@@ -198,6 +198,23 @@ Options (arguments, never environment variables): `--reference <old hook> --pip-
 jq -s 'group_by(.hook) | map({hook: .[0].hook, calls: length, same: map(select(.same)) | length, different: map(select(.same | not))})' ~/.local/state/claude-guard/shadow.log
 ```
 
+## Release binary (macOS arm64)
+
+Each release has `claude-guard-aarch64-apple-darwin.tar.gz` and its `.sha256`, built by `.github/workflows/release.yml`
+on a GitHub-hosted `macos-15` (arm64) runner from the release tag, with build provenance attested. To install one,
+check both the checksum and the attestation before running it:
+
+```sh
+gh release download v0.1.0 -R KennethWKZ/claude-guard -p 'claude-guard-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c claude-guard-aarch64-apple-darwin.tar.gz.sha256
+gh attestation verify claude-guard-aarch64-apple-darwin.tar.gz -R KennethWKZ/claude-guard
+tar -xzf claude-guard-aarch64-apple-darwin.tar.gz
+install -m 755 claude-guard ~/.local/bin/claude-guard && ~/.local/bin/claude-guard --version
+```
+
+The binary is ad-hoc signed (the linker's default), not Developer ID signed or notarized. `gh` and `curl` downloads
+carry no quarantine flag, so macOS runs it; a browser download would be stopped by Gatekeeper.
+
 ## Build, test, install
 
 ```sh
