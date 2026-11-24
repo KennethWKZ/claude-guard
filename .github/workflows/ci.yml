@@ -47,7 +47,9 @@ jobs:
 
   supply-chain:
     name: cargo deny, cargo audit
-    runs-on: macos-15
+    # Linux arm64: neither tool needs macOS, and this keeps the job out of the macOS runner queue (it once waited
+    # there until its timeout while the release build and the test job held the macOS runners).
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     permissions:
       contents: read
@@ -59,8 +61,14 @@ jobs:
 
       - name: Toolchain
         run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustup toolchain install stable --profile minimal
           rustup default stable
+          cargo --version
 
       - name: Install cargo-deny and cargo-audit
         uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
