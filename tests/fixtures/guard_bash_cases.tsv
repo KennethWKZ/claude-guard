@@ -1,0 +1,175 @@
+# Cases from guard-bash's test_guard_bash.sh.
+# want<TAB>command. {TMPDIR} is $TMPDIR without its trailing slash; ⏎ marks a newline.
+
+# rm -rf
+allow	rm -rf {TMPDIR}/claude-scratch-123
+allow	rm -rf /tmp/build-out /private/tmp/x
+deny	rm -rf {TMPDIR}
+deny	rm -rf /tmp
+deny	rm -rf /
+deny	rm -rf /srv/someone/Repositories
+deny	rm -fr /usr/local/lib
+deny	rm -r -f /etc
+deny	rm --recursive --force /Applications/Foo.app
+deny	rm -rf /tmp/ok /srv/someone
+deny	rm -rf /tmp/../srv/someone
+deny	cd /x && rm -Rf /System/Library
+allow	rm -rf node_modules dist
+allow	rm /tmp/file.txt
+allow	git rm -rf --cached dir
+# .env reads
+deny	cat .env
+deny	cat ./backend/.env.production
+deny	head -5 .env.local
+deny	grep DB_PASSWORD .env
+deny	sed -n 1,5p config/.env
+deny	less .env
+deny	base64 .env
+deny	python3 -c 'print(1)' .env
+deny	source .env
+deny	. ./.env
+deny	set -a && . .env && set +a
+deny	cat < .env
+deny	cp .env /tmp/leak.txt
+deny	git add .env
+deny	git diff .env
+deny	docker compose --env-file .env up
+deny	cat prod.env
+deny	FOO=1 cat .env
+allow	cat .env.example
+allow	cat .env.sample .env.template
+allow	cp .env.example .env
+allow	ls -la .env
+allow	test -f .env && echo yes
+allow	chmod 600 .env
+allow	echo "APP_DEBUG=true" >> .env
+deny	grep CANARY .env* 2>&1 || true
+deny	cat ./.env*
+deny	tail .env.{local,production}
+deny	grep -r "DB_HOST" config/
+deny	grep -rn TODO .
+deny	grep -Rl secret src
+deny	rg --hidden DB_PASSWORD
+deny	rg --no-ignore-vcs password .
+allow	rg DB_HOST
+allow	rg -g '!.env*' password
+allow	grep -n DB_HOST config/database.php
+allow	grep --include='*.php' -n DB_HOST app/Http/Kernel.php
+allow	ls .env*
+allow	cat *.md
+allow	npm run dev
+allow	php artisan migrate
+allow	cat venv/bin/activate
+allow	cat src/environment.ts
+# direnv's .envrc holds secrets too
+deny	cat .envrc
+deny	source ./app/.envrc
+deny	grep TOKEN .envr?
+allow	ls -la .envrc
+allow	cat .envrc.example
+allow	cat src/envrc.ts
+# writing a .env (output redirect target), linking or printing its name isn't reading it
+allow	printf 'export TOKEN=dummy\n' > .envrc
+allow	ln -s .envrc canary-rc
+allow	ln -sf .env canary
+allow	python3 gen.py > .env
+allow	jq -n '{}' >> .env.local
+allow	cat .env.example > .env
+deny	cat .env > /tmp/out.txt
+deny	cat .env.production >> notes.txt
+deny	sort < .env > sorted.txt
+deny	printf x > out.txt && cat .envrc
+# force push
+deny	git push --force origin main
+deny	git push origin main --force
+deny	git push -f
+deny	git push -uf origin feature
+allow	git push --force-with-lease origin feature
+allow	git push origin feature
+allow	git push -u origin feature
+# sudo
+deny	sudo rm /tmp/x
+deny	cd /x && sudo make install
+allow	echo sudo is blocked
+# text that mentions .env is not a read
+allow	python3 - <<'PY' ... "<code>.env</code> and <code>.env.local</code>" PY
+allow	git commit -m "docs: never commit .env.production"
+deny	git commit -m "msg" .env
+# rg --hidden / --no-ignore are fine once every .env file is excluded
+allow	rg --hidden -g '!.env*' pat .
+allow	rg -n "pnpm import|pnpm -s" --hidden -g '!.env*' -g '!node_modules' -g '!decks' .
+allow	rg -l --hidden --no-ignore -g '!.env*' pat
+allow	rg --hidden --glob='!**/.env*' pat
+deny	rg --hidden pat .
+deny	rg --no-ignore pat .
+deny	rg --hidden -g '!.env' pat .
+deny	rg --hidden -g '!node_modules' pat .
+# bracket text that isn't a valid glob range (Python 3.9 glob raised re.error on these)
+allow	jq -r '.Metrics[]|select(.Value=="i-0cd833764855393ea")|.Dimensions[i-0]' data.json
+allow	aws ec2 describe-instances --query "Reservations[].Instances[?InstanceId=='i-0e2']"
+allow	cat .env[i-0]
+deny	cat .env[.]local
+# brace expansion: only what it expands to counts
+allow	graphmind memory search "setting SOURCE_TRUST_GRADES={} ... still gives mm-app:direct ... in the env" --slug mm-ems --no-recall
+allow	jq '{"env":"prod"}' file.json
+allow	echo "{} in the env"
+allow	cat config{,.local}.json
+deny	cat .env{,.prod}
+deny	cat {a,.env}
+deny	cp .env{,.bak}
+deny	source {x,.env.local}
+deny	cat {a,{b,.env.production}}
+allow	cp .env.example .env
+# cp/install with no arguments, or as the last path part of a substitution (IndexError before 2026-10-16)
+allow	cp
+allow	install
+allow	d=$(uv tool dir)/h/install; rg x
+deny	install .env /tmp/x
+# jq/yq filters are paths into the data, not files (false positive before 2026-11-08); file arguments still count
+allow	jq -r '.env.LAVISH_AXI_TELEMETRY' snapshot/.claude/settings.json
+allow	jq -r .env ~/.claude/settings.json
+allow	jq -rc '.env.DB_HOST // "none"' a.json b.json
+allow	jq -n --arg k .x '.env.FOO'
+allow	jq --indent 4 '.env' settings.json
+allow	gojq '.env.TOKEN_NAME' x.json
+allow	yq '.env.DB_HOST' docker-compose.yml
+allow	yq eval -o json '.env.APP_KEY' compose.yml
+allow	jq -r '.env.X' settings.json | rg FOO
+deny	jq . .env
+deny	jq -r '.env.X' .env.production
+deny	jq -f .env data.json
+deny	jq --from-file=.env.local data.json
+deny	jq --rawfile s .env '.' x.json
+deny	jq --slurpfile s .env.local '.' x.json
+deny	jq -r '.env.X' settings.json && cat .env
+deny	yq '.env' .env
+deny	cat .env.LAVISH_AXI_TELEMETRY
+deny	grep FOO .env.LAVISH_AXI_TELEMETRY
+# heredoc bodies are data, unless a shell reads them
+allow	python3 - <<'PY'⏎import os⏎os.system("rm -rf /var/lib/x")⏎print(open("std::env::current_dir"))⏎PY
+allow	cat > src/x.rs <<'EOF'⏎    .env("HOME", home)⏎EOF
+allow	cat > notes.sh <<-EOF⏎	rm -rf "$STATE_DIR" /srv/x⏎	EOF
+deny	cat > notes.txt <<'EOF'⏎text⏎EOF⏎cat .env
+deny	bash <<'SH'⏎rm -rf /srv/someone⏎SH
+deny	echo hi && sh -s <<EOF⏎cat .env.production⏎EOF
+allow	cat <<< "rm -rf /"
+# shell keywords in front of a command (do, then, else, {) don't hide it (before 2026-11-10 they did: do sudo ran)
+deny	for x in a; do sudo ls; done
+deny	if true; then git push --force origin main; fi
+deny	if true; then true; else grep -r foo .; fi
+deny	{ rg --hidden foo; }
+deny	while false; do rm -rf /srv/someone/x; done
+deny	until true; do cat .env; done
+deny	{ cat .env; }
+allow	for f in ~/.claude/settings.json; do jq -r '.env.BITBUCKET_EMAIL, (.permissions.ask|length)' "$f"; done
+allow	if true; then jq -r '.env.FOO' ~/.claude/settings.json; fi
+allow	{ jq -r '.env.FOO' ~/.claude/settings.json; }
+allow	echo do then else
+# rm -rf on ~ and $HOME paths: the shell expands them, so they count as absolute (before 2026-11-10 they ran)
+deny	rm -rf ~/Documents/x
+deny	rm -rf ~
+deny	rm -rf "$HOME/Documents/x"
+deny	rm -rf ${HOME}/x
+allow	rm -rf "$TMPDIR/x"
+allow	rm -f ~/x.txt
+allow	rm -rf build
