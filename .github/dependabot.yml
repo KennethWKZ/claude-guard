@@ -1,0 +1,23 @@
+# Weekly update PRs for the crates and the SHA-pinned GitHub Actions, one PR per ecosystem. The cooldown waits a week
+# after a release before proposing it, so a hijacked release has time to be found and pulled first.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]

@@ -4,7 +4,12 @@ version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 publish = false
-description = "Claude Code hooks in Rust, ported from Python and dash hooks (one binary, one subcommand per hook)."
+description = "Fast guard hooks for Claude Code: Bash commands, file reads, prompts and URLs (one binary, one subcommand per hook)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/KennethWKZ/claude-guard"
+readme = "README.md"
+keywords = ["claude-code", "hooks", "security", "guardrails"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 regex = "1"
