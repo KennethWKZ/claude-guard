@@ -5,13 +5,13 @@ Claude Code hooks in Rust: one binary, one subcommand per hook. It replaces Pyth
 
 | Subcommand | Replaces | Hook | State |
 | --- | --- | --- | --- |
-| `claude-guard bash` | `guard-bash.py` + `block-pip.sh` | PreToolUse Bash | shadow since 2026-11-24 |
-| `claude-guard read` | `guard-read-keys.py` | PreToolUse Read | shadow since 2026-11-24 |
-| `claude-guard husky` | `husky-worktree-hooks.py` | PostToolUse Bash\|EnterWorktree, SessionStart | shadow since 2026-11-24 |
-| `claude-guard prompt` | `guard-prompt.py` | UserPromptSubmit (and GraphMind's prompt hook, `--strict`) | shadow since 2026-11-24 |
-| `claude-guard session-name` | `session-name-from-title.sh` | UserPromptSubmit, SessionStart | shadow since 2026-11-24 |
+| `claude-guard bash` | `guard-bash.py` + `block-pip.sh` | PreToolUse Bash | live since 2026-11-24 |
+| `claude-guard read` | `guard-read-keys.py` | PreToolUse Read | live since 2026-11-24 |
+| `claude-guard husky` | `husky-worktree-hooks.py` | PostToolUse Bash\|EnterWorktree, SessionStart | live since 2026-11-24 |
+| `claude-guard prompt` | `guard-prompt.py` | UserPromptSubmit (and GraphMind's prompt hook, `--strict`) | live since 2026-11-24 |
+| `claude-guard session-name` | `session-name-from-title.sh` | UserPromptSubmit, SessionStart | live since 2026-11-24 |
 | `claude-guard dns-nxdomain` | `dns-nxdomain.py` (launchd agent `local.claude-guard.dns-nxdomain`) | not a hook: the DNS responder behind dns-blocklist | ported, not switched |
-| `claude-guard web pre\|post` | `web-guard.sh` + `web-guard.py` | PreToolUse and PostToolUse (Bash, WebFetch, ccs-browser, ctx_index/ctx_search, WebSearch) | shadow since 2026-11-24 |
+| `claude-guard web pre\|post` | `web-guard.sh` + `web-guard.py` | PreToolUse and PostToolUse (Bash, WebFetch, ccs-browser, ctx_index/ctx_search, WebSearch) | live since 2026-11-24 |
 
 Why: a hook in Rust starts in about 7 ms and uses about 4 MB; `guard-bash.py` took 60 to 90 ms and 14 MB on every
 Bash call (measured 2026-11-24 at load 13).
@@ -246,5 +246,6 @@ features). The user-database calls are hand-declared, not the `libc` crate. `Car
 
 ## Rollback
 
-Each shadow hook is one extra entry in `~/.claude/settings.json` (`claude-guard <hook> --shadow`); remove it to stop.
-Until a switch, the old hooks stay registered and do the real work.
+Each hook is one entry in `~/.claude/settings.json` (`claude-guard <hook>`). The old Python and dash hooks stay in
+`~/.claude/hooks/`: to roll one back, point its entry at the old script again. A shadow entry (`claude-guard <hook>
+--shadow` next to the old hook) is how a new port is checked before it replaces one.
