@@ -1,5 +1,8 @@
 //! The user database (Python's `pwd` module): the home folder of this account or of a named one. guard-read-keys
-//! looks up the real home folder here, not in `$HOME`, which a repo's settings `env` can override.
+//! (credential files) and the web guard's url-policy.json look up the real home folder here, not in `$HOME`: a
+//! Claude Code started with HOME set (benchmarks, sandboxes, managed hooks) passes that HOME to every hook. A
+//! repo's settings `env` can't: Claude Code ignored a repo's HOME for hooks and kept the real one (tested with
+//! Claude Code 2.1.292), though the same `env` block does replace their PATH.
 //! Three libc calls declared by hand: the `libc` crate would bring a build script for them.
 
 use std::ffi::{CStr, CString, c_char};

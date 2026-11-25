@@ -9,8 +9,10 @@
 //! post (PostToolUse): detect only. Scans what came back for invisible Unicode, injection wording, hidden HTML
 //! text, planted keys and callback links, and tells Claude to treat the content as data.
 //!
-//! Policy: built-in lists plus ~/.config/claude-guard/url-policy.json (`--policy`). Log:
-//! ~/.local/state/claude-guard/web.log (`--log`). `--terms` and `--guard` as in web-guard.py: the URL data checks
+//! Policy: built-in lists plus ~/.config/claude-guard/url-policy.json (`--policy`), in the real home folder from
+//! the user database, not `$HOME`: its `allow_hosts` lifts built-in blocks, so a Claude Code started with HOME set
+//! must not bring its own (web-guard.py reads `$HOME`; this is the one deliberate difference). Log:
+//! ~/.local/state/claude-guard/web.log under `$HOME` (`--log`). `--terms` and `--guard` as in web-guard.py: the URL data checks
 //! are built in here, so `--guard <file>` only switches them off when that file doesn't exist (as Python did when
 //! it couldn't load guard-prompt.py). Fails open: an internal error allows the call with one warning.
 //!
@@ -794,7 +796,11 @@ impl Options {
         let ex = |p: &str| pyfs::expanduser(p).unwrap_or_else(|_| p.replacen('~', &home, 1));
         let mut o = Options {
             mode: None,
-            policy: ex("~/.config/claude-guard/url-policy.json"),
+            // The real home (user database), not $HOME: see the module comment. No entry: $HOME, as before.
+            policy: match crate::pwd::own_home() {
+                Some(h) => format!("{h}/.config/claude-guard/url-policy.json"),
+                None => ex("~/.config/claude-guard/url-policy.json"),
+            },
             log: ex("~/.local/state/claude-guard/web.log"),
             guard: None,
             terms: None,

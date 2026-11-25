@@ -549,3 +549,57 @@ fn shadow_never_blocks() {
         "shadow never writes the allow-name log"
     );
 }
+
+/// No `--terms` or `--log`: the guard finds them under `$HOME`, as guard-prompt.py does (expanduser). A caller's
+/// HOME that isn't the real one (a fresh folder, so the real names file and log are never touched) still blocks
+/// secrets; the names it warns about are that HOME's, not the real home's.
+#[test]
+fn a_fake_home() {
+    let e = Env::new("fake-home");
+    let home = e.p("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let aws = format!("AKIA{}", "QX3MPLW4RTZKVNAB");
+    let decision = |prompt: &str| {
+        let (rc, out) = run_raw(
+            &["prompt"],
+            &hook_input(prompt),
+            &e.dir,
+            &[("HOME", home.as_str())],
+        );
+        assert_eq!(rc, 0);
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_default();
+        if v["decision"] == "block" {
+            v["reason"].as_str().unwrap_or("").to_string()
+        } else if v["systemMessage"].is_string() {
+            "warn".to_string()
+        } else {
+            out
+        }
+    };
+    let secret = format!("my key is {aws} ok");
+    assert!(
+        decision(&secret).contains("(rule aws-access-key-id)"),
+        "secret blocked under a fake HOME"
+    );
+    assert_eq!(
+        decision("ask Zorbenta Quillfeather"),
+        "",
+        "no names file in the fake HOME: no warning"
+    );
+    let cfg = format!("{home}/.config/claude-guard");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        format!("{cfg}/blocked-terms.txt"),
+        "Zorbenta Quillfeather\n",
+    )
+    .unwrap();
+    assert_eq!(
+        decision("ask Zorbenta Quillfeather"),
+        "warn",
+        "the fake HOME's names file is the one used"
+    );
+    assert!(
+        decision(&secret).contains("(rule aws-access-key-id)"),
+        "secret still blocked"
+    );
+}

@@ -846,3 +846,45 @@ fn shadow_never_blocks() {
         "the log must not hold the URL"
     );
 }
+
+/// No `--policy`, `--log` or `--terms`. A caller's HOME that isn't the real one (a fresh folder here, so the real
+/// web.log is never touched) keeps the built-in blocks, and the log lands in that HOME. The policy comes from the
+/// real home (user database), so a `url-policy.json` in the fake HOME is ignored: its `allow_hosts` can't lift a
+/// built-in block. web-guard.py reads `$HOME` for both; the policy is the one deliberate difference.
+#[test]
+fn a_fake_home() {
+    let canary = mcp(NAV, json!({"url": "https://webhook.site/x"}));
+    let fake = fresh_dir("web-fake-home");
+    let o = run_in(
+        &[BIN, "web", "pre"],
+        &canary.to_string(),
+        &[("HOME", fake.as_str())],
+        None,
+    );
+    assert!(
+        verdict("deny:callback-host", &o),
+        "built-in block under a fake HOME: {o:?}"
+    );
+    assert!(
+        std::path::Path::new(&format!("{fake}/.local/state/claude-guard/web.log")).is_file(),
+        "web.log goes to the caller's HOME"
+    );
+    let policy = format!("{fake}/.config/claude-guard");
+    std::fs::create_dir_all(&policy).unwrap();
+    std::fs::write(
+        format!("{policy}/url-policy.json"),
+        r#"{"allow_hosts":["webhook.site"]}"#,
+    )
+    .unwrap();
+    let o = run_in(
+        &[BIN, "web", "pre"],
+        &canary.to_string(),
+        &[("HOME", fake.as_str())],
+        None,
+    );
+    assert!(
+        verdict("deny:callback-host", &o),
+        "a fake HOME's url-policy.json is ignored; the built-in block holds: {o:?}"
+    );
+    let _ = std::fs::remove_dir_all(&fake);
+}

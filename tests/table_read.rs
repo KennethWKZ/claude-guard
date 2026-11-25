@@ -197,6 +197,60 @@ fn guard_read_keys_cases() {
     );
 }
 
+/// The real home folder from the user database, as the guard finds it; not `$HOME`, which the test's
+/// caller could have changed.
+fn real_home() -> String {
+    let user = std::process::Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .unwrap();
+    let user = String::from_utf8_lossy(&user.stdout).trim().to_string();
+    let o = std::process::Command::new("/usr/bin/dscl")
+        .args([".", "-read", &format!("/Users/{user}"), "NFSHomeDirectory"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    let h = out
+        .split_whitespace()
+        .nth(1)
+        .expect("NFSHomeDirectory")
+        .to_string();
+    assert!(std::path::Path::new(&h).is_dir(), "real home {h}");
+    h
+}
+
+/// A caller can set HOME to any folder. Credential files are found in the real home (user database), as
+/// guard-read-keys.py does: a fake HOME neither hides the real ones nor turns its own files into credentials.
+/// Key names block wherever they are.
+#[test]
+fn a_fake_home_changes_nothing() {
+    let real = real_home();
+    let fake = fresh_dir("read-fake-home");
+    assert_ne!(fake, real);
+    let env = [("HOME", fake.as_str())];
+    for (want, path, label) in [
+        (
+            0,
+            "~/.npmrc".to_string(),
+            "~/.npmrc under a fake HOME is the fake folder's file",
+        ),
+        (
+            2,
+            format!("{real}/.npmrc"),
+            "the real ~/.npmrc stays blocked under a fake HOME",
+        ),
+        (
+            2,
+            "~/.ssh/id_rsa".to_string(),
+            "a key name under a fake HOME",
+        ),
+    ] {
+        let o = run_in(&[BIN, "read"], &j(&path, "/tmp"), &env, None);
+        assert_eq!(o.code, want, "{label}: {path} (stderr: {})", o.stderr);
+    }
+    let _ = std::fs::remove_dir_all(&fake);
+}
+
 #[test]
 fn message_is_python_s() {
     let o = run(&[BIN, "read"], &j("/tmp/a/Server.PEM", "/"));
