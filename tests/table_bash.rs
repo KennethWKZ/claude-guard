@@ -142,6 +142,136 @@ fn pip_rule() {
     assert!(o.stdout.contains("sudo is blocked"));
 }
 
+/// rust-anything: only the read-only subcommands run; every other one (and any added later) is blocked, as its
+/// MCP tools are. Rust-only rule, so these cases stay out of guard_bash_cases.tsv (the differential test replays
+/// that file against the Python guard).
+#[test]
+fn rust_anything_rule() {
+    let block = [
+        // Every code-running or source-editing subcommand of rust-anything 4.1.
+        "rust-anything go --agent claude -- python3 app.py",
+        "rust-anything bridge src/util.ts --name util",
+        "rust-anything refresh rust/util",
+        "rust-anything record rust/util",
+        "rust-anything build rust/util",
+        "rust-anything diff rust/util",
+        "rust-anything bench rust/util",
+        "rust-anything fuzz rust/util --seed 7",
+        "rust-anything profile . -- node bench.mjs",
+        "rust-anything enable rust/util",
+        "rust-anything disable rust/util",
+        "rust-anything report rust/util",
+        "rust-anything clean",
+        "rust-anything shadow rust/util",
+        "rust-anything gate rust/util",
+        "rust-anything package rust/util",
+        "rust-anything app record -- ./cli",
+        "rust-anything mcp",
+        "rust-anything setup",
+        // A subcommand this list doesn't know yet.
+        "rust-anything port-everything",
+        // Called by path, after options, or with no subcommand (xargs could supply one).
+        "~/.cargo/bin/rust-anything build rust/util",
+        "/opt/tools/bin/rust-anything go -- node x.js",
+        "rust-anything --verbose build rust/util",
+        "rust-anything",
+        // --help after `--` goes to the workload, not to rust-anything.
+        "rust-anything go -- python3 app.py --help",
+        "ls rust | xargs rust-anything",
+        "ls rust | xargs -n1 rust-anything build",
+        // In a list, a pipeline, a subshell or command substitution.
+        "cd /tmp && rust-anything build rust/util",
+        "true; rust-anything diff rust/util",
+        "(cd x && rust-anything gate rust/util)",
+        "echo $(rust-anything build rust/util)",
+        "echo `rust-anything build rust/util`",
+        // Behind a prefix, an assignment or a wrapper with options.
+        "env FOO=1 rust-anything build rust/util",
+        "CARGO_TARGET_DIR=/tmp/t rust-anything build rust/util",
+        "env -i rust-anything build rust/util",
+        "nice -n 10 rust-anything bench rust/util",
+        "timeout 600 rust-anything fuzz rust/util",
+        "caffeinate -i rust-anything go -- node x.js",
+        "nohup rust-anything go -- node x.js",
+        "exec rust-anything mcp",
+        // Inside a shell's -c string or a heredoc the shell reads.
+        "bash -c 'rust-anything build rust/util'",
+        "sh -lc \"cd x && rust-anything gate rust/util\"",
+        "zsh -ec 'timeout 9 rust-anything go'",
+        "bash -c 'bash -c \"rust-anything build x\"'",
+        "bash <<'EOF'⏎rust-anything build rust/util⏎EOF",
+    ];
+    let allow = [
+        "rust-anything analyze",
+        "rust-anything analyze . --json",
+        "rust-anything analyze ~/Repositories/app -o /tmp/plan.md",
+        "rust-anything analyze --whole-app --lang ts",
+        "rust-anything map",
+        "rust-anything map --write",
+        "rust-anything map --check --json",
+        "rust-anything doctor",
+        "rust-anything doctor --json",
+        "rust-anything help",
+        "rust-anything help build",
+        "rust-anything --help",
+        "rust-anything -h",
+        "rust-anything -V",
+        "rust-anything --version",
+        "rust-anything build --help",
+        "rust-anything bridge src/util.ts -h",
+        "rust-anything -h go",
+        "~/.cargo/bin/rust-anything analyze .",
+        "timeout 60 rust-anything map",
+        "bash -c 'rust-anything doctor'",
+        // Naming it isn't running it.
+        "echo rust-anything build",
+        "rg -n rust-anything src",
+        "git commit -m 'block rust-anything build in the guard'",
+        "cat ~/.claude/skills/rust-anything/SKILL.md",
+        "cargo install rust-anything",
+        "bash -c 'echo rust-anything build'",
+        "rust-anything-helper build",
+        "ls ~/.cargo/bin/rust-anything",
+    ];
+    let mut fails = Vec::new();
+    for c in &block {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains("guard-bash: rust-anything ")
+            && o.stdout.contains("analyze, map, doctor and help");
+        if !ok {
+            fails.push(format!("want=deny :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    for c in &allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want=allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+    // The subcommand is named in the reason.
+    let o = run(&["bash"], &bash_input("rust-anything go -- node x.js"));
+    assert!(
+        o.stdout.contains("rust-anything go can build"),
+        "{}",
+        o.stdout
+    );
+    let o = run(&["bash"], &bash_input("rust-anything"));
+    assert!(
+        o.stdout.contains("rust-anything without a subcommand"),
+        "{}",
+        o.stdout
+    );
+}
+
 #[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).

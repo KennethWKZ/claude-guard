@@ -8,6 +8,9 @@
 //!   3. git push with --force or -f.
 //!   4. sudo.
 //!   5. `pip install` (from block-pip.sh): exit 2 with a message on stderr, after the rules above.
+//!   6. rust-anything subcommands other than the read-only ones (analyze, map, doctor, help): the rest build or
+//!      run the code being ported, or edit its sources, and its MCP tools for them are denied, so the CLI must not
+//!      be the way round. Rust only (the Python guard never had it); also through wrappers and `sh -c`.
 //!
 //! Same contract as the Python guard: a parse error allows the command (a quoting mistake never locks the
 //! shell); any other failure blocks it (fail closed) and is logged. It only sees what is written in the command.
@@ -59,6 +62,28 @@ const ENV_PROBES: &[&str] = &[
     "prod.env",
 ];
 const ENV_EXCLUDES: &[&str] = &["!.env*", "!*.env*", "!**/.env*", "!**/*.env*"];
+/// rust-anything subcommands that only read (the MCP tools left allowed are analyze and map). Anything else,
+/// including subcommands added later, is blocked.
+const RUST_ANYTHING_READ_ONLY: &[&str] = &["analyze", "map", "doctor", "help"];
+/// Commands that run the command after their own options. `segments` already drops a leading
+/// env/xargs/nice/nohup/time/command/builtin/exec, but their options (`nice -n 5`) stay behind as the verb.
+const RUN_WRAPPERS: &[&str] = &[
+    "timeout",
+    "gtimeout",
+    "caffeinate",
+    "stdbuf",
+    "arch",
+    "nice",
+    "env",
+    "xargs",
+    "nohup",
+    "time",
+    "command",
+    "builtin",
+    "exec",
+];
+/// Shells whose `-c` string is a command to check.
+const C_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 
 // Python's `$` (no MULTILINE) also matches just before a final newline: `\n?\z` here.
 static ENV_FILE: LazyLock<Regex> =
@@ -456,6 +481,78 @@ fn home_path(arg: &str) -> String {
     arg.to_string()
 }
 
+fn is_rust_anything(token: &str) -> bool {
+    pyfs::basename(token.trim_start_matches('`')) == "rust-anything"
+}
+
+/// The reason to block the rust-anything run in one simple command, if it runs one that isn't read-only.
+/// Finds it as the verb, after a wrapper (`timeout 60 rust-anything go`), and inside `bash -c '...'`.
+fn rust_anything_reason(seg: &[String], depth: usize) -> Result<Option<String>, Crash> {
+    if depth > MAX_DEPTH {
+        return Err(Crash(
+            "RecursionError: maximum recursion depth exceeded".into(),
+        ));
+    }
+    let verb = pyfs::basename(&seg[0]);
+    let args: &[String] = if is_rust_anything(&seg[0]) {
+        &seg[1..]
+    } else if contains(C_SHELLS, verb) {
+        // `bash -c STRING`, `sh -lc STRING`: STRING is a command line of its own.
+        let Some(i) = seg[1..]
+            .iter()
+            .position(|a| !a.starts_with("--") && dash_letters_contain(a, &['c']))
+        else {
+            return Ok(None);
+        };
+        let Some(inner) = seg.get(i + 2) else {
+            return Ok(None);
+        };
+        // Same contract as the whole command: a string that doesn't parse is allowed.
+        let Ok(raw) = shlex::split(inner) else {
+            return Ok(None);
+        };
+        for s in segments(raw) {
+            if let Some(r) = rust_anything_reason(&s, depth + 1)? {
+                return Ok(Some(r));
+            }
+        }
+        return Ok(None);
+    } else if contains(RUN_WRAPPERS, verb) || verb.starts_with('-') {
+        match seg.iter().position(|a| is_rust_anything(a)) {
+            Some(i) => &seg[i + 1..],
+            None => return Ok(None),
+        }
+    } else if let Some(i) = seg
+        .iter()
+        .position(|a| a.starts_with('`') && is_rust_anything(a))
+    {
+        // Backtick substitution: `echo `rust-anything build x``.
+        &seg[i + 1..]
+    } else {
+        return Ok(None);
+    };
+    // `rust-anything build --help` only prints help; a --help after `--` belongs to the workload instead.
+    if args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "-h" || a == "--help")
+    {
+        return Ok(None);
+    }
+    let sub = args.iter().find(|a| !a.starts_with('-'));
+    let what = match sub {
+        Some(s) if contains(RUST_ANYTHING_READ_ONLY, s) => return Ok(None),
+        Some(s) => format!("rust-anything {s}"),
+        // The version flag stops before any subcommand. Without it, the subcommand may come from elsewhere
+        // (`... | xargs rust-anything`), so a bare run is blocked too.
+        None if args.iter().any(|a| a == "-V" || a == "--version") => return Ok(None),
+        None => "rust-anything without a subcommand".to_string(),
+    };
+    Ok(Some(format!(
+        "{what} can build, run or edit the code being ported, and its MCP tool is denied. Claude may run only rust-anything analyze, map, doctor and help; run the rest yourself with !."
+    )))
+}
+
 /// The reason to block `command`, if any. Err is a crash (blocks).
 pub fn check(command: &str, cwd: &Cwd, depth: usize) -> Result<Option<String>, Crash> {
     if depth > MAX_DEPTH {
@@ -480,6 +577,9 @@ pub fn check(command: &str, cwd: &Cwd, depth: usize) -> Result<Option<String>, C
                 "sudo is blocked: Claude never needs admin rights. Run it yourself if you must."
                     .into(),
             ));
+        }
+        if let Some(r) = rust_anything_reason(&seg, depth + 1)? {
+            return Ok(Some(r));
         }
         if verb == "rm" {
             let flags: Vec<&String> = args.iter().filter(|a| a.starts_with('-')).collect();
@@ -636,6 +736,8 @@ pub fn rule_of(reason: &str) -> &'static str {
         "rg-hidden"
     } else if r.starts_with("reading a secrets file") {
         "secret-file"
+    } else if r.starts_with("rust-anything ") {
+        "rust-anything"
     } else if r.starts_with("guard-bash crashed") {
         "crash"
     } else {

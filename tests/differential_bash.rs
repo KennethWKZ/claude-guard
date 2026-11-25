@@ -643,5 +643,13 @@ fn known_difference(
     {
         return Some("lone-surrogate-text");
     }
+    // The rust-anything rule is Rust only (added after the port); Python allows those commands.
+    if reference.stdout.is_empty()
+        && reference.code == 0
+        && rust.code == 0
+        && rule(&rust.stdout).starts_with("rust-anything ")
+    {
+        return Some("rust-anything-rule");
+    }
     None
 }

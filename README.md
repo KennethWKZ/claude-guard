@@ -23,7 +23,7 @@ Claude Code's sandbox and permission rules, not instead of them. See [What it do
 
 | Subcommand | Hook | What it does | On an internal error |
 | --- | --- | --- | --- |
-| `claude-guard bash` | PreToolUse `Bash` | Blocks `rm -rf` outside temp, reading `.env` files, recursive `grep`, `rg --hidden`, `git push --force`, `sudo`, `pip install` | blocks (fail closed), logged |
+| `claude-guard bash` | PreToolUse `Bash` | Blocks `rm -rf` outside temp, reading `.env` files, recursive `grep`, `rg --hidden`, `git push --force`, `sudo`, `pip install`, rust-anything's code-running subcommands | blocks (fail closed), logged |
 | `claude-guard read` | PreToolUse `Read` | Refuses key and certificate files, tools' credential files, and files that start a private key | blocks (fail closed) |
 | `claude-guard prompt` | UserPromptSubmit | Blocks prompts holding secrets or Malaysian IC numbers; warns on names from your list | allows with a warning (fail open) |
 | `claude-guard web pre` / `post` | PreToolUse / PostToolUse on fetch tools | `pre` denies canary, callback and cloud-metadata URLs and URLs carrying data; `post` flags hidden instructions in what came back | allows with a warning (fail open) |
@@ -132,6 +132,11 @@ Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `ba
 3. `git push --force` / `-f` (`--force-with-lease` is allowed).
 4. `sudo`.
 5. `pip install` (tells Claude to use `uv` instead).
+6. [rust-anything](https://crates.io/crates/rust-anything) subcommands other than `analyze`, `map`, `doctor` and
+   `help` (and `--help` / `--version`). The rest build, run or edit the code being ported; deny their MCP tools
+   (`mcp__rust-anything__*`) too, so the CLI isn't the way round. A subcommand added later is blocked until it's
+   listed. Found by path, behind wrappers (`timeout`, `nice -n`, `env -i`, `xargs`), in `$(…)` and backticks, and
+   inside `bash -c '…'`.
 
 The rules hold inside loops, `if` blocks and `{ … }`. A quoting error in the command allows it, so a typo never locks
 the shell; any other failure blocks it and is logged. Input nested too deep to check blocks.
