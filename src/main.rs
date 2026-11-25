@@ -8,6 +8,8 @@
 //!   claude-guard web pre|post [--policy F] [--log F] [--guard F] [--terms F]
 //!                         PreToolUse/PostToolUse web guard (was web-guard.sh + web-guard.py)
 //!   claude-guard session-name   UserPromptSubmit/SessionStart naming hook (was session-name-from-title.sh)
+//!   claude-guard repo pre-bash [--crash-log F]
+//!                         PreToolUse Bash guards a repo configures in .claude/repo-guard.json (was a repo's Python hook)
 //!   claude-guard dns-nxdomain [--port N] [--log F]
 //!                         launchd daemon: NXDOMAIN for every DNS query on 127.0.0.1:10053 (was dns-nxdomain.py)
 //!   claude-guard <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F]
@@ -29,6 +31,7 @@ mod pwd;
 mod pyfs;
 mod pyre;
 mod read;
+mod repo;
 mod session_name;
 mod shadow;
 mod shlex;
@@ -67,7 +70,7 @@ fn home() -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | session-name | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
+        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | session-name | repo pre-bash [--crash-log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
     );
     std::process::exit(64);
 }
@@ -87,6 +90,17 @@ fn main() {
             option_env!("CLAUDE_GUARD_COMMIT").unwrap_or("unknown commit")
         );
         return;
+    }
+    if cmd == "repo" {
+        // `repo pre-bash [--crash-log <file>]`: the log override is for tests; the default comes from the config.
+        let crash_log = match &args[1..] {
+            [m] if m == "pre-bash" => None,
+            [m, flag, path] if m == "pre-bash" && flag == "--crash-log" => Some(path.clone()),
+            _ => usage(),
+        };
+        let input = hookio::read_stdin();
+        let (verdict, log) = repo::decide(&input, crash_log.as_deref());
+        std::process::exit(repo::emit(&verdict, log.as_deref()));
     }
     if !["bash", "read", "husky", "prompt", "web", "session-name"].contains(&cmd) {
         usage();

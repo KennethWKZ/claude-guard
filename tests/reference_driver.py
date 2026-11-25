@@ -12,6 +12,8 @@ Usage: /usr/bin/python3 -I reference_driver.py bash <guard-bash.py>
          out: {"stdout": ...}   (as its __main__ block: an exception prints the fail-open warning)
        /usr/bin/python3 -I reference_driver.py web <web-guard.py>
          in/out as prompt (web-guard.py's own fail-open warning)
+       /usr/bin/python3 -I reference_driver.py repo-bash <a repo's PreToolUse Bash hook>
+         out: {"code": <exit code>, "stdout": ..., "stderr": ..., "crash": <main() raised, which the hook logs and allows>}
 """
 import importlib.util
 import io
@@ -50,6 +52,15 @@ for line in real[0]:
             except BaseException as e:  # what would have ended the real process (exit 1, no decision)
                 error = type(e).__name__
             result = {"stdout": clean(out.getvalue()), "error": error}
+        elif mode == "repo-bash":
+            code, crash = 0, False
+            try:
+                g.main()
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+            except Exception:
+                crash = True
+            result = {"code": code, "stdout": clean(out.getvalue()), "stderr": clean(err.getvalue()), "crash": crash}
         elif mode in ("prompt", "web"):
             sys.argv = [ref] + request.get("args", [])
             name = "guard-prompt.py" if mode == "prompt" else "web-guard.py"

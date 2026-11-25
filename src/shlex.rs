@@ -23,17 +23,17 @@ enum State {
 const PUNCT: &str = ";&|()!<>";
 
 #[derive(Clone, Copy)]
-struct Config {
-    punct: &'static str,
+struct Config<'a> {
+    punct: &'a str,
+    /// `lex.whitespace` (Python's default is " \t\r\n").
+    whitespace: &'a str,
     comments: bool,
 }
 
-fn is_ws(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\r' | '\n')
-}
+const WHITESPACE: &str = " \t\r\n";
 
-struct Lexer {
-    cfg: Config,
+struct Lexer<'a> {
+    cfg: Config<'a>,
     chars: Vec<char>,
     pos: usize,
     state: State,
@@ -41,9 +41,13 @@ struct Lexer {
     token: String,
 }
 
-impl Lexer {
+impl Lexer<'_> {
     fn is_punct(&self, c: char) -> bool {
         self.cfg.punct.contains(c)
+    }
+
+    fn is_ws(&self, c: char) -> bool {
+        self.cfg.whitespace.contains(c)
     }
 
     fn read(&mut self) -> Option<char> {
@@ -81,7 +85,7 @@ impl Lexer {
                         self.state = State::End;
                         break;
                     }
-                    Some(c) if is_ws(c) => {
+                    Some(c) if self.is_ws(c) => {
                         if !self.token.is_empty() || quoted {
                             break;
                         }
@@ -131,7 +135,7 @@ impl Lexer {
                         self.state = State::End;
                         break;
                     }
-                    Some(c) if is_ws(c) => {
+                    Some(c) if self.is_ws(c) => {
                         self.state = State::Space;
                         if !self.token.is_empty() || quoted {
                             break;
@@ -183,6 +187,7 @@ pub fn split(command: &str) -> Result<Vec<String>, LexError> {
         command,
         Config {
             punct: PUNCT,
+            whitespace: WHITESPACE,
             comments: true,
         },
     )
@@ -194,6 +199,21 @@ pub fn split_plain(command: &str) -> Result<Vec<String>, LexError> {
         command,
         Config {
             punct: "",
+            whitespace: WHITESPACE,
+            comments: false,
+        },
+    )
+}
+
+/// `shlex.shlex(command, posix=True, punctuation_chars=punct)` with `whitespace_split = True`, `commenters = ""`
+/// and `lex.whitespace = whitespace`: the settings the repo guards use (`punct` "();<>|&" is Python's
+/// `punctuation_chars=True`).
+pub fn split_with(command: &str, punct: &str, whitespace: &str) -> Result<Vec<String>, LexError> {
+    run(
+        command,
+        Config {
+            punct,
+            whitespace,
             comments: false,
         },
     )
