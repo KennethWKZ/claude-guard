@@ -6,6 +6,10 @@
 //!
 //! - bash, read: the detached copy decides with the Rust code, runs the reference hook(s) on the same input and
 //!   compares the verdicts.
+//! - repo pre-bash: the detached copy decides with the Rust code and runs every reference hook given (a repo's
+//!   Python Bash hooks, in its settings' order) side by side, as Claude Code does; the reference verdict is the
+//!   first block among them, else an allow. A reference that crashes logs to the repo's own error log, as it does
+//!   when it runs as the hook, so a crash shows there twice during the shadow week.
 //! - husky copies files, so its reference can't be run a second time. The hook itself works out what it would
 //!   copy (dry run) before detaching, which is before the Python hook (40 ms of start-up) copies anything; the
 //!   detached copy waits for the Python hook and checks that it copied exactly those items. A worktree the
@@ -15,7 +19,7 @@
 //! transcript, never a command, a path or file contents.
 
 use crate::hookio::{self, py_str};
-use crate::{bash, husky, prompt, read, session_name, web};
+use crate::{bash, husky, prompt, read, repo, session_name, web};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,6 +27,8 @@ use std::time::{Duration, Instant};
 pub struct Options {
     pub hook: String,
     pub reference: String,
+    /// repo pre-bash: every reference hook, in the repo settings' order.
+    pub references: Vec<String>,
     pub pip_reference: String,
     /// prompt: the blocked-terms file for both sides (default: the hooks' own default).
     pub terms: Option<String>,
@@ -35,6 +41,15 @@ pub struct Options {
 
 impl Options {
     fn args(&self) -> Vec<String> {
+        if self.hook == "repo" {
+            let mut a: Vec<String> =
+                vec!["repo".into(), "pre-bash".into(), "--shadow-compare".into()];
+            for r in &self.references {
+                a.extend(["--reference".into(), r.clone()]);
+            }
+            a.extend(["--log".into(), self.log.clone()]);
+            return a;
+        }
         let mut a = vec![self.hook.clone(), "--shadow-compare".into()];
         if let Some(m) = &self.web_mode {
             a.push(m.clone());
@@ -215,6 +230,7 @@ pub fn compare(opts: &Options) {
         "prompt" => compare_prompt(opts, &payload),
         "web" => compare_web(opts, &payload),
         "session-name" => compare_session_name(opts, &payload),
+        "repo" => compare_repo(opts, &payload),
         _ => {}
     }
 }
@@ -450,6 +466,86 @@ fn compare_web(opts: &Options, input: &[u8]) {
             same_reason: ref_line == rust.line,
             rust: rust.rule,
             reference: ref_rule,
+            rust_ms,
+            reference_ms,
+        },
+    );
+}
+
+/// Rust's decision (nothing logged) against the reference hooks run side by side. `same`: the same exit code;
+/// `same_reason`: the same stderr too. The reference's rule is Rust's when the messages agree, else "block" or
+/// "allow"; a reference crash looks like an allow (that is what Claude Code sees).
+fn compare_repo(opts: &Options, input: &[u8]) {
+    let t = Instant::now();
+    let rust = repo::decide(input, None);
+    let rust_ms = ms(t);
+    if matches!(rust.verdict, repo::Verdict::NoConfig(_)) {
+        // No config: nothing to compare (the hook is off for this repo).
+        return;
+    }
+    let (rcode, rerr) = rust.outcome();
+    let t = Instant::now();
+    let runs: Vec<Option<Ran>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = opts
+            .references
+            .iter()
+            .map(|r| {
+                sc.spawn(move || {
+                    run(
+                        &["/usr/bin/python3", "-I", r.as_str()],
+                        input,
+                        Duration::from_secs(8),
+                    )
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().ok().flatten()).collect()
+    });
+    let reference_ms = ms(t);
+    let reference: Result<(i32, String), &str> = (|| {
+        let mut allow = true;
+        for r in &runs {
+            let r = r.as_ref().ok_or("reference-not-run")?;
+            if r.timed_out {
+                return Err("reference-timeout");
+            }
+            match r.code {
+                Some(2) => {
+                    return Ok((2, String::from_utf8_lossy(&r.stderr).into_owned()));
+                }
+                Some(0) => {}
+                _ => allow = false,
+            }
+        }
+        if allow {
+            Ok((0, String::new()))
+        } else {
+            Err("reference-error")
+        }
+    })();
+    let rust_rule = rust.rule();
+    let (ref_rule, same, same_reason) = match &reference {
+        Ok((code, err)) => {
+            let rule = if *code == rcode && *err == rerr {
+                rust_rule.clone()
+            } else if *code == 2 {
+                "block".into()
+            } else {
+                "allow".into()
+            };
+            (rule, *code == rcode, *code == rcode && *err == rerr)
+        }
+        Err(e) => (e.to_string(), false, false),
+    };
+    write_line(
+        &opts.log,
+        Line {
+            hook: "repo-pre-bash",
+            input,
+            rust: rust_rule,
+            reference: ref_rule,
+            same,
+            same_reason,
             rust_ms,
             reference_ms,
         },

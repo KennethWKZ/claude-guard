@@ -2,15 +2,19 @@
 //! (messages, the guard module, where errors are logged) comes from that repo's `.claude/repo-guard.json`, found
 //! through `CLAUDE_PROJECT_DIR`.
 //!
-//! Rules so far: the Logs Insights cost guard, ported from a repo's Python hook that blocks
+//! Two rule sets, each on when its config section is there, both run on every call (as the two Python hooks they
+//! replace ran side by side; a block from the first, in this order, is the one shown):
+//!
+//! 1. The Logs Insights cost guard (`pre_bash.logs_insights`), ported from a repo's Python hook that blocks
 //! - a raw `aws ... logs ... start-query` the command runs itself (also through `bash -c`, a heredoc fed to a
 //!   shell, `$(...)` and backticks, three levels deep), and
 //! - Python that starts a query without the repo's guard module: a `.py` file the command runs (found where it
 //!   runs: after a `cd`, with `~` and `$VAR` expanded) or inline Python (`-c`, a heredoc).
+//! 2. The shared-working-tree guard (`pre_bash.git` and its sibling sections): `repo_tree.rs`.
 //!
 //! Failure behaviour (written here on purpose; see the porting rules):
-//! - Unreadable hook input and any internal error let the command through and append one line to the repo's error
-//!   log, exactly where the Python hook let it through (`Crash`). `FAIL_CLOSED` turns internal errors into blocks;
+//! - Unreadable hook input and any internal error let the command through and append one line per rule set to the
+//!   repo's error log, exactly where the Python hooks let it through (`Decision::crashes`). `FAIL_CLOSED` turns internal errors into blocks;
 //!   it stays off until the shadow week shows Rust and Python agree.
 //! - A missing or invalid config lets the command through with a `systemMessage` warning: the guard is off, and
 //!   the session should know.
@@ -19,6 +23,8 @@
 //! Overrides are arguments: `--crash-log F` (tests) replaces the config's error log.
 
 use crate::hookio::{self, py_truthy};
+use crate::repo_tree::{Guard, TreeConfig};
+use crate::shell_words::{heredoc_marks, py_split};
 use crate::{logfile, pyfs, pyre::PyText, shlex};
 use regex::Regex;
 use serde_json::Value;
@@ -56,18 +62,60 @@ pub enum Verdict {
     Allow,
     Block {
         message: String,
-        rule: &'static str,
+        rule: String,
     },
-    /// Where the Python hook raised: the text is for the error log only.
-    Crash(String),
     /// No usable config: allowed, with this warning.
     NoConfig(String),
 }
 
-/// The parts of `.claude/repo-guard.json` the rules use.
+/// A verdict, the internal errors met on the way (one per rule set that raised where its Python hook did; for the
+/// error log only) and where to log them.
+#[derive(Debug, Clone)]
+pub struct Decision {
+    pub verdict: Verdict,
+    pub crashes: Vec<String>,
+    pub log: Option<String>,
+}
+
+impl Decision {
+    /// The rule id for logs: the block's rule, "crash" for an allow after an internal error, else "allow".
+    pub fn rule(&self) -> String {
+        match &self.verdict {
+            Verdict::Block { rule, .. } => rule.clone(),
+            Verdict::NoConfig(_) => "no-config".into(),
+            Verdict::Allow if !self.crashes.is_empty() => "crash".into(),
+            Verdict::Allow => "allow".into(),
+        }
+    }
+
+    /// (exit code, stderr) as `emit` would give them.
+    pub fn outcome(&self) -> (i32, String) {
+        match &self.verdict {
+            Verdict::Block { message, .. } => (2, format!("{message}\n")),
+            _ if FAIL_CLOSED && !self.crashes.is_empty() => (2, crash_block(&self.crashes[0])),
+            _ => (0, String::new()),
+        }
+    }
+}
+
+fn crash_block(e: &str) -> String {
+    format!(
+        "claude-guard repo pre-bash failed, so the command is blocked: {}\n",
+        e.lines().next().unwrap_or("")
+    )
+}
+
+/// `.claude/repo-guard.json`: the error log and the rule sets it turns on.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub error_log: String,
+    pub logs: Option<LogsConfig>,
+    pub tree: Option<TreeConfig>,
+}
+
+/// `pre_bash.logs_insights`.
+#[derive(Debug, Clone)]
+pub struct LogsConfig {
     pub guard_module: String,
     pub raw_cli_reason: String,
     pub script_reason: String,
@@ -99,30 +147,35 @@ impl Config {
         let li = ["pre_bash", "logs_insights"];
         let at = |k: &str| field(&v, &[li[0], li[1], k]).map(str::to_string);
         let error_log = field(&v, &["error_log"])?;
+        let logs = match v.get(li[0]).and_then(|p| p.get(li[1])) {
+            None => None,
+            Some(_) => Some(LogsConfig {
+                guard_module: at("guard_module")?,
+                raw_cli_reason: at("raw_cli_reason")?,
+                script_reason: at("script_reason")?,
+                inline_reason: at("inline_reason")?,
+                block_message: at("block_message")?,
+            }),
+        };
+        let tree = TreeConfig::load(&v).map_err(|e| format!("{path}: {e}"))?;
+        if logs.is_none() && tree.is_none() {
+            return Err(format!(
+                "{path}: no rules (pre_bash.logs_insights or pre_bash.git)"
+            ));
+        }
         Ok(Config {
             error_log: if error_log.starts_with('/') {
                 error_log.to_string()
             } else {
                 format!("{project}/{error_log}")
             },
-            guard_module: at("guard_module")?,
-            raw_cli_reason: at("raw_cli_reason")?,
-            script_reason: at("script_reason")?,
-            inline_reason: at("inline_reason")?,
-            block_message: at("block_message")?,
+            logs,
+            tree,
         })
     }
 }
 
 // ------------------------------------------------------------------ shell words, as the Python hook splits them
-
-/// `str.split()`: runs of Python whitespace.
-fn py_split(s: &str) -> Vec<String> {
-    s.split(pyfs::py_isspace)
-        .filter(|w| !w.is_empty())
-        .map(str::to_string)
-        .collect()
-}
 
 /// `words()`: shlex with `punctuation_chars=True`, no comments; `str.split()` on a ValueError.
 fn words(command: &str) -> Vec<String> {
@@ -131,58 +184,6 @@ fn words(command: &str) -> Vec<String> {
 
 fn is_sep(w: &str) -> bool {
     SEPARATORS.contains(&w)
-}
-
-/// `HEREDOC.finditer(line)` for `(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2`: (start, strip tabs, delimiter).
-fn heredoc_marks(line: &str) -> Vec<(usize, bool, String)> {
-    let cs: Vec<(usize, char)> = line.char_indices().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 1 < cs.len() {
-        if cs[i].1 == '<' && cs[i + 1].1 == '<' && (i == 0 || cs[i - 1].1 != '<') {
-            let mut j = i + 2;
-            let dash = j < cs.len() && cs[j].1 == '-';
-            if dash {
-                j += 1;
-            }
-            while j < cs.len() && pyfs::py_isspace(cs[j].1) {
-                j += 1;
-            }
-            let quote = if j < cs.len() && (cs[j].1 == '\'' || cs[j].1 == '"') {
-                Some(cs[j].1)
-            } else {
-                None
-            };
-            let try_at = |start: usize, q: Option<char>| -> Option<(usize, String)> {
-                let first = cs.get(start)?.1;
-                if !(first.is_ascii_alphabetic() || first == '_') {
-                    return None;
-                }
-                let mut k = start + 1;
-                while k < cs.len() && (cs[k].1.is_ascii_alphanumeric() || cs[k].1 == '_') {
-                    k += 1;
-                }
-                let name: String = cs[start..k].iter().map(|c| c.1).collect();
-                match q {
-                    Some(q) if cs.get(k).map(|c| c.1) == Some(q) => Some((k + 1, name)),
-                    Some(_) => None,
-                    None => Some((k, name)),
-                }
-            };
-            // The quote group is optional: with a quote, the name must close with the same quote; without one,
-            // the name starts right there. A dash or spaces given back never lead to a match (see the tests).
-            let hit = quote
-                .and_then(|q| try_at(j + 1, Some(q)))
-                .or_else(|| try_at(j, None));
-            if let Some((end, name)) = hit {
-                out.push((cs[i].0, dash, name));
-                i = end;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
 }
 
 /// `first_program(text)`: the program of the last command in `text`, env assignments skipped.
@@ -226,7 +227,7 @@ fn split_heredocs(command: &str) -> (String, Vec<String>) {
             continue;
         }
         kept.push(line);
-        for (start, dash, name) in heredoc_marks(line) {
+        for (start, _, dash, name) in heredoc_marks(line) {
             let to_shell = SHELLS.contains(&first_program(&line[..start]).as_str());
             pending.push((dash, name, to_shell, Vec::new()));
         }
@@ -392,7 +393,7 @@ fn script_paths(
 fn reason(
     command: &str,
     cwd: Here,
-    cfg: &Config,
+    cfg: &LogsConfig,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Option<String>, String> {
     if raw_start_query(command, 0) {
@@ -414,9 +415,50 @@ fn reason(
     Ok(None)
 }
 
-fn check(data: &serde_json::Map<String, Value>, cfg: &Config) -> Result<Verdict, String> {
-    if data.get("tool_name") != Some(&Value::String("Bash".into())) {
-        return Ok(Verdict::Allow);
+/// The hook input's `command` as both Python hooks read it: `(data.get("tool_input") or {}).get("command") or ""`.
+fn command_of(data: &serde_json::Map<String, Value>) -> Result<Value, String> {
+    match data.get("tool_input") {
+        Some(t) if py_truthy(t) => match t {
+            Value::Object(m) => Ok(m
+                .get("command")
+                .filter(|c| py_truthy(c))
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new()))),
+            other => Err(format!(
+                "AttributeError: '{}' object has no attribute 'get'",
+                hookio::py_type_name(other)
+            )),
+        },
+        _ => Ok(Value::String(String::new())),
+    }
+}
+
+fn is_bash(data: &serde_json::Map<String, Value>) -> bool {
+    data.get("tool_name") == Some(&Value::String("Bash".into()))
+}
+
+/// The shared-tree rules: (message, rule) or None.
+fn check_tree(
+    data: &serde_json::Map<String, Value>,
+    cfg: &TreeConfig,
+    project: &str,
+) -> Result<Option<(String, String)>, String> {
+    if !is_bash(data) {
+        return Ok(None);
+    }
+    let command = command_of(data)?;
+    let repo = pyfs::realpath(project)?;
+    let cwd = data.get("cwd").filter(|c| py_truthy(c));
+    Guard::new(repo, cfg).check(&command, cwd)
+}
+
+/// The Logs Insights rule: the block message or None.
+fn check_logs(
+    data: &serde_json::Map<String, Value>,
+    cfg: &LogsConfig,
+) -> Result<Option<String>, String> {
+    if !is_bash(data) {
+        return Ok(None);
     }
     let command = match data.get("tool_input") {
         Some(t) if py_truthy(t) => match t {
@@ -448,96 +490,110 @@ fn check(data: &serde_json::Map<String, Value>, cfg: &Config) -> Result<Verdict,
             None => Here::Dir(pyfs::cwd()?),
         },
     };
-    Ok(match reason(&command, cwd, cfg, &env)? {
-        Some(why) => Verdict::Block {
-            message: cfg.block_message.replace("{why}", &why),
-            rule: "logs-insights",
-        },
-        None => Verdict::Allow,
-    })
+    Ok(reason(&command, cwd, cfg, &env)?.map(|why| cfg.block_message.replace("{why}", &why)))
 }
 
-/// The verdict for one hook input, and where to log a crash.
-pub fn decide(input: &[u8], crash_log: Option<&str>) -> (Verdict, Option<String>) {
+/// The verdict for one hook input. Nothing is written here (`emit` logs the crashes), so shadow mode can call it.
+pub fn decide(input: &[u8], crash_log: Option<&str>) -> Decision {
     let project = std::env::var("CLAUDE_PROJECT_DIR").unwrap_or_default();
+    let no_config = |why: String| Decision {
+        verdict: Verdict::NoConfig(why),
+        crashes: Vec::new(),
+        log: None,
+    };
     if project.is_empty() {
-        return (
-            Verdict::NoConfig("CLAUDE_PROJECT_DIR is not set".into()),
-            None,
-        );
+        return no_config("CLAUDE_PROJECT_DIR is not set".into());
     }
     let cfg = match Config::load(&project) {
         Ok(c) => c,
-        Err(e) => return (Verdict::NoConfig(e), None),
+        Err(e) => return no_config(e),
     };
     let log = Some(
         crash_log
             .map(str::to_string)
             .unwrap_or_else(|| cfg.error_log.clone()),
     );
-    // The Python hook let json.load raise, and logged it: bad JSON, bad UTF-8 and too deep all count as crashes.
+    let parts: Vec<&str> = [
+        cfg.logs.as_ref().map(|_| "logs-insights"),
+        cfg.tree.as_ref().map(|_| "tree"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let every = |e: String| Decision {
+        verdict: Verdict::Allow,
+        crashes: parts.iter().map(|p| format!("{p} {e}")).collect(),
+        log: log.clone(),
+    };
+    // The Python hooks let json.load raise, and logged it: bad JSON, bad UTF-8 and too deep all count as crashes.
     let data = match hookio::parse_py(input) {
         Ok(Value::Object(d)) => d,
         Ok(other) => {
-            return (
-                Verdict::Crash(format!(
-                    "AttributeError: '{}' object has no attribute 'get'",
-                    hookio::py_type_name(&other)
-                )),
-                log,
-            );
+            return every(format!(
+                "AttributeError: '{}' object has no attribute 'get'",
+                hookio::py_type_name(&other)
+            ));
         }
         Err(hookio::ParseError::TooDeep(kind)) => {
-            return (Verdict::Crash(hookio::ParseError::too_deep_text(kind)), log);
+            return every(hookio::ParseError::too_deep_text(kind));
         }
-        Err(hookio::ParseError::Invalid) => return (Verdict::Crash("JSONDecodeError".into()), log),
+        Err(hookio::ParseError::Invalid) => return every("JSONDecodeError".into()),
     };
-    let v = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&data, &cfg))) {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => Verdict::Crash(e),
-        Err(_) => Verdict::Crash("panic".into()),
+    let mut crashes = Vec::new();
+    let mut block: Option<(String, String)> = None;
+    let mut run = |name: &str, f: &dyn Fn() -> Result<Option<(String, String)>, String>| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(Ok(Some(b))) => {
+                block.get_or_insert(b);
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => crashes.push(format!("{name} {e}")),
+            Err(_) => crashes.push(format!("{name} panic")),
+        }
     };
-    (v, log)
+    if let Some(l) = &cfg.logs {
+        run("logs-insights", &|| {
+            Ok(check_logs(&data, l)?.map(|m| (m, "logs-insights".to_string())))
+        });
+    }
+    if let Some(t) = &cfg.tree {
+        run("tree", &|| check_tree(&data, t, &project));
+    }
+    Decision {
+        verdict: match block {
+            Some((message, rule)) => Verdict::Block { message, rule },
+            None => Verdict::Allow,
+        },
+        crashes,
+        log,
+    }
 }
 
-/// Act on the verdict; returns the exit code.
-pub fn emit(v: &Verdict, log: Option<&str>) -> i32 {
-    match v {
-        Verdict::Allow => 0,
-        Verdict::Block { message, .. } => {
-            eprintln!("{message}");
-            2
-        }
-        Verdict::Crash(e) => {
-            if let Some(path) = log {
-                let first = e.lines().next().unwrap_or("");
-                logfile::append(
-                    path,
-                    &format!("{} repo-pre-bash {first}", crate::now_utc()),
-                    LOG_CAP,
-                );
-            }
-            if FAIL_CLOSED {
-                eprintln!(
-                    "claude-guard repo pre-bash failed, so the command is blocked: {}",
-                    e.lines().next().unwrap_or("")
-                );
-                2
-            } else {
-                0
-            }
-        }
-        Verdict::NoConfig(why) => {
-            let msg = format!(
-                "claude-guard repo pre-bash: no usable config ({why}); this repo's Bash guards are off for this call."
+/// Act on the decision; returns the exit code.
+pub fn emit(d: &Decision) -> i32 {
+    if let Some(path) = &d.log {
+        for e in &d.crashes {
+            let first = e.lines().next().unwrap_or("");
+            logfile::append(
+                path,
+                &format!("{} repo-pre-bash {first}", crate::now_utc()),
+                LOG_CAP,
             );
-            println!(
-                "{}",
-                hookio::py_dumps(&serde_json::json!({ "systemMessage": msg }))
-            );
-            0
         }
     }
+    if let Verdict::NoConfig(why) = &d.verdict {
+        let msg = format!(
+            "claude-guard repo pre-bash: no usable config ({why}); this repo's Bash guards are off for this call."
+        );
+        println!(
+            "{}",
+            hookio::py_dumps(&serde_json::json!({ "systemMessage": msg }))
+        );
+        return 0;
+    }
+    let (code, stderr) = d.outcome();
+    eprint!("{stderr}");
+    code
 }
 
 #[cfg(test)]
@@ -549,7 +605,7 @@ mod tests {
         let names = |l: &str| {
             heredoc_marks(l)
                 .into_iter()
-                .map(|(_, d, n)| (d, n))
+                .map(|(_, _, d, n)| (d, n))
                 .collect::<Vec<_>>()
         };
         assert_eq!(names("cat <<EOF"), [(false, "EOF".to_string())]);

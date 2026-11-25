@@ -4,14 +4,14 @@
 //!
 //! The reference hook and its config belong to a private repo, so nothing of theirs is in this one: the test runs
 //! only when both paths are given, and skips otherwise.
-//! Env (test only): CLAUDE_GUARD_REF_REPO_BASH (the Python hook), CLAUDE_GUARD_REF_REPO_CONFIG (that repo's
+//! Env (test only): CLAUDE_GUARD_REF_REPO_BASH (the Python hooks, ':'-separated in the repo settings' order; the
+//! expected answer is theirs combined, see `common::combine`), CLAUDE_GUARD_REF_REPO_CONFIG (that repo's
 //! .claude/repo-guard.json), CLAUDE_GUARD_DIFF_CASES (default 4000), CLAUDE_GUARD_DIFF_SEED,
 //! CLAUDE_GUARD_DIFF_WORKERS (default 2; pass "$(test-workers)").
 
 mod common;
 use common::*;
 use serde_json::{Value, json};
-use std::process::{Command, Stdio};
 
 const UNGUARDED: &str = "import boto3\nboto3.client('logs').start_query(logGroupName='g')\n";
 
@@ -288,10 +288,7 @@ fn generate(rng: &mut Rng, d: &str) -> String {
 
 #[test]
 fn rust_matches_python() {
-    let (Ok(reference), Ok(config_path)) = (
-        std::env::var("CLAUDE_GUARD_REF_REPO_BASH"),
-        std::env::var("CLAUDE_GUARD_REF_REPO_CONFIG"),
-    ) else {
+    let Some((refs, config_path)) = repo_references() else {
         eprintln!(
             "SKIPPED: set CLAUDE_GUARD_REF_REPO_BASH and CLAUDE_GUARD_REF_REPO_CONFIG to run it"
         );
@@ -384,39 +381,7 @@ fn rust_matches_python() {
         ));
     }
 
-    let driver = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference_driver.py");
-    let mut cmd = Command::new("/usr/bin/python3");
-    cmd.args(["-I", driver, "repo-bash", &reference])
-        .current_dir(&d)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    for (k, v) in &env {
-        cmd.env(k, v);
-    }
-    let mut child = cmd.spawn().unwrap();
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        let feed: String = inputs
-            .iter()
-            .map(|i| json!({"input": i}).to_string() + "\n")
-            .collect();
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = stdin.write_all(feed.as_bytes());
-        });
-    }
-    let py_out = child.wait_with_output().unwrap();
-    let py: Vec<Value> = String::from_utf8_lossy(&py_out.stdout)
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(
-        py.len(),
-        inputs.len(),
-        "driver answered {} of {}",
-        py.len(),
-        inputs.len()
-    );
+    let per_hook = reference_runs(&refs, &inputs, &env, &d);
 
     let rust: Vec<(Out, bool)> = parallel(&inputs, workers, |i, input| {
         let log = format!("{d}/crash/{i}.log");
@@ -429,34 +394,8 @@ fn rust_matches_python() {
         (o, std::path::Path::new(&log).exists())
     });
 
-    // Spot-check the in-process driver against real runs of the hook (which log a crash instead of reporting it).
-    let spot: Vec<usize> = (0..inputs.len())
-        .step_by((inputs.len() / 60).max(1))
-        .collect();
-    let real: Vec<Out> = parallel(&spot, workers, |_, &i| {
-        run_in(
-            &["/usr/bin/python3", "-I", &reference],
-            &inputs[i],
-            &env,
-            Some(&d),
-        )
-    });
-    for (k, &i) in spot.iter().enumerate() {
-        assert_eq!(
-            (
-                real[k].code,
-                real[k].stdout.as_str(),
-                real[k].stderr.as_str()
-            ),
-            (
-                py[i]["code"].as_i64().unwrap() as i32,
-                py[i]["stdout"].as_str().unwrap(),
-                py[i]["stderr"].as_str().unwrap()
-            ),
-            "driver vs real on {}",
-            inputs[i]
-        );
-    }
+    // Spot-check the in-process driver against real runs of the hooks (which log a crash instead of reporting it).
+    let spot = spot_check_driver(&refs, &per_hook, &inputs, &env, &d, workers);
 
     let (mut same, mut known, mut bad, mut blocked, mut crashed) = (
         0,
@@ -466,12 +405,8 @@ fn rust_matches_python() {
         0,
     );
     for i in 0..inputs.len() {
-        let (pc, po, pe, pcrash) = (
-            py[i]["code"].as_i64().unwrap() as i32,
-            py[i]["stdout"].as_str().unwrap_or(""),
-            py[i]["stderr"].as_str().unwrap_or(""),
-            py[i]["crash"].as_bool().unwrap(),
-        );
+        let p = combine(&per_hook, i);
+        let (pc, po, pe, pcrash) = (p.code, p.stdout.as_str(), p.stderr.as_str(), p.crash);
         let (r, rcrash) = &rust[i];
         blocked += (r.code == 2) as usize;
         crashed += *rcrash as usize;
@@ -492,7 +427,7 @@ fn rust_matches_python() {
         "differential repo pre-bash: {} inputs, {same} identical, known {known:?}, {} unexpected; {blocked} blocked, {crashed} crashed; {} spot checks",
         inputs.len(),
         bad.len(),
-        spot.len()
+        spot
     );
     assert!(
         bad.is_empty(),

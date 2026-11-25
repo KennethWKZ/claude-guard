@@ -9,7 +9,9 @@
 //!                         PreToolUse/PostToolUse web guard (was web-guard.sh + web-guard.py)
 //!   claude-guard session-name   UserPromptSubmit/SessionStart naming hook (was session-name-from-title.sh)
 //!   claude-guard repo pre-bash [--crash-log F]
-//!                         PreToolUse Bash guards a repo configures in .claude/repo-guard.json (was a repo's Python hook)
+//!                         PreToolUse Bash guards a repo configures in .claude/repo-guard.json (was a repo's Python hooks)
+//!   claude-guard repo pre-bash --shadow --reference F [--reference F ...] [--log F]
+//!                         shadow mode against the repo's Python hooks, given in its settings' order
 //!   claude-guard dns-nxdomain [--port N] [--log F]
 //!                         launchd daemon: NXDOMAIN for every DNS query on 127.0.0.1:10053 (was dns-nxdomain.py)
 //!   claude-guard <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F]
@@ -32,8 +34,10 @@ mod pyfs;
 mod pyre;
 mod read;
 mod repo;
+mod repo_tree;
 mod session_name;
 mod shadow;
+mod shell_words;
 mod shlex;
 mod web;
 
@@ -70,7 +74,7 @@ fn home() -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
+        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | repo pre-bash --shadow --reference F [--reference F ...] [--log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
     );
     std::process::exit(64);
 }
@@ -91,6 +95,48 @@ fn main() {
         );
         return;
     }
+    if cmd == "repo"
+        && matches!(
+            args.get(2).map(String::as_str),
+            Some("--shadow" | "--shadow-compare")
+        )
+    {
+        // `repo pre-bash --shadow --reference <hook> [--reference <hook> ...] [--log F]`.
+        if args[1] != "pre-bash" {
+            usage();
+        }
+        let mut opts = shadow::Options {
+            hook: "repo".into(),
+            reference: String::new(),
+            references: Vec::new(),
+            pip_reference: String::new(),
+            terms: None,
+            policy: None,
+            web_mode: None,
+            log: format!("{}/.local/state/claude-guard/shadow.log", home()),
+        };
+        let mut it = args[3..].iter();
+        while let Some(a) = it.next() {
+            let v = it.next().cloned().unwrap_or_else(|| usage());
+            match a.as_str() {
+                "--reference" => opts.references.push(v),
+                "--log" => opts.log = v,
+                _ => usage(),
+            }
+        }
+        if opts.references.is_empty() {
+            usage();
+        }
+        let compare = args[2] == "--shadow-compare";
+        let _ = std::panic::catch_unwind(|| {
+            if compare {
+                shadow::compare(&opts)
+            } else {
+                shadow::start(&opts)
+            }
+        });
+        std::process::exit(0);
+    }
     if cmd == "repo" {
         // `repo pre-bash [--crash-log <file>]`: the log override is for tests; the default comes from the config.
         let crash_log = match &args[1..] {
@@ -99,8 +145,7 @@ fn main() {
             _ => usage(),
         };
         let input = hookio::read_stdin();
-        let (verdict, log) = repo::decide(&input, crash_log.as_deref());
-        std::process::exit(repo::emit(&verdict, log.as_deref()));
+        std::process::exit(repo::emit(&repo::decide(&input, crash_log.as_deref())));
     }
     if cmd == "web" && args[1..] == ["--list-hosts"] {
         // The built-in block list for dns-blocklist; reads no stdin.
@@ -116,6 +161,7 @@ fn main() {
         let h = home();
         let mut opts = shadow::Options {
             hook: cmd.to_string(),
+            references: Vec::new(),
             reference: match cmd {
                 "bash" => format!("{h}/.claude/hooks/guard-bash.py"),
                 "read" => format!("{h}/.claude/hooks/guard-read-keys.py"),

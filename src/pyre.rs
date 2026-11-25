@@ -45,17 +45,23 @@ pub struct PyText<'a> {
 impl<'a> PyText<'a> {
     /// `ci`: the pattern is IGNORECASE.
     pub fn new(orig: &'a str, ci: bool) -> PyText<'a> {
-        Self::build(orig, ci, true)
+        Self::build(orig, ci, true, ' ')
+    }
+
+    /// Like `new` (no IGNORECASE), but U+001C..U+001F become U+2000 (whitespace to Rust's `\s`, yet not the space a
+    /// pattern may name literally, as in `[ \t]`, which Python never matches against them).
+    pub fn exact(orig: &'a str) -> PyText<'a> {
+        Self::build(orig, false, true, '\u{2000}')
     }
 
     /// Only the IGNORECASE letters (and U+001C..U+001F) replaced: for patterns built from the text's own
     /// characters (a blocked term), where two different characters must not become the same stand-in. `\w` and
     /// `\b` are then checked in code with `py_word`.
     pub fn case_only(orig: &'a str) -> PyText<'a> {
-        Self::build(orig, true, false)
+        Self::build(orig, true, false, ' ')
     }
 
-    fn build(orig: &'a str, ci: bool, words: bool) -> PyText<'a> {
+    fn build(orig: &'a str, ci: bool, words: bool, ws: char) -> PyText<'a> {
         let mut t = String::with_capacity(orig.len());
         let mut map = Vec::with_capacity(orig.len() + 1);
         let mut memo: HashMap<char, char> = HashMap::new();
@@ -80,7 +86,7 @@ impl<'a> PyText<'a> {
                     })
             };
             let s = if ('\u{1c}'..='\u{1f}').contains(&s) {
-                ' '
+                ws
             } else {
                 s
             };

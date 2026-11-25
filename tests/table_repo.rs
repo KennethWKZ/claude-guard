@@ -247,8 +247,25 @@ fn missing_or_bad_config_allows_with_a_warning() {
     );
     assert!(
         o.stdout
-            .contains("pre_bash.logs_insights.guard_module is missing"),
+            .contains("no rules (pre_bash.logs_insights or pre_bash.git)"),
         "{}",
+        o.stdout
+    );
+    std::fs::write(
+        format!("{d}/.claude/repo-guard.json"),
+        "{\"version\": 1, \"error_log\": \"e.log\", \"pre_bash\": {\"logs_insights\": {}}}",
+    )
+    .unwrap();
+    let o = run_in(
+        &[BIN, "repo", "pre-bash"],
+        &input,
+        &[("CLAUDE_PROJECT_DIR", &d)],
+        Some(&d),
+    );
+    assert!(
+        o.stdout
+            .contains("pre_bash.logs_insights.guard_module is missing"),
+        "a section that is there must be complete: {}",
         o.stdout
     );
     let o = run_in(&[BIN, "repo", "pre-bash", "--bogus"], &input, &[], Some(&d));

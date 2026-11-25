@@ -29,7 +29,7 @@ Claude Code's sandbox and permission rules, not instead of them. See [What it do
 | `claude-guard web pre` / `post` | PreToolUse / PostToolUse on fetch tools | `pre` denies canary, callback and cloud-metadata URLs and URLs carrying data; `post` flags hidden instructions in what came back | allows with a warning (fail open) |
 | `claude-guard husky` | PostToolUse `Bash\|EnterWorktree`, SessionStart | Copies husky's `.husky/_` (and GraphMind's git hooks) into new git worktrees | nothing more copied, logged; never blocks |
 | `claude-guard session-name` | UserPromptSubmit, SessionStart | Names an unnamed session from Claude's own title for it | prints nothing |
-| `claude-guard repo pre-bash` | PreToolUse `Bash`, in one repo | Guards a repo configures in its own `.claude/repo-guard.json`; so far the Logs Insights cost guard (raw `aws logs start-query`, and Python that starts queries without the repo's guard module) | allows, logs one line (blocks once the repo opts in) |
+| `claude-guard repo pre-bash` | PreToolUse `Bash`, in one repo | Guards a repo configures in its own `.claude/repo-guard.json`: the Logs Insights cost guard (raw `aws logs start-query`, and Python that starts queries without the repo's guard module) and, for repos where sessions share one working tree, the shared-tree guard (git outside the commit queue, history and branch moves, discards, shell and interpreter writes to locked folders, the write ledger) | allows, logs one line (blocks once the repo opts in) |
 | `claude-guard dns-nxdomain` | not a hook | A tiny DNS responder that answers "no such domain" for blocked domains (see below) | skips that reply |
 
 Input that isn't hook JSON is let through by every guard: a hook that blocked on bad input could lock up Claude Code.
@@ -108,7 +108,7 @@ use them. To check it works, ask Claude Code to run `grep -r x .`: the Bash guar
 | --- | --- | --- |
 | `~/.config/claude-guard/blocked-terms.txt` | `prompt`, `web pre` | Names to watch for (customers, projects): one per line, `#` starts a comment, matched in any case as whole words. Optional |
 | `~/.config/claude-guard/url-policy.json` | `web pre` | Your own `allow_hosts`, `block_hosts` and `warn_hosts` lists on top of the built-in ones. Optional |
-| `<repo>/.claude/repo-guard.json` | `repo pre-bash` | That repo's rules and wording (version 1): `error_log`, and under `pre_bash.logs_insights` the `guard_module` name and the `raw_cli_reason`, `script_reason` (`{path}`), `inline_reason` and `block_message` (`{why}`) texts. Found through `CLAUDE_PROJECT_DIR`; missing or invalid, the hook allows and says so in a `systemMessage` |
+| `<repo>/.claude/repo-guard.json` | `repo pre-bash` | That repo's rules and wording (version 1): `error_log`; under `pre_bash.logs_insights` the `guard_module` name and the `raw_cli_reason`, `script_reason` (`{path}`), `inline_reason` and `block_message` (`{why}`) texts; for the shared-tree guard `repo_label`, `locked_dirs`, `output_dirs` and the `pre_bash.git` (`block_message` with `{op}` `{message}` `{advice}`, per-operation `messages` and `advice`, defaults, `saved_prune_message`), `shell_writes`, `interpreter_writes` and `write_ledger` (`dir`, `override_env`) sections. Each rule set is on when its section is there. Found through `CLAUDE_PROJECT_DIR`; missing or invalid, the hook allows and says so in a `systemMessage` |
 
 Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `bash-crash.log` rotate to `<log>.1` at
 1 MB):
@@ -206,8 +206,21 @@ rule blocks a raw `aws ... logs ... start-query` the command runs itself (also t
 shell, `$(...)` and backticks), and Python that starts a query without naming the repo's `guard_module`: a `.py` file
 the command runs, found where it runs (after a `cd`, with `~` and `$VAR` expanded), or inline Python. Ported from a
 Python hook and checked against it by `tests/differential_repo.rs`, which runs when `CLAUDE_GUARD_REF_REPO_BASH` and
-`CLAUDE_GUARD_REF_REPO_CONFIG` point at the reference hook and its config. An internal error allows the command and
-logs one line to the config's `error_log` (`--crash-log F` overrides it for tests).
+`CLAUDE_GUARD_REF_REPO_CONFIG` point at the reference hooks and their config.
+
+The shared-tree rules (`src/repo_tree.rs`, shell parsing in `src/shell_words.rs`) are for a repo where several
+sessions share one working tree, index and branch. They block git that stages or commits outside the repo's queue,
+rewrites history, moves the branch or HEAD, throws away uncommitted work, prunes unreachable objects at once (also
+through `-c`, `--config-env`, `GIT_CONFIG_*` or a value saved in git config) or writes the repo's own git config;
+shell writes (`>`, `tee`, `sed -i`, `cp`/`mv`, ...) onto files in `locked_dirs`; any use of the `write_ledger` folder
+or its override variable in what the command runs; and python, node, perl or ruby code that writes a file in the
+locked folders. Commands are followed through `cd`, `git -C`, `bash -c`, `eval`, substitutions, heredocs fed to a
+shell, scripts run by path, `xargs` and `find -exec`. Checked against the Python hooks by
+`tests/differential_repo_tree.rs` (same env vars). Both rule sets run on every call; the first block wins.
+
+An internal error allows the command and logs one line per rule set to the config's `error_log` (`--crash-log F`
+overrides it for tests). `repo pre-bash --shadow --reference <hook> [--reference <hook> ...]` runs next to the
+Python hooks during a shadow week: it never blocks or prints, and logs rule ids and agreement only.
 
 ### `claude-guard dns-nxdomain`
 
