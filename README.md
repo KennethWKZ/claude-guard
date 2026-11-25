@@ -176,6 +176,9 @@ A secret or an IC number blocks with the rule name only, never the matched text.
 
 A Bash call that names no fetch tool and no URL is let through without parsing.
 
+`claude-guard web --list-hosts` prints the built-in blocked host names and the cloud metadata names (no IP
+literals), sorted, one per line, so a DNS blocklist can use the same list as the hook.
+
 ### `claude-guard husky`
 
 After a Bash command that mentions `worktree add`, after EnterWorktree, and at session start, it finds the repository's

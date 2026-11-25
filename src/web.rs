@@ -9,6 +9,8 @@
 //! post (PostToolUse): detect only. Scans what came back for invisible Unicode, injection wording, hidden HTML
 //! text, planted keys and callback links, and tells Claude to treat the content as data.
 //!
+//! `web --list-hosts` prints the built-in block list (block hosts and metadata names) for dns-blocklist.
+//!
 //! Policy: built-in lists plus ~/.config/claude-guard/url-policy.json (`--policy`), in the real home folder from
 //! the user database, not `$HOME`: its `allow_hosts` lifts built-in blocks, so a Claude Code started with HOME set
 //! must not bring its own (web-guard.py reads `$HOME`; this is the one deliberate difference). Log:
@@ -41,6 +43,7 @@ const BLOCK_HOSTS: &[(&str, &str)] = &[
     ("oast.online", "OAST callback"),
     ("oast.fun", "OAST callback"),
     ("oast.me", "OAST callback"),
+    ("bxss.me", "OAST callback"),
     ("burpcollaborator.net", "Burp Collaborator"),
     ("oastify.com", "Burp Collaborator"),
     ("webhook.site", "request catcher"),
@@ -55,10 +58,16 @@ const BLOCK_HOSTS: &[(&str, &str)] = &[
     ("ptsv3.com", "request catcher"),
     ("requestinspector.com", "request catcher"),
     ("mockbin.org", "request catcher"),
+    ("requestrepo.com", "request catcher"),
+    ("webhooks.sh", "request catcher"),
+    ("webhooks.page", "request catcher"),
+    ("play.svix.com", "request catcher"),
+    ("usewebhook.com", "request catcher"),
     ("dnslog.cn", "DNS logger"),
     ("dnslog.link", "DNS logger"),
     ("ceye.io", "DNS logger"),
     ("dnslog.pw", "DNS logger"),
+    ("dig.pm", "DNS logger"),
     ("xss.ht", "blind-XSS catcher"),
     ("bxss.in", "blind-XSS catcher"),
     ("xss.report", "blind-XSS catcher"),
@@ -73,6 +82,25 @@ const METADATA_HOSTS: &[&str] = &[
     "100.100.100.200",
     "metadata.azure.internal",
 ];
+/// `claude-guard web --list-hosts`: the built-in names a DNS blocklist can block, one per line, sorted: every
+/// BLOCK_HOSTS entry plus the METADATA_HOSTS names (not the IP literals; the same filter as dns-blocklist's
+/// `^[\d.:a-f]+$`). dns-blocklist reads this, so the hook and the DNS layer share one list. The policy file's
+/// block_hosts aren't included: dns-blocklist adds those itself.
+pub fn list_hosts() -> String {
+    let ip_literal = |h: &str| {
+        h.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | 'a'..='f'))
+    };
+    let mut hosts: Vec<&str> = BLOCK_HOSTS
+        .iter()
+        .map(|(h, _)| *h)
+        .chain(METADATA_HOSTS.iter().copied().filter(|h| !ip_literal(h)))
+        .collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts.iter().map(|h| format!("{h}\n")).collect()
+}
+
 const WARN_HOSTS: &[(&str, &str)] = &[
     ("ngrok.io", "tunnel"),
     ("ngrok-free.app", "tunnel"),
@@ -84,6 +112,10 @@ const WARN_HOSTS: &[(&str, &str)] = &[
     ("localhost.run", "tunnel"),
     ("pinggy.link", "tunnel"),
     ("bore.pub", "tunnel"),
+    ("lhr.life", "tunnel"),
+    ("tunnelmole.net", "tunnel"),
+    ("devtunnels.ms", "tunnel"),
+    ("smee.io", "webhook relay"),
 ];
 
 fn rx(p: &str) -> Regex {

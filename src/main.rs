@@ -70,7 +70,7 @@ fn home() -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | session-name | repo pre-bash [--crash-log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
+        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
     );
     std::process::exit(64);
 }
@@ -101,6 +101,11 @@ fn main() {
         let input = hookio::read_stdin();
         let (verdict, log) = repo::decide(&input, crash_log.as_deref());
         std::process::exit(repo::emit(&verdict, log.as_deref()));
+    }
+    if cmd == "web" && args[1..] == ["--list-hosts"] {
+        // The built-in block list for dns-blocklist; reads no stdin.
+        print!("{}", web::list_hosts());
+        return;
     }
     if !["bash", "read", "husky", "prompt", "web", "session-name"].contains(&cmd) {
         usage();

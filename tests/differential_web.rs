@@ -581,3 +581,41 @@ fn rule_kind(stdout: &str) -> String {
     }
     "none".into()
 }
+
+/// `web --list-hosts` against the names dns-blocklist derives from web-guard.py (BLOCK_HOSTS plus the
+/// non-IP METADATA_HOSTS, sorted), so the Rust list and the Python one can't drift apart.
+#[test]
+fn list_hosts_matches_python() {
+    let h = home();
+    let refdir = env_or("CLAUDE_GUARD_REF_WEB", &format!("{h}/.claude/hooks"));
+    let reference = format!("{refdir}/web-guard.py");
+    if !std::path::Path::new(&reference).exists() {
+        eprintln!("SKIPPED: reference hook not found ({reference})");
+        return;
+    }
+    let py = Command::new("/usr/bin/python3")
+        .args([
+            "-I",
+            "-c",
+            "import importlib.util, re, sys\n\
+             spec = importlib.util.spec_from_file_location('web_guard', sys.argv[1])\n\
+             mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n\
+             names = set(mod.BLOCK_HOSTS) | {h for h in mod.METADATA_HOSTS if not re.match(r'^[\\d.:a-f]+$', h)}\n\
+             print(''.join(n + '\\n' for n in sorted(names)), end='')",
+            &reference,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        py.status.success(),
+        "python: {}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    let rust = run(&[BIN, "web", "--list-hosts"], "");
+    assert_eq!(rust.code, 0);
+    assert_eq!(
+        rust.stdout,
+        String::from_utf8_lossy(&py.stdout),
+        "web --list-hosts differs from web-guard.py"
+    );
+}

@@ -888,3 +888,41 @@ fn a_fake_home() {
     );
     let _ = std::fs::remove_dir_all(&fake);
 }
+
+/// `web --list-hosts`: dns-blocklist's source. Sorted, unique, domain names only (no IP literals), and it reads no
+/// stdin and writes no log.
+#[test]
+fn list_hosts() {
+    let o = run(&[BIN, "web", "--list-hosts"], "this stdin is ignored");
+    assert_eq!(o.code, 0, "{o:?}");
+    assert_eq!(o.stderr, "");
+    let hosts: Vec<&str> = o.stdout.lines().collect();
+    let mut sorted = hosts.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(hosts, sorted, "sorted and unique");
+    for must in [
+        "webhook.site",
+        "canarytokens.com",
+        "oastify.com",
+        "m.pipedream.net",
+        "metadata.google.internal",
+    ] {
+        assert!(hosts.contains(&must), "{must} listed");
+    }
+    for never in [
+        "169.254.169.254",
+        "100.100.100.200",
+        "fd00:ec2::254",
+        "pipedream.net",
+    ] {
+        assert!(!hosts.contains(&never), "{never} not listed");
+    }
+    assert!(
+        hosts.iter().all(|h| h.split('.').count() >= 2
+            && h.split('.').all(|l| !l.is_empty()
+                && l.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))),
+        "every line is a domain a resolver file can be named after"
+    );
+}
