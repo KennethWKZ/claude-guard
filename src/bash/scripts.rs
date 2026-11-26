@@ -4,6 +4,7 @@
 //!
 //! - A path is read relative to the hook's `cwd`, with `~` and `$HOME` expanded. A missing file, a directory, or a
 //!   relative path with no text `cwd` is not read (the command is checked as written).
+//! - Third-party folders are never read (`node_modules`, `vendor`, `.venv`, `venv`, `site-packages`, `.git`).
 //! - Only scripts Claude could have written are read: inside `cwd` (the project) or a temp folder (`/tmp`,
 //!   `$TMPDIR`). Tools and dotfiles elsewhere (`/opt/homebrew/bin/brew`, `~/.zshrc`) are not, so their own internals
 //!   don't trip the rules. A `cwd` of the home folder or `/` is too broad to count; then only temp folders do.
@@ -106,7 +107,7 @@ pub(super) fn read_script(file: &str, cwd: Option<&str>, explicit: bool) -> Scri
         return Script::Skip;
     }
     let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-    if !in_allowed_root(&canon, cwd) {
+    if !in_allowed_root(&canon, cwd) || third_party(&canon) {
         return Script::Skip;
     }
     if meta.len() > MAX_SCRIPT {
@@ -118,6 +119,16 @@ pub(super) fn read_script(file: &str, cwd: Option<&str>, explicit: bool) -> Scri
     }
     head.extend(rest);
     Script::Text(String::from_utf8_lossy(&head).into_owned(), canon)
+}
+
+/// Third-party code inside a project (installed packages, vendored code), which Claude didn't write.
+fn third_party(canon: &Path) -> bool {
+    canon.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some("node_modules" | "vendor" | ".venv" | "venv" | "site-packages" | ".git")
+        )
+    })
 }
 
 /// True if `canon` is inside the project (`cwd`, unless it is the home folder or `/`) or a temp folder.

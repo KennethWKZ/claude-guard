@@ -146,7 +146,8 @@ deny	yq '.env' .env
 deny	cat .env.LAVISH_AXI_TELEMETRY
 deny	grep FOO .env.LAVISH_AXI_TELEMETRY
 # heredoc bodies are data, unless a shell reads them
-allow	python3 - <<'PY'⏎import os⏎os.system("rm -rf /var/lib/x")⏎print(open("std::env::current_dir"))⏎PY
+# Rust reads python code fed on stdin and checks what os.system runs (the Python guard read the body as data).
+deny	python3 - <<'PY'⏎import os⏎os.system("rm -rf /var/lib/x")⏎print(open("std::env::current_dir"))⏎PY
 allow	cat > src/x.rs <<'EOF'⏎    .env("HOME", home)⏎EOF
 allow	cat > notes.sh <<-EOF⏎	rm -rf "$STATE_DIR" /srv/x⏎	EOF
 deny	cat > notes.txt <<'EOF'⏎text⏎EOF⏎cat .env

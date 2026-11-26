@@ -407,7 +407,8 @@ pub(super) fn executed(seg: &[String], input: Option<&str>) -> Vec<String> {
             Some(program) => awk_commands(program, input),
             None => Vec::new(),
         },
-        _ => Vec::new(),
+        // perl, python, node, ruby, php, lua, osascript: commands their code runs.
+        _ => super::interp::commands(seg, input),
     };
     out.retain(|c| !c.trim().is_empty());
     out.dedup();

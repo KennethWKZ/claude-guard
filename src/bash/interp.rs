@@ -1,0 +1,670 @@
+//! Commands run by code given to an interpreter, so every rule holds inside them (Rust only):
+//!
+//! | Interpreter | Code from | Commands |
+//! | --- | --- | --- |
+//! | perl | `-e`/`-E` (also `-ne`, `-lane`), stdin, a file | `system`, `exec`, `readpipe`, backticks, `qx`, pipe `open` |
+//! | python (`python3.12`, pypy) | `-c`, stdin, a file | `os.system`, `os.popen`, `subprocess.*`, `os.exec*`, `os.spawn*` |
+//! | node, bun, deno | `-e`/`--eval`/`-p`, `deno eval`, stdin, a file | `child_process` `exec*`/`spawn*`/`execFile*`, `Bun.spawn`, Bun `` $`...` ``, `Deno.Command`, `Deno.run` |
+//! | ruby | `-e`, stdin, a file | `system`, `exec`, `spawn`, backticks, `%x{}`, `IO.popen`, `Open3.*` |
+//! | php | `-r`/`-R`/`-B`/`-E`, stdin, a file | `exec`, `shell_exec`, `system`, `passthru`, `popen`, `proc_open`, backticks |
+//! | lua | `-e`, stdin, a file | `os.execute`, `io.popen` |
+//! | osascript | `-e`, stdin, a file | `do shell script` |
+//!
+//! A call's argument is read from its string literals: one string is a command line; a list (`["git", "push"]`) or
+//! several arguments are an argv. Literals joined with `.`, `+` or `&` count as one, and variables between them
+//! drop out (`"rm -rf " . $dir` reads as `rm -rf `); interpolations (`${x}`, `#{x}`, f-string `{x}`) read as the word
+//! `x`, so `/srv/${name}` stays absolute and `${dir}/build` stays relative. A heuristic: code that builds a command
+//! any other way (eval, variables, ffi) isn't followed.
+
+use super::wrappers::shell_join;
+use crate::pyfs;
+use regex::Regex;
+use std::sync::LazyLock;
+
+static INTERP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[$#]\{[^}]*\}").expect("static regex"));
+static FSTRING_FIELD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{[^}]*\}").expect("static regex"));
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum Lang {
+    Perl,
+    Python,
+    Node,
+    Ruby,
+    Php,
+    Lua,
+    Osa,
+}
+
+/// Where an interpreter takes its code from.
+pub(super) enum Source {
+    Inline(String),
+    Stdin,
+    File(String),
+    None,
+}
+
+pub(super) fn lang_of(verb: &str) -> Option<Lang> {
+    let b = pyfs::basename(verb);
+    let python = b == "python"
+        || b == "pypy"
+        || b == "pypy3"
+        || (b.starts_with("python") && b[6..].chars().all(|c| c.is_ascii_digit() || c == '.'));
+    Some(match b {
+        "perl" | "perl5" => Lang::Perl,
+        "node" | "nodejs" | "bun" | "deno" => Lang::Node,
+        "ruby" | "jruby" => Lang::Ruby,
+        "php" => Lang::Php,
+        "osascript" => Lang::Osa,
+        _ if b == "lua"
+            || b == "luajit"
+            || (b.starts_with("lua") && b[3..].chars().all(|c| c.is_ascii_digit() || c == '.')) =>
+        {
+            Lang::Lua
+        }
+        _ if python => Lang::Python,
+        _ => return None,
+    })
+}
+
+/// The code an interpreter command runs: inline options, stdin, or a file.
+pub(super) fn source(seg: &[String]) -> Option<(Lang, Source)> {
+    let lang = lang_of(seg.first()?)?;
+    let mut args: &[String] = &seg[1..];
+    let verb = pyfs::basename(&seg[0]);
+    if verb == "deno" {
+        match args.first().map(String::as_str) {
+            Some("eval") => {
+                let code = args[1..].iter().find(|a| !a.starts_with('-'))?;
+                return Some((lang, Source::Inline(code.clone())));
+            }
+            Some("run") => args = &args[1..],
+            _ => return Some((lang, Source::None)),
+        }
+    }
+    if verb == "bun" && args.first().is_some_and(|a| a == "run") {
+        args = &args[1..];
+    }
+    // (letters whose code follows, long forms, letters that take a value)
+    let (code_letters, code_long, value_letters): (&str, &[&str], &str) = match lang {
+        // perl's -l, -0, -i and -x take only an attached value; -I may take the next argument.
+        Lang::Perl => ("eE", &[], "I"),
+        Lang::Python => ("c", &[], "WXQ"),
+        Lang::Node => ("ep", &["--eval", "--print"], "r"),
+        Lang::Ruby => ("e", &[], "IrECFTxW"),
+        Lang::Php => ("rRBE", &[], "cdzF"),
+        Lang::Lua => ("e", &[], "l"),
+        Lang::Osa => ("e", &[], "ls"),
+    };
+    let mut inline: Vec<String> = Vec::new();
+    let mut k = 0;
+    while k < args.len() {
+        let a = args[k].as_str();
+        if a == "--" {
+            k += 1;
+            break;
+        }
+        if let Some((opt, v)) = a.split_once('=') {
+            if code_long.contains(&opt) {
+                inline.push(v.to_string());
+                k += 1;
+                continue;
+            }
+        }
+        if code_long.contains(&a) {
+            if let Some(v) = args.get(k + 1) {
+                inline.push(v.clone());
+            }
+            k += 2;
+            continue;
+        }
+        if lang == Lang::Python && a == "-m" {
+            return Some((lang, Source::None)); // a module, not code
+        }
+        if a.starts_with("--") {
+            k += 1;
+            continue;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            let letters: Vec<char> = a[1..].chars().collect();
+            let mut took_next = false;
+            for (li, c) in letters.iter().enumerate() {
+                if code_letters.contains(*c) {
+                    let attached: String = letters[li + 1..].iter().collect();
+                    if attached.is_empty() {
+                        if let Some(v) = args.get(k + 1) {
+                            inline.push(v.clone());
+                        }
+                        took_next = true;
+                    } else {
+                        inline.push(attached);
+                    }
+                    break;
+                }
+                if value_letters.contains(*c) {
+                    if li + 1 == letters.len() {
+                        took_next = true; // its value is the next argument
+                    }
+                    break;
+                }
+            }
+            k += if took_next { 2 } else { 1 };
+            continue;
+        }
+        break;
+    }
+    if !inline.is_empty() {
+        return Some((lang, Source::Inline(inline.join("\n"))));
+    }
+    Some((
+        lang,
+        match args.get(k).map(String::as_str) {
+            None | Some("-") => Source::Stdin,
+            Some(f) => Source::File(f.to_string()),
+        },
+    ))
+}
+
+/// The commands an interpreter command runs, for its inline code, or for `input` when it reads its code from stdin
+/// and the input is known (a heredoc or `echo` feeding it).
+pub(super) fn commands(seg: &[String], input: Option<&str>) -> Vec<String> {
+    match source(seg) {
+        Some((lang, Source::Inline(code))) => code_commands(lang, &code),
+        Some((lang, Source::Stdin)) => input.map(|c| code_commands(lang, c)).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// How a call's argument becomes a command line.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// One string is a command line; a list or several arguments are an argv.
+    Cmd,
+    /// The program, then an argv list (or more arguments): `spawn("git", ["push"])`, `os.execvp(...)`.
+    ProgArgs,
+    /// Python `os.spawn*`: a mode first, then the program and its argv.
+    Spawn,
+}
+
+/// The commands in one piece of code.
+pub(super) fn code_commands(lang: Lang, code: &str) -> Vec<String> {
+    let mut calls: Vec<(&str, Kind)> = match lang {
+        Lang::Perl => vec![
+            (r"\bsystem\b", Kind::Cmd),
+            (r"\bexec\b", Kind::Cmd),
+            (r"\breadpipe\b", Kind::Cmd),
+        ],
+        Lang::Python => vec![
+            (r"\bos\.system\b", Kind::Cmd),
+            (r"\bos\.popen\b", Kind::Cmd),
+            (
+                r"\bsubprocess\.(?:run|call|check_call|check_output|Popen|getoutput|getstatusoutput)\b",
+                Kind::Cmd,
+            ),
+            (r"\bcommands\.getoutput\b", Kind::Cmd),
+            (r"\bos\.exec\w+\b", Kind::ProgArgs),
+            (r"\bos\.spawn\w+\b", Kind::Spawn),
+        ],
+        Lang::Node => vec![
+            (r"\bBun\.spawn(?:Sync)?\b", Kind::Cmd),
+            (r"\bDeno\.run\b", Kind::Cmd),
+            (r"\bnew\s+Deno\.Command\b", Kind::ProgArgs),
+        ],
+        Lang::Ruby => vec![
+            (r"\bsystem\b", Kind::Cmd),
+            (r"\bexec\b", Kind::Cmd),
+            (r"\bspawn\b", Kind::Cmd),
+            (r"\bIO\.popen\b", Kind::Cmd),
+            (
+                r"\bOpen3\.(?:capture2e?|capture3|popen2e?|popen3|pipeline\w*)\b",
+                Kind::Cmd,
+            ),
+        ],
+        Lang::Php => vec![(
+            r"\b(?:exec|shell_exec|system|passthru|popen|proc_open)\b",
+            Kind::Cmd,
+        )],
+        Lang::Lua => vec![
+            (r"\bos\.execute\b", Kind::Cmd),
+            (r"\bio\.popen\b", Kind::Cmd),
+        ],
+        Lang::Osa => vec![(r"\bdo\s+shell\s+script\b", Kind::Cmd)],
+    };
+    // Python: modules imported under another name (`import subprocess as sp`).
+    let alias_pats: Vec<String> = if lang == Lang::Python {
+        Regex::new(r"\bimport\s+(os|subprocess)\s+as\s+(\w+)")
+            .expect("static regex")
+            .captures_iter(code)
+            .map(|c| {
+                if &c[1] == "os" {
+                    format!(r"\b{}\.(?:system|popen)\b", &c[2])
+                } else {
+                    format!(
+                        r"\b{}\.(?:run|call|check_call|check_output|Popen|getoutput|getstatusoutput)\b",
+                        &c[2]
+                    )
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for p in &alias_pats {
+        calls.push((p.as_str(), Kind::Cmd));
+    }
+    // Python: names imported from os or subprocess (`from subprocess import run`).
+    if lang == Lang::Python
+        && (code.contains("from subprocess import") || code.contains("from os import"))
+    {
+        calls.push((
+            r"(?:^|[^.\w])(?:run|call|check_call|check_output|Popen|getoutput|system|popen)\b",
+            Kind::Cmd,
+        ));
+    }
+    // Node: child_process functions, called through the module or destructured.
+    if lang == Lang::Node && code.contains("child_process") {
+        calls.push((r"\b(?:exec|execSync)\b", Kind::Cmd));
+        calls.push((
+            r"\b(?:spawn|spawnSync|execFile|execFileSync)\b",
+            Kind::ProgArgs,
+        ));
+    }
+    let mut out = Vec::new();
+    for (pat, kind) in calls {
+        let Ok(re) = Regex::new(pat) else { continue };
+        for m in re.find_iter(code) {
+            if inside_string(code, m.start(), lang) || not_a_call(code, m.start(), m.end(), lang) {
+                continue;
+            }
+            if let Some(args) = call_args(code, m.end(), lang) {
+                out.extend(command_of(&args, kind, lang));
+            }
+        }
+    }
+    // Backtick and %x / qx substitutions.
+    match lang {
+        Lang::Perl | Lang::Ruby | Lang::Php => out.extend(backticks(code)),
+        _ => {}
+    }
+    if lang == Lang::Perl {
+        out.extend(quoted_forms(code, "qx"));
+        out.extend(perl_pipe_opens(code));
+    }
+    if lang == Lang::Ruby {
+        out.extend(quoted_forms(code, "%x"));
+    }
+    if lang == Lang::Node {
+        // Bun shell and zx: $`cmd`.
+        if let Ok(re) = Regex::new(r"\$`((?:[^`\\]|\\.)*)`") {
+            out.extend(re.captures_iter(code).map(|c| strip_interp(&c[1])));
+        }
+    }
+    out.retain(|c| !c.trim().is_empty());
+    out.dedup();
+    out
+}
+
+/// True if the name at `start..end` is a variable (`$exec`, `@system`), assigned to (`$system = ...`), or a method
+/// on some other object (`$pdo->exec(...)` runs SQL; ruby `obj.system`), not the call that runs a command.
+fn not_a_call(code: &str, start: usize, end: usize, lang: Lang) -> bool {
+    let before = &code[..start];
+    if before.ends_with(['$', '@', '%']) || before.ends_with("->") || before.ends_with("::") {
+        return true;
+    }
+    if lang == Lang::Ruby
+        && before.ends_with('.')
+        && !(before.ends_with("Kernel.") || before.ends_with("Process."))
+    {
+        return true;
+    }
+    let after = code[end..].trim_start();
+    after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>")
+}
+
+/// True if byte `at` sits inside a string literal (a call name in text, not code).
+fn inside_string(code: &str, at: usize, lang: Lang) -> bool {
+    let mut q: Option<char> = None;
+    let mut esc = false;
+    for c in code[..at].chars() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match q {
+            Some(open) => {
+                if c == '\\' && open != '\'' {
+                    esc = true;
+                } else if c == open {
+                    q = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' || (c == '`' && lang != Lang::Python) {
+                    q = Some(c);
+                }
+            }
+        }
+    }
+    q.is_some()
+}
+
+/// The argument text of a call whose name ends at `at`: inside its parentheses, or (perl, ruby, lua, osascript, php)
+/// to the end of the statement when there are none.
+fn call_args(code: &str, at: usize, lang: Lang) -> Option<String> {
+    let chars: Vec<char> = code[at..].chars().collect();
+    let mut i = 0;
+    while i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
+        i += 1;
+    }
+    if chars.get(i) == Some(&'(') {
+        return Some(balanced(&chars, i, '(', ')', lang));
+    }
+    if matches!(lang, Lang::Python | Lang::Node) && chars.get(i) != Some(&'(') {
+        return None; // a name, not a call
+    }
+    // Paren-less: to `;`, a newline or a closing brace, outside strings.
+    let mut q: Option<char> = None;
+    let mut end = i;
+    while end < chars.len() {
+        let c = chars[end];
+        match q {
+            Some(open) => {
+                if c == '\\' && open != '\'' {
+                    end += 1;
+                } else if c == open {
+                    q = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' || c == '`' {
+                    q = Some(c);
+                } else if c == ';' || c == '\n' || c == '}' {
+                    break;
+                }
+            }
+        }
+        end += 1;
+    }
+    let text: String = chars[i..end.min(chars.len())].iter().collect();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// The text between `open` at `start` and its matching `close`, quote-aware.
+fn balanced(chars: &[char], start: usize, open: char, close: char, lang: Lang) -> String {
+    let mut depth = 0;
+    let mut q: Option<char> = None;
+    let mut i = start;
+    while i < chars.len() {
+        let c = chars[i];
+        match q {
+            Some(o) => {
+                if c == '\\' && o != '\'' {
+                    i += 1;
+                } else if c == o {
+                    q = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' || (c == '`' && lang != Lang::Python) {
+                    q = Some(c);
+                } else if c == open {
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return chars[start + 1..i].iter().collect();
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    chars[start + 1..].iter().collect()
+}
+
+/// Splits on commas outside strings and brackets.
+fn top_level_split(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut q: Option<char> = None;
+    let mut esc = false;
+    for c in text.chars() {
+        if esc {
+            esc = false;
+            cur.push(c);
+            continue;
+        }
+        match q {
+            Some(o) => {
+                if c == '\\' && o != '\'' {
+                    esc = true;
+                } else if c == o {
+                    q = None;
+                }
+                cur.push(c);
+            }
+            None => {
+                match c {
+                    '"' | '\'' | '`' => q = Some(c),
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        parts.push(std::mem::take(&mut cur));
+                        continue;
+                    }
+                    _ => {}
+                }
+                cur.push(c);
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
+/// `${...}`, `#{...}` read as the placeholder word `x`: a path built on one stays relative (`${dir}/node_modules` is
+/// `x/node_modules`), one that was absolute before it stays absolute (`/srv/${name}` is `/srv/x`).
+fn strip_interp(s: &str) -> String {
+    INTERP.replace_all(s, "x").into_owned()
+}
+
+/// The string literals in an expression, in order, unescaped, interpolations dropped.
+fn literals(expr: &str, lang: Lang) -> Vec<String> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Lua long strings: [[...]].
+        if lang == Lang::Lua && c == '[' && chars.get(i + 1) == Some(&'[') {
+            let rest: String = chars[i + 2..].iter().collect();
+            let end = rest.find("]]").unwrap_or(rest.len());
+            out.push(rest[..end].to_string());
+            i += 2 + rest[..end].chars().count() + 2;
+            continue;
+        }
+        if c == '"' || c == '\'' || (c == '`' && lang != Lang::Python) {
+            let fstring = lang == Lang::Python
+                && i > 0
+                && matches!(chars[i - 1], 'f' | 'F')
+                && (i < 2 || !chars[i - 2].is_alphanumeric());
+            let mut s = String::new();
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                if chars[i] == '\\' && i + 1 < chars.len() && c != '\'' {
+                    s.push(match chars[i + 1] {
+                        'n' => '\n',
+                        't' => '\t',
+                        o => o,
+                    });
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '\\'
+                    && i + 1 < chars.len()
+                    && c == '\''
+                    && matches!(chars[i + 1], '\'' | '\\')
+                {
+                    s.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                s.push(chars[i]);
+                i += 1;
+            }
+            let s = if fstring {
+                FSTRING_FIELD.replace_all(&s, "x").into_owned()
+            } else {
+                strip_interp(&s)
+            };
+            out.push(s);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// One argument (an expression) as a word: its literals joined.
+fn word(expr: &str, lang: Lang) -> Option<String> {
+    let lits = literals(expr, lang);
+    (!lits.is_empty()).then(|| lits.concat())
+}
+
+/// A list expression (`[...]`, `%w(...)`, `qw(...)`) as an argv, if it is one.
+fn list_argv(expr: &str, lang: Lang) -> Option<Vec<String>> {
+    let t = expr.trim();
+    if let Some(rest) = t.strip_prefix("%w(").or_else(|| t.strip_prefix("qw(")) {
+        let words = rest.strip_suffix(')').unwrap_or(rest);
+        return Some(words.split_whitespace().map(str::to_string).collect());
+    }
+    let rest = t.strip_prefix('[')?;
+    let inner = rest.strip_suffix(']').unwrap_or(rest);
+    Some(
+        top_level_split(inner)
+            .iter()
+            .filter_map(|e| word(e, lang))
+            .collect(),
+    )
+}
+
+/// The command line a call runs, from its argument text.
+fn command_of(args: &str, kind: Kind, lang: Lang) -> Vec<String> {
+    let parts = top_level_split(args);
+    // Objects: the list under `cmd:` or `args:` (`Deno.run({cmd: [...]})`, `{args: [...]}`); other objects (an env
+    // hash, options) and keyword arguments (`shell=True`, `cwd: x`) aren't part of the command.
+    let key_list =
+        Regex::new(r#"["']?(?:cmd|args)["']?\s*:\s*(\[[^\]]*\])"#).expect("static regex");
+    let keyword = Regex::new(r"^\w+\s*[=:]\s*[^=]").expect("static regex");
+    let parts: Vec<String> = parts
+        .iter()
+        .filter_map(|p| {
+            let t = p.trim();
+            if t.starts_with('{') {
+                return key_list.captures(t).map(|c| c[1].to_string());
+            }
+            (!keyword.is_match(t)).then(|| t.to_string())
+        })
+        .collect();
+    let mut argv: Vec<String> = Vec::new();
+    let parts: Vec<String> = match kind {
+        Kind::Spawn => parts.into_iter().skip(1).collect(),
+        _ => parts,
+    };
+    for (n, p) in parts.iter().enumerate() {
+        if let Some(list) = list_argv(p, lang) {
+            argv.extend(list);
+            continue;
+        }
+        // Ruby/Node `Bun.spawn({cmd: [...]})`-style objects were dropped above; a leading env hash too.
+        if let Some(w) = word(p, lang) {
+            if n == 0 && parts.len() == 1 && matches!(kind, Kind::Cmd) {
+                return vec![w]; // one string: a command line
+            }
+            argv.push(w);
+        }
+    }
+    // `os.execvp("sudo", ["sudo", "ls"])`: argv[0] repeats the program.
+    if argv.len() > 1 && argv[0] == argv[1] {
+        argv.remove(1);
+    }
+    if argv.is_empty() {
+        return Vec::new();
+    }
+    // A Deno.run({cmd: [...]}) object holds the list inside.
+    vec![shell_join(&argv)]
+}
+
+/// Backtick substitutions in perl, ruby and php code.
+fn backticks(code: &str) -> Vec<String> {
+    let re = Regex::new(r"`((?:[^`\\]|\\.)*)`").expect("static regex");
+    re.captures_iter(code)
+        .map(|c| strip_interp(&c[1]))
+        .collect()
+}
+
+/// `qx{...}` (perl) or `%x(...)` (ruby) with any delimiter.
+fn quoted_forms(code: &str, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = code.chars().collect();
+    let p: Vec<char> = prefix.chars().collect();
+    let mut i = 0;
+    while i + p.len() < chars.len() {
+        let word_start = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+        if word_start && chars[i..i + p.len()] == p[..] {
+            let open = chars[i + p.len()];
+            let close = match open {
+                '(' => ')',
+                '{' => '}',
+                '[' => ']',
+                '<' => '>',
+                c if !c.is_alphanumeric() && !c.is_whitespace() => c,
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let start = i + p.len() + 1;
+            let end = (start..chars.len())
+                .find(|&k| chars[k] == close)
+                .unwrap_or(chars.len());
+            out.push(strip_interp(&chars[start..end].iter().collect::<String>()));
+            i = end;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// perl `open(FH, "cmd |")`, `open(FH, "| cmd")`, `open(my $f, "-|", "cmd", @args)`.
+fn perl_pipe_opens(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(re) = Regex::new(r"\bopen\b") else {
+        return out;
+    };
+    for m in re.find_iter(code) {
+        let Some(args) = call_args(code, m.end(), Lang::Perl) else {
+            continue;
+        };
+        let lits: Vec<String> = top_level_split(&args)
+            .iter()
+            .filter_map(|p| word(p, Lang::Perl))
+            .collect();
+        if let Some(i) = lits.iter().position(|l| l == "-|" || l == "|-") {
+            if lits.len() > i + 1 {
+                out.push(shell_join(&lits[i + 1..]));
+            }
+            continue;
+        }
+        for l in &lits {
+            let t = l.trim();
+            if let Some(c) = t.strip_suffix('|').or_else(|| t.strip_prefix('|')) {
+                out.push(c.trim().to_string());
+            }
+        }
+    }
+    out
+}

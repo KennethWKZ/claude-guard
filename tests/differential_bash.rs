@@ -84,6 +84,11 @@ fn fixture_dir() -> String {
         ("run/env.sh", "#!/bin/sh\ncat .env\n"),
         ("run/ok.sh", "#!/bin/sh\nls -la\n"),
         ("run/pip.sh", "pip install x\n"),
+        ("run/r.py", "import os\nos.system(\"sudo ls\")\n"),
+        (
+            "run/r.js",
+            "require('child_process').execSync('git push -f')\n",
+        ),
     ] {
         std::fs::write(d.join(f), text).unwrap();
     }
@@ -107,6 +112,8 @@ const SCRIPT_RUNS: &[&str] = &[
     "bash -n run/sudo.sh",
     "cat run/sudo.sh",
     "cat run/ok.sh | sed 's/^/sudo /' | bash",
+    "python3 run/r.py",
+    "node run/r.js",
 ];
 
 const WRAPPED_TEMPLATES: &[&str] = &[
@@ -163,6 +170,15 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "sed 's#.*#@@#e' f.txt",
     "echo x | sed 's#^#@@ #e'",
     "sed 's#^#@@ #e' <<EOF\nx\nEOF\n",
+    "perl -e 'system(\"@@\")'",
+    "python3 -c 'import os; os.system(\"@@\")'",
+    "python3 - <<EOF\nimport subprocess\nsubprocess.run(\"@@\", shell=True)\nEOF\n",
+    "node -e 'require(\"child_process\").execSync(\"@@\")'",
+    "ruby -e 'puts `@@`'",
+    "php -r 'shell_exec(\"@@\");'",
+    "lua -e 'os.execute(\"@@\")'",
+    "osascript -e 'do shell script \"@@\"'",
+    "bun -e 'await $`@@`'",
     "{ @@; }",
 ];
 
@@ -695,6 +711,24 @@ fn wrapped_kind(input: &str) -> Option<&'static str> {
     // `./ru\\n/x.sh` is ./run/x.sh to bash: a backslash quotes the next letter.
     if cmd.replace('\\', "").contains("run/") {
         Some("script-on-disk")
+    } else if words.iter().any(|w| {
+        let w = w.as_str();
+        [
+            "perl",
+            "node",
+            "bun",
+            "deno",
+            "ruby",
+            "php",
+            "lua",
+            "osascript",
+            "pypy3",
+        ]
+        .contains(&w)
+            || w.starts_with("python")
+    }) {
+        // Commands an interpreter's code runs (`python3 -c 'os.system(...)'`, `node -e`, code on stdin).
+        Some("interpreter-command")
     } else if cmd.contains("system(") || cmd.contains("getline") {
         // Commands awk runs itself.
         Some("awk-command")

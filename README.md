@@ -176,6 +176,14 @@ The rules also hold for what a wrapper runs (Rust only):
 - user switches: `su -c '…'`, `runuser -c '…'`, `runuser -u USER -- CMD`, `sg GROUP -c '…'`;
 - `find … -exec|-execdir|-ok|-okdir CMD {} +|;`, with `{}` read as each start path (`find /srv/old -exec rm -rf {} +`);
 - string runners: `watch '…'`, `script -c '…'` and macOS `script FILE CMD`, `flock FILE -c '…'`, `env -S '…'`;
+- commands an interpreter's code runs, from `-e`/`-c`/`-r` code, code on stdin (`python3 - <<EOF`, `echo … |
+  python3`) and script files (`python3 x.py`, `node x.js`, `./x` with such a shebang; project and temp folders only,
+  never `node_modules`, `vendor`, `.venv` or `site-packages`, and a file over 256 KiB is skipped): perl `system`,
+  `exec`, backticks, `qx`, pipe `open`; python `os.system`, `os.popen`, `subprocess.*` (also imported or aliased),
+  `os.exec*`, `os.spawn*`; node/bun/deno `child_process` `exec*`/`spawn*`/`execFile*`, `Bun.spawn`, `` $`…` `` (Bun,
+  zx), `Deno.Command`, `Deno.run`; ruby `system`, `exec`, `spawn`, backticks, `%x()`, `IO.popen`, `Open3.*`; php
+  `exec`, `shell_exec`, `system`, `passthru`, `popen`, `proc_open`, backticks; lua `os.execute`, `io.popen`;
+  osascript `do shell script`. One string is a command line, a list an argv; interpolations read as the word `x`;
 - commands sed and awk run themselves: sed `e CMD`, a bare `e` and the `s///e` flag; awk `system("…")`,
   `"CMD" | getline` and `print … | "CMD"` (with a shell as CMD, what it prints too). With input the guard knows (a
   heredoc or `echo …` feeding them) each line is worked through; otherwise fields read as empty

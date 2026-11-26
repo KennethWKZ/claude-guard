@@ -1332,12 +1332,35 @@ const EVERY_RULE: &[(&str, &str)] = &[
 /// Runs every template (`C` = a rule's command, `⏎` = newline) with every rule's command (deny with its reason) and
 /// with a pip install (exit 2), and each allow case; fails listing every miss.
 fn every_rule_table(templates: &[&str], allow: &[&str]) {
+    every_rule_table_with("C", templates, allow);
+}
+
+/// `every_rule_table` with another placeholder for the command (`ph`), plus `@L@` and `@S@` for its words as a
+/// double- or single-quoted list (`"git", "push", "-f"`), for templates whose text holds a capital C or an argv.
+fn every_rule_table_with(ph: &str, templates: &[&str], allow: &[&str]) {
+    let fill = |t: &str, c: &str| {
+        let words: Vec<&str> = c.split_whitespace().collect();
+        let dq = words
+            .iter()
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sq = words
+            .iter()
+            .map(|w| format!("'{w}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        t.replace("@L@", &dq)
+            .replace("@S@", &sq)
+            .replace(ph, c)
+            .replace('⏎', "\n")
+    };
     let pip = format!("{} install y", "pip"); // kept apart so this file's text doesn't trip the live pip hook
     let mut fails = Vec::new();
     let mut checked = 0;
     for t in templates {
         for (c, want) in EVERY_RULE {
-            let cmd = t.replace('C', c).replace('⏎', "\n");
+            let cmd = fill(t, c);
             let o = run(&["bash"], &bash_input(&cmd));
             checked += 1;
             if !(o.code == 0
@@ -1350,7 +1373,7 @@ fn every_rule_table(templates: &[&str], allow: &[&str]) {
                 ));
             }
         }
-        let cmd = t.replace('C', &pip).replace('⏎', "\n");
+        let cmd = fill(t, &pip);
         let o = run(&["bash"], &bash_input(&cmd));
         if (o.code, o.stdout.as_str()) != (2, "") {
             fails.push(format!(
@@ -1975,6 +1998,193 @@ fn commands_sed_and_awk_run_every_rule() {
             "sed 's/^/echo /e' <<EOF⏎hello⏎EOF",
             "sed -n '/end/p' f.txt",
         ],
+    );
+}
+
+#[test]
+fn interpreter_code_every_rule() {
+    // `@@` = the rule's command; `@L@` / `@S@` = its words as a quoted list.
+    every_rule_table_with(
+        "@@",
+        &[
+            // perl
+            "perl -e 'system(\"@@\")'",
+            "perl -e 'system @L@'",
+            "perl -le 'print `@@`'",
+            "perl -e 'my $x = qx{@@}'",
+            "perl -ne 'exec(\"@@\")' f.txt",
+            "perl -e 'open(my $f, \"-|\", @L@)'",
+            "perl -e 'open(F, \"@@ |\")'",
+            "perl - <<'EOF'⏎system(\"@@\");⏎EOF",
+            // python
+            "python3 -c 'import os; os.system(\"@@\")'",
+            "python3 -c \"import subprocess; subprocess.run([@S@])\"",
+            "python3 -c 'import subprocess as sp; sp.check_output(\"@@\", shell=True)'",
+            "python -c 'from subprocess import run; run([@L@])'",
+            "python3.12 -c 'import os; os.popen(f\"@@\")'",
+            "python3 - <<EOF⏎import os⏎os.system(\"@@\")⏎EOF",
+            "python3 <<'EOF'⏎import subprocess⏎subprocess.call(\"@@\", shell=True)⏎EOF",
+            "echo 'import os; os.system(\"@@\")' | python3",
+            // node, bun, deno
+            "node -e 'require(\"child_process\").execSync(\"@@\")'",
+            "node -e \"const {spawnSync} = require('child_process'); spawnSync(@S@)\"",
+            "node -e 'const cp = require(\"node:child_process\"); cp.exec(`@@`)'",
+            "node <<EOF⏎require('child_process').execSync('@@')⏎EOF",
+            "bun -e 'Bun.spawn([@L@])'",
+            "bun -e 'await $`@@`'",
+            "deno eval 'Deno.run({cmd: [@L@]})'",
+            "deno eval 'new Deno.Command(\"bash\", {args: [\"-c\", \"@@\"]}).outputSync()'",
+            // ruby
+            "ruby -e 'system(\"@@\")'",
+            "ruby -e 'system @L@'",
+            "ruby -e 'puts `@@`'",
+            "ruby -e 'x = %x(@@)'",
+            "ruby -e 'IO.popen([@L@]).read'",
+            "ruby -e 'require \"open3\"; Open3.capture2(\"@@\")'",
+            // php, lua, osascript
+            "php -r 'shell_exec(\"@@\");'",
+            "php -r 'echo `@@`;'",
+            "php -r 'proc_open([@L@], [], $p);'",
+            "lua -e 'os.execute(\"@@\")'",
+            "lua -e 'io.popen(\"@@\")'",
+            "osascript -e 'do shell script \"@@\"'",
+            // behind a wrapper
+            "timeout 9 python3 -c 'import os; os.system(\"@@\")'",
+        ],
+        &[
+            "python3 -c 'print(\"sudo ls\")'",
+            "perl -e 'my $exec = \"sudo ls\"; print $exec'",
+            "php -r '$pdo->exec(\"DELETE FROM t\");'",
+            "node -e 'console.log(/x/.exec(\"sudo ls\"))'",
+            "python3 -c 'import os; os.system(\"ls -la\")'",
+            "ruby -e 'puts \"system(\\\"sudo ls\\\")\"'",
+            "python3 -m http.server",
+            "node --version",
+            "python3 -c 'exec(\"print(1)\")'",
+            "node -e 'require(\"child_process\").execSync(\"git status\")'",
+            // An interpolation is a placeholder word: a path built on one stays relative.
+            "python3 -c 'import os; os.system(f\"rm -rf {d}/build\")'",
+            "node -e 'require(\"child_process\").execSync(`rm -rf ${dir}/node_modules`)'",
+        ],
+    );
+    // ...and one that was absolute before it stays absolute.
+    for c in [
+        "node -e 'require(\"child_process\").execSync(`rm -rf /srv/${name}`)'",
+        "ruby -e 'system(\"rm -rf /srv/#{x}\")'",
+    ] {
+        let o = run(&["bash"], &bash_input(c));
+        assert!(
+            o.stdout.contains("recursive force delete"),
+            "{c} -> {}",
+            o.stdout
+        );
+    }
+}
+
+#[test]
+fn interpreter_script_files_every_rule() {
+    let dir = format!(
+        "{}/claude-guard-table-interp-{}",
+        tmpdir(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(format!("{dir}/scripts")).unwrap();
+    std::fs::create_dir_all(format!("{dir}/node_modules/pkg")).unwrap();
+    let write = |name: &str, text: &str| std::fs::write(format!("{dir}/{name}"), text).unwrap();
+    let pip = format!("{} install y", "pip");
+    let mut bodies: Vec<(String, String)> = EVERY_RULE
+        .iter()
+        .map(|(c, want)| (c.to_string(), want.to_string()))
+        .collect();
+    bodies.push((pip, String::new()));
+    let mut fails = Vec::new();
+    for (i, (c, want)) in bodies.iter().enumerate() {
+        write(
+            &format!("scripts/r{i}.py"),
+            &format!("import os\nos.system(\"{c}\")\n"),
+        );
+        write(
+            &format!("scripts/r{i}.js"),
+            &format!("const cp = require('child_process');\ncp.execSync('{c}');\n"),
+        );
+        write(&format!("scripts/r{i}.rb"), &format!("system(\"{c}\")\n"));
+        write(&format!("scripts/r{i}.pl"), &format!("system(\"{c}\");\n"));
+        write(
+            &format!("scripts/r{i}.php"),
+            &format!("<?php\nshell_exec(\"{c}\");\n"),
+        );
+        write(
+            &format!("scripts/r{i}.lua"),
+            &format!("os.execute(\"{c}\")\n"),
+        );
+        write(
+            &format!("scripts/x{i}"),
+            &format!(
+                "#!/usr/bin/env python3\nimport subprocess\nsubprocess.run(\"{c}\", shell=True)\n"
+            ),
+        );
+        for cmd in [
+            format!("python3 scripts/r{i}.py"),
+            format!("node scripts/r{i}.js"),
+            format!("bun run scripts/r{i}.js"),
+            format!("ruby scripts/r{i}.rb"),
+            format!("perl scripts/r{i}.pl"),
+            format!("php scripts/r{i}.php"),
+            format!("lua scripts/r{i}.lua"),
+            format!("./scripts/x{i}"),
+            format!("timeout 9 python3 -u scripts/r{i}.py"),
+        ] {
+            let input = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": dir}).to_string();
+            let o = run(&["bash"], &input);
+            let ok = if want.is_empty() {
+                (o.code, o.stdout.as_str()) == (2, "")
+            } else {
+                o.code == 0 && o.stdout.contains("\"deny\"") && o.stdout.contains(want.as_str())
+            };
+            if !ok {
+                fails.push(format!(
+                    "want {} :: {cmd:?} -> {} {}",
+                    if want.is_empty() { "pip" } else { want },
+                    o.code,
+                    o.stdout.trim()
+                ));
+            }
+        }
+    }
+    // Not read: third-party code, a script over the cap (skipped, not blocked), harmless code.
+    write(
+        "node_modules/pkg/x.js",
+        "require('child_process').execSync('sudo ls')\n",
+    );
+    write(
+        "scripts/big.js",
+        &format!(
+            "require('child_process').execSync('sudo ls');\n{}",
+            "//\n".repeat(100_000)
+        ),
+    );
+    write("scripts/ok.py", "import os\nos.system('ls -la')\n");
+    for cmd in [
+        "node node_modules/pkg/x.js",
+        "node scripts/big.js",
+        "python3 scripts/ok.py",
+        "python3 scripts/missing.py",
+    ] {
+        let input =
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": dir})
+                .to_string();
+        let o = run(&["bash"], &input);
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {cmd:?} -> {}", o.stdout.trim()));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
     );
 }
 

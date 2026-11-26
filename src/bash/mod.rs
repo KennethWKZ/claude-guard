@@ -36,6 +36,9 @@
 //! for script files on disk it runs inside the project or a temp folder (`scripts`: `bash scripts/x.sh`,
 //! `cat x | bash`, 256 KiB cap). Rust only, all checked after the rest of the command passed.
 //!
+//! Commands run by interpreter code (perl, python, node/bun/deno, ruby, php, lua, osascript), inline, on stdin or
+//! in a script file, are checked too (`interp`).
+//!
 //! Command substitutions inside double quotes and backticks are checked too (`substitutions`); `[[ ... ]]`,
 //! `[ ! ... ]` and `test ! ...` stay one test command (`test_word`), so naming a `.env` there only tests it; pip is
 //! also matched per simple command (`then pip install`). Rust only.
@@ -45,6 +48,7 @@
 //! script files the command runs (see `scripts`).
 
 mod filters;
+mod interp;
 mod scripts;
 mod wrappers;
 
@@ -694,6 +698,48 @@ fn output_runs(before: &str) -> bool {
     }
 }
 
+/// Commands run by the code of interpreter scripts these simple commands run from disk: `python3 x.py`,
+/// `node x.js`, `ruby x.rb`, `perl x.pl`, `php x.php`, `lua x.lua`, `osascript x.applescript`, or `./x` with such a
+/// shebang (also behind argv wrappers). Same reading rules as shell scripts, except that a file over the size cap
+/// is skipped rather than blocked (built bundles such as `node dist/server.js` are often that big).
+fn interp_file_commands(raw_segs: &[Vec<String>], cwd: &Cwd) -> Vec<String> {
+    let mut out = Vec::new();
+    for rs in raw_segs {
+        let mut seg = rs.clone();
+        while let Some(inner) = wrappers::argv_wrapper_inner(&seg) {
+            seg = inner;
+        }
+        let seg = strip_redirs(&seg);
+        let Some(first) = seg.first() else { continue };
+        let (lang, file) = match interp::source(&seg) {
+            Some((lang, interp::Source::File(f))) => (Some(lang), f),
+            Some(_) => continue,
+            None if first.contains('/') => (None, first.clone()),
+            None => continue,
+        };
+        let scripts::Script::Text(text, canon) = scripts::read_script(&file, cwd_str(cwd), true)
+        else {
+            continue;
+        };
+        // Run as the command: the shebang names the interpreter.
+        let lang = lang.or_else(|| {
+            let line = text.lines().next()?.strip_prefix("#!")?;
+            let mut words = line.split_whitespace();
+            let mut prog = words.next()?;
+            if pyfs::basename(prog) == "env" {
+                prog = words.find(|w| !w.starts_with('-'))?;
+            }
+            interp::lang_of(prog)
+        });
+        let Some(lang) = lang else { continue };
+        if scripts::enter(&canon) {
+            out.extend(interp::code_commands(lang, &text));
+            scripts::leave(&canon);
+        }
+    }
+    out
+}
+
 /// The file a heredoc's command writes its body to: `cat > f <<EOF`, `cat <<EOF >> f`, `tee [-a] f <<EOF`.
 fn heredoc_target(command: &str) -> Option<String> {
     let tokens = shlex::split_lines(command).ok()?;
@@ -1188,6 +1234,7 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
         .collect();
     more.extend(scripts_run(&raw_segs, &mut written));
     more.extend(substitutions(&command));
+    more.extend(interp_file_commands(&raw_segs, cwd));
     let segs = segments_with_seps(raw);
     let disk = files_run(&raw_segs, &segs, &written);
     // Each simple command with its keywords, wrappers and assignments dropped (`then pip install`, `X=1 pip
@@ -1610,6 +1657,8 @@ fn check_mode(
         nested.extend(scripts_run(&raw_segs, &mut written));
         // Script files on disk it runs (`bash scripts/x.sh`, `cat x | bash`), checked last.
         disk = files_run(&raw_segs, &segs, &written);
+        // Interpreter scripts on disk (`python3 x.py`, `node x.js`, `./x.rb`): the commands their code runs.
+        nested.extend(interp_file_commands(&raw_segs, cwd));
     }
     for (seg, _) in segs {
         nested.extend(nested_commands(&seg));
