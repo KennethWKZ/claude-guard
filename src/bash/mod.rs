@@ -47,6 +47,7 @@
 //! shell); any other failure blocks it (fail closed) and is logged. Besides the command text, it reads only the
 //! script files the command runs (see `scripts`).
 
+mod context;
 mod filters;
 mod interp;
 mod scripts;
@@ -1213,7 +1214,9 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
     if depth > MAX_DEPTH {
         return false; // check() already crashed (blocked) at this depth
     }
+    let _frame = context::push(command, cwd_str(cwd));
     let (command, bodies, mut written) = split_heredocs(command, true);
+    context::add_written(&written);
     if bodies.iter().any(|b| pip_in_nested(b, cwd, depth + 1)) {
         return true;
     }
@@ -1229,6 +1232,11 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
         }
     }
     let raw_segs = raw_segments(&raw);
+    for rs in &raw_segs {
+        if let Some(w) = printed_to_file(rs) {
+            context::add_written(&[w]);
+        }
+    }
     let mut more: Vec<String> = raw_segs
         .iter()
         .flat_map(|s| wrappers::wrapped_commands(s))
@@ -1618,7 +1626,10 @@ fn check_mode(
             "RecursionError: maximum recursion depth exceeded".into(),
         ));
     }
+    // What interpreter code in this command can read: its variables, the cwd, files it writes.
+    let _frame = context::push(command, cwd_str(cwd));
     let (command, shell_bodies, mut written) = split_heredocs(command, lines);
+    context::add_written(&written);
     for body in shell_bodies {
         if let Some(r) = check_mode(&body, cwd, depth + 1, lines, true)? {
             return Ok(Some(r));
@@ -1647,6 +1658,12 @@ fn check_mode(
     let mut nested: Vec<String> = piped_scripts(&segs);
     // `$(...)` and backticks, also inside double quotes (`echo "$(cat .env)"`).
     nested.extend(substitutions(&command));
+    // Files echo/printf write, for interpreter code that reads them later in the command.
+    for rs in &raw_segs {
+        if let Some(w) = printed_to_file(rs) {
+            context::add_written(&[w]);
+        }
+    }
     // What wrappers run: `timeout 9 CMD`, `ssh HOST CMD`, `docker exec C CMD`, `su -c STRING`, `find -exec CMD`.
     for rs in &raw_segs {
         nested.extend(wrappers::wrapped_commands(rs));

@@ -187,7 +187,14 @@ The rules also hold for what a wrapper runs (Rust only):
   variables the code assigns (every value a name gets), concatenation, interpolation, `" ".join([…])`,
   `[…].join(" ")`, perl `join`, python `%` and `.format()`; an unknown name reads as the word `x`. Built code run
   through `exec`/`eval`/`compile` (python), `eval`/`new Function`/`vm.*` (node), `eval`/`instance_eval` (ruby),
-  string `eval` (perl), `eval` (php) or `load` (lua) is read again, up to 4 levels;
+  string `eval` (perl), `eval` (php) or `load` (lua) is read again, up to 4 levels. Environment lookups (`os.environ`, `os.getenv`,
+  `process.env`, `ENV`, `$ENV{…}`, `getenv`, `$_ENV`) take the value the command itself gives the variable
+  (`CMD=… python3 …`, `export CMD=…`); one it doesn't set stays unknown, since the hook can't see the real
+  environment. File reads (`open(p).read()`, `Path(p).read_text()`, `fs.readFileSync`, `File.read`,
+  `file_get_contents`, `io.open(p):read`) take the file's text: written earlier in the command, or on disk under the
+  script rules. Indirect calls count: python `getattr(os, "system")`, aliases (`f = os.system`, `import … as`), node
+  `cp["execSync"]`, `const run = cp.execSync`, `{execSync: run}`, ruby `send(:system, …)`, `method(:system).call`,
+  php `call_user_func(_array)("system", …)` and `$f = "system"; $f(…)`;
 - commands sed and awk run themselves: sed `e CMD`, a bare `e` and the `s///e` flag; awk `system("…")`,
   `"CMD" | getline` and `print … | "CMD"` (with a shell as CMD, what it prints too). With input the guard knows (a
   heredoc or `echo …` feeding them) each line is worked through; otherwise fields read as empty

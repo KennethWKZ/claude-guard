@@ -185,6 +185,12 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "ruby -e 'eval(\"system(\\\"@@\\\")\")'",
     "perl -e 'my $c = \"@@\"; system($c)'",
     "php -r '$c = \"@@\"; shell_exec($c);'",
+    "CMD='@@' python3 -c 'import os; os.system(os.environ[\"CMD\"])'",
+    "CMD='@@' node -e 'require(\"child_process\").execSync(process.env.CMD)'",
+    "python3 -c 'import os; getattr(os, \"system\")(\"@@\")'",
+    "ruby -e 'send(:system, \"@@\")'",
+    "php -r 'call_user_func(\"system\", \"@@\");'",
+    "echo '@@' > cmd.txt; python3 -c 'import os; os.system(open(\"cmd.txt\").read())'",
     "{ @@; }",
 ];
 
@@ -717,6 +723,28 @@ fn wrapped_kind(input: &str) -> Option<&'static str> {
     // `./ru\\n/x.sh` is ./run/x.sh to bash: a backslash quotes the next letter.
     if cmd.replace('\\', "").contains("run/") {
         Some("script-on-disk")
+    } else if [
+        "environ",
+        "getenv",
+        "process.env",
+        "ENV[",
+        "$ENV{",
+        "getattr",
+        "readFileSync",
+        "File.read",
+        "file_get_contents",
+        "io.open",
+        "open(",
+        "call_user_func",
+        "send(:",
+        "method(:",
+        "[\"exec",
+    ]
+    .iter()
+    .any(|k| cmd.contains(k))
+    {
+        // Interpreter code taking the command from the environment the command sets, a file, or an indirect call.
+        Some("interpreter-dynamic")
     } else if words.iter().any(|w| {
         let w = w.as_str();
         [

@@ -2247,6 +2247,71 @@ fn interpreter_variables_and_eval_every_rule() {
 }
 
 #[test]
+fn interpreter_env_files_and_indirect_calls_every_rule() {
+    // `@@` = the rule's command; `@L@` = its words as a list.
+    every_rule_table_with(
+        "@@",
+        &[
+            // The command gives the variable its value.
+            "CMD='@@' python3 -c 'import os; os.system(os.environ[\"CMD\"])'",
+            "export CMD=\"@@\"; python3 -c 'import os; os.system(os.getenv(\"CMD\"))'",
+            "python3 -c 'import os; os.system(os.environ.get(\"CMD\", \"@@\"))'",
+            "CMD='@@' node -e 'require(\"child_process\").execSync(process.env.CMD)'",
+            "CMD='@@' ruby -e 'system(ENV[\"CMD\"])'",
+            "CMD='@@' perl -e 'system($ENV{CMD})'",
+            "CMD='@@' php -r 'shell_exec(getenv(\"CMD\"));'",
+            "CMD='@@' lua -e 'os.execute(os.getenv(\"CMD\"))'",
+            // Reached indirectly.
+            "python3 -c 'import os; getattr(os, \"system\")(\"@@\")'",
+            "python3 -c 'getattr(__import__(\"os\"), \"system\")(\"@@\")'",
+            "python3 -c 'import os; f = os.system; f(\"@@\")'",
+            "python3 -c 'from subprocess import run as r; r([@L@])'",
+            "node -e 'const cp = require(\"child_process\"); cp[\"execSync\"](\"@@\")'",
+            "node -e 'const cp = require(\"child_process\"); const run = cp.execSync; run(\"@@\")'",
+            "node -e 'const {execSync: run} = require(\"child_process\"); run(\"@@\")'",
+            "ruby -e 'send(:system, \"@@\")'",
+            "ruby -e 'Kernel.public_send(:system, @L@)'",
+            "ruby -e 'method(:system).call(\"@@\")'",
+            "php -r 'call_user_func(\"system\", \"@@\");'",
+            "php -r 'call_user_func_array(\"passthru\", [\"@@\"]);'",
+            "php -r '$f = \"shell_exec\"; $f(\"@@\");'",
+            // Read from a file the command writes first.
+            "echo '@@' > cmd.txt; python3 -c 'import os; os.system(open(\"cmd.txt\").read())'",
+            "printf '%s' '@@' > cmd.txt && node -e 'require(\"child_process\").execSync(require(\"fs\").readFileSync(\"cmd.txt\", \"utf8\"))'",
+            "echo '@@' > c.txt; ruby -e 'system(File.read(\"c.txt\"))'",
+            "echo '@@' > c.txt; php -r 'shell_exec(file_get_contents(\"c.txt\"));'",
+            "echo '@@' > c.txt; lua -e 'os.execute(io.open(\"c.txt\"):read(\"a\"))'",
+            "echo 'import os; os.system(\"@@\")' > x.py; python3 -c 'exec(open(\"x.py\").read())'",
+        ],
+        &[
+            "python3 -c 'import os; os.system(os.environ[\"UNKNOWN\"])'",
+            "python3 -c 'import os; os.system(os.environ.get(\"EDITOR\", \"vi\") + \" f.txt\")'",
+            "python3 -c 'import os; f = os.path.join; f(\"a\", \"b\")'",
+            "php -r '$f = \"strtoupper\"; $f(\"sudo ls\");'",
+            "ruby -e 'send(:puts, \"sudo ls\")'",
+            "CMD='ls -la' python3 -c 'import os; os.system(os.environ[\"CMD\"])'",
+            "echo 'sudo ls' > notes.txt; python3 -c 'print(open(\"notes.txt\").read())'",
+        ],
+    );
+    // A file already on disk in the project.
+    let dir = format!(
+        "{}/claude-guard-table-envfile-{}",
+        tmpdir(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(format!("{dir}/cmd.txt"), "sudo ls\n").unwrap();
+    let cmd = "python3 -c 'import os; os.system(open(\"cmd.txt\").read())'";
+    let input =
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": dir})
+            .to_string();
+    let o = run(&["bash"], &input);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(o.stdout.contains("sudo is blocked"), "{}", o.stdout);
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [

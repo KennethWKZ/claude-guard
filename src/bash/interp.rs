@@ -10,6 +10,10 @@
 //! | lua | `-e`, stdin, a file | `os.execute`, `io.popen` |
 //! | osascript | `-e`, stdin, a file | `do shell script` |
 //!
+//! Indirect calls count too (`indirect_calls`: getattr, aliases, bracket access, send, call_user_func, variable
+//! functions), and environment lookups and file reads take what the command around the code gives them
+//! (`context`).
+//!
 //! Arguments are evaluated with the code's variables (`values`), and built code run through eval/exec (python
 //! `exec`/`eval`/`compile`, node `eval`/`new Function`/`vm.*`, ruby `eval`/`instance_eval`, perl string `eval`, php
 //! `eval`, lua `load`) is read again as code, up to `MAX_CODE_DEPTH` levels.
@@ -180,7 +184,7 @@ pub(super) fn commands(seg: &[String], input: Option<&str>) -> Vec<String> {
 }
 
 /// How a call's argument becomes a command line.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Kind {
     /// One string is a command line; a list or several arguments are an argv.
     Cmd,
@@ -339,6 +343,10 @@ fn code_commands_at(lang: Lang, code: &str, depth: usize) -> Vec<String> {
         }
     }
     // Backtick and %x / qx substitutions.
+    // Calls reached indirectly: getattr, aliases, bracket access, send, call_user_func, variable functions.
+    for (args, kind) in indirect_calls(code, lang, &env) {
+        out.extend(command_of(&args, kind, lang, &env));
+    }
     let fill = |t: String| values::interpolate(&t, lang, &env);
     match lang {
         Lang::Perl | Lang::Ruby | Lang::Php => out.extend(backticks(code).into_iter().map(fill)),
@@ -359,6 +367,188 @@ fn code_commands_at(lang: Lang, code: &str, depth: usize) -> Vec<String> {
     }
     out.retain(|c| !c.trim().is_empty());
     out.dedup();
+    out
+}
+
+const PY_OS: &[&str] = &["system", "popen"];
+const PY_SUBPROCESS: &[&str] = &[
+    "run",
+    "call",
+    "check_call",
+    "check_output",
+    "Popen",
+    "getoutput",
+    "getstatusoutput",
+];
+const NODE_CMD: &[&str] = &["exec", "execSync"];
+const RUBY_CMD: &[&str] = &["system", "exec", "spawn"];
+const PHP_CMD: &[&str] = &[
+    "system",
+    "exec",
+    "shell_exec",
+    "passthru",
+    "popen",
+    "proc_open",
+];
+
+/// The argument text after the first argument (`send(:system, "ls")` -> `"ls"`).
+fn rest_args(args: &str) -> String {
+    top_level_split(args)
+        .into_iter()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Calls to a command-running function reached indirectly, as (argument text, kind):
+/// - python `getattr(os, "system")(...)`, `getattr(__import__("os"), "system")(...)`, aliases `f = os.system`,
+///   `from subprocess import run as r`;
+/// - node `cp["execSync"](...)`, `const run = cp.execSync`, `const {execSync: run} = require(...)`;
+/// - ruby `send(:system, ...)` (also `public_send`, `__send__`), `method(:system).call(...)`;
+/// - php `call_user_func("system", ...)`, `call_user_func_array("system", [...])`, `$f = "system"; $f(...)`.
+fn indirect_calls(code: &str, lang: Lang, env: &Env) -> Vec<(String, Kind)> {
+    let mut out = Vec::new();
+    let r = |s: &str| Regex::new(s).expect("static regex");
+    // Calls of these names (aliases) anywhere in the code.
+    let mut aliases: Vec<(String, Kind)> = Vec::new();
+    match lang {
+        Lang::Python => {
+            let re = r(
+                r#"\bgetattr\s*\(\s*(?:os|subprocess|__import__\(\s*["'](?:os|subprocess)["']\s*\))\s*,\s*([^)]*)\)\s*\("#,
+            );
+            for c in re.captures_iter(code) {
+                let name = values::eval(&c[1], lang, env, 0)
+                    .first()
+                    .map(Val::text)
+                    .unwrap_or_default();
+                if PY_OS.contains(&name.as_str()) || PY_SUBPROCESS.contains(&name.as_str()) {
+                    let at = c.get(0).map(|m| m.end() - 1).unwrap_or(0);
+                    out.extend(call_args(code, at, lang).map(|a| (a, Kind::Cmd)));
+                }
+            }
+            let alias = r(
+                r"(?m)(?:^|;)\s*(\w+)\s*=\s*(?:os\.(?:system|popen)|subprocess\.(?:run|call|check_call|check_output|Popen|getoutput|getstatusoutput))\s*(?:$|;)",
+            );
+            aliases.extend(
+                alias
+                    .captures_iter(code)
+                    .map(|c| (c[1].to_string(), Kind::Cmd)),
+            );
+            let from = r(r"\bfrom\s+(?:os|subprocess)\s+import\s+([^\n;]+)");
+            for c in from.captures_iter(code) {
+                for item in c[1].split(',') {
+                    if let Some((orig, new)) = item.split_once(" as ") {
+                        let orig = orig.trim();
+                        if PY_OS.contains(&orig) || PY_SUBPROCESS.contains(&orig) {
+                            aliases
+                                .push((new.trim().trim_matches(['(', ')']).to_string(), Kind::Cmd));
+                        }
+                    }
+                }
+            }
+        }
+        Lang::Node if code.contains("child_process") => {
+            let bracket = r(
+                r#"\[\s*["'`](exec|execSync|spawn|spawnSync|execFile|execFileSync)["'`]\s*\]\s*\("#,
+            );
+            for c in bracket.captures_iter(code) {
+                let kind = if NODE_CMD.contains(&&c[1]) {
+                    Kind::Cmd
+                } else {
+                    Kind::ProgArgs
+                };
+                let at = c.get(0).map(|m| m.end() - 1).unwrap_or(0);
+                out.extend(call_args(code, at, lang).map(|a| (a, kind)));
+            }
+            let assign = r(
+                r"\b(?:const|let|var)\s+(\w+)\s*=\s*[\w.$]*\.(exec|execSync|spawn|spawnSync|execFile|execFileSync)\b\s*(?:;|$|\n)",
+            );
+            let rename = r(r"\b(exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*:\s*(\w+)");
+            for c in assign.captures_iter(code) {
+                let kind = if NODE_CMD.contains(&&c[2]) {
+                    Kind::Cmd
+                } else {
+                    Kind::ProgArgs
+                };
+                aliases.push((c[1].to_string(), kind));
+            }
+            for c in rename.captures_iter(code) {
+                let kind = if NODE_CMD.contains(&&c[1]) {
+                    Kind::Cmd
+                } else {
+                    Kind::ProgArgs
+                };
+                aliases.push((c[2].to_string(), kind));
+            }
+        }
+        Lang::Ruby => {
+            let send = r(r"\b(?:send|public_send|__send__)\s*\(\s*:(\w+)\s*,");
+            for c in send.captures_iter(code) {
+                if RUBY_CMD.contains(&&c[1]) {
+                    let open = code[..c.get(0).map(|m| m.start()).unwrap_or(0)].len()
+                        + c[0].find('(').unwrap_or(0);
+                    if let Some(a) = call_args(code, open, lang) {
+                        out.push((rest_args(&a), Kind::Cmd));
+                    }
+                }
+            }
+            let method = r(r"\bmethod\s*\(\s*:(\w+)\s*\)\s*\.\s*call\b");
+            for c in method.captures_iter(code) {
+                if RUBY_CMD.contains(&&c[1]) {
+                    let at = c.get(0).map(|m| m.end()).unwrap_or(0);
+                    out.extend(call_args(code, at, lang).map(|a| (a, Kind::Cmd)));
+                }
+            }
+        }
+        Lang::Php => {
+            let cuf = r(r#"\bcall_user_func(?:_array)?\s*\(\s*["'](\w+)["']\s*,"#);
+            for c in cuf.captures_iter(code) {
+                if PHP_CMD.contains(&&c[1]) {
+                    let open =
+                        c.get(0).map(|m| m.start()).unwrap_or(0) + c[0].find('(').unwrap_or(0);
+                    if let Some(a) = call_args(code, open, lang) {
+                        let rest = rest_args(&a);
+                        // call_user_func_array: the array is the function's argument list.
+                        let rest = if c[0].contains("_array") {
+                            let t = rest.trim();
+                            t.strip_prefix('[')
+                                .and_then(|x| x.strip_suffix(']'))
+                                .unwrap_or(t)
+                                .to_string()
+                        } else {
+                            rest
+                        };
+                        out.push((rest, Kind::Cmd));
+                    }
+                }
+            }
+            // `$f = "system"; $f("...")`.
+            let varcall = r(r"\$(\w+)\s*\(");
+            for c in varcall.captures_iter(code) {
+                let name = format!("${}", &c[1]);
+                if env
+                    .texts(&name)
+                    .iter()
+                    .any(|v| PHP_CMD.contains(&v.as_str()))
+                {
+                    let at = c.get(0).map(|m| m.end() - 1).unwrap_or(0);
+                    out.extend(call_args(code, at, lang).map(|a| (a, Kind::Cmd)));
+                }
+            }
+        }
+        _ => {}
+    }
+    for (name, kind) in aliases {
+        let Ok(re) = Regex::new(&format!(r"(?:^|[^.\w$]){}\s*\(", regex::escape(&name))) else {
+            continue;
+        };
+        for m in re.find_iter(code) {
+            if inside_string(code, m.start(), lang) {
+                continue;
+            }
+            out.extend(call_args(code, m.end() - 1, lang).map(|a| (a, kind)));
+        }
+    }
     out
 }
 

@@ -10,6 +10,10 @@
 //!   perl `join`, python `%` and `.format()`. An unknown name inside a concatenation or interpolation reads as the
 //!   word `x` (a path built on it stays relative); an unknown expression on its own has no value.
 //!
+//! - Environment lookups (`os.environ`, `process.env`, `ENV`, `$ENV`, `getenv`) take the value the command
+//!   itself gives the variable, and file reads (`open(p).read()`, `fs.readFileSync`, `File.read`,
+//!   `file_get_contents`, `io.open(p):read`) the file's text (`context`).
+//!
 //! A heuristic: there is no scoping, control flow or function call; values come from the program's text.
 
 use super::interp::{Lang, top_level_split};
@@ -41,6 +45,13 @@ pub(super) struct Env {
 }
 
 impl Env {
+    /// The string values `name` holds.
+    pub(super) fn texts(&self, name: &str) -> Vec<String> {
+        self.get(name)
+            .map(|v| v.iter().map(Val::text).collect())
+            .unwrap_or_default()
+    }
+
     fn get(&self, name: &str) -> Option<&Vec<Val>> {
         self.vars.iter().find(|(n, _)| n == name).map(|(_, v)| v)
     }
@@ -310,6 +321,9 @@ pub(super) fn eval(expr: &str, lang: Lang, env: &Env, depth: usize) -> Vec<Val> 
     if let Some(v) = joins_and_formats(t, lang, env, depth) {
         return v;
     }
+    if let Some(v) = env_or_file(t, lang, env, depth) {
+        return v;
+    }
     let pieces = split_concat(t, lang);
     if pieces.len() > 1 {
         let texts: Vec<Vec<String>> = pieces
@@ -331,6 +345,80 @@ pub(super) fn eval(expr: &str, lang: Lang, env: &Env, depth: usize) -> Vec<Val> 
         return env.get(t).cloned().unwrap_or_default();
     }
     Vec::new()
+}
+
+/// Environment lookups and file reads with a value the check knows: the command's own variables
+/// (`CMD=... python3 -c 'os.environ["CMD"]'`) and files in the project, a temp folder, or written earlier in the
+/// same command (`open("cmd.txt").read()`). None when `t` is neither; an empty list when its value is unknown.
+fn env_or_file(t: &str, lang: Lang, env: &Env, depth: usize) -> Option<Vec<Val>> {
+    static PATTERNS: LazyLock<Vec<(Lang, bool, Regex)>> = LazyLock::new(|| {
+        let r = |s: &str| Regex::new(s).expect("static regex");
+        vec![
+            // (language, is a file read, pattern with the argument list in group 1)
+            (Lang::Python, false, r(r"(?s)^(?:os\.)?environ\s*\[(.+)\]$")),
+            (
+                Lang::Python,
+                false,
+                r(r"(?s)^(?:os\.)?environ\.get\s*\((.*)\)$"),
+            ),
+            (Lang::Python, false, r(r"(?s)^os\.getenv\s*\((.*)\)$")),
+            (
+                Lang::Python,
+                true,
+                r(r"(?s)^(?:io\.)?open\s*\((.*)\)\s*\.\s*read\s*\(\s*\)$"),
+            ),
+            (
+                Lang::Python,
+                true,
+                r(r"(?s)^(?:pathlib\.)?Path\s*\((.*?)\)\s*\.\s*read_text\s*\(.*\)$"),
+            ),
+            (Lang::Node, false, r(r"^process\.env\.(\w+)$")),
+            (Lang::Node, false, r(r"(?s)^process\.env\s*\[(.+)\]$")),
+            (
+                Lang::Node,
+                true,
+                r(
+                    r#"(?s)^(?:require\(\s*["'](?:node:)?fs["']\s*\)|fs)\s*\.\s*readFileSync\s*\((.*?)\)(?:\s*\.\s*toString\s*\(\s*\))?$"#,
+                ),
+            ),
+            (Lang::Ruby, false, r(r"(?s)^ENV\s*\[(.+)\]$")),
+            (Lang::Ruby, false, r(r"(?s)^ENV\.fetch\s*\((.*)\)$")),
+            (Lang::Ruby, true, r(r"(?s)^(?:File|IO)\.read\s*\((.*)\)$")),
+            (Lang::Perl, false, r(r"(?s)^\$ENV\{(.+)\}$")),
+            (Lang::Php, false, r(r"(?s)^getenv\s*\((.*)\)$")),
+            (Lang::Php, false, r(r"(?s)^\$_(?:ENV|SERVER)\s*\[(.+)\]$")),
+            (Lang::Php, true, r(r"(?s)^file_get_contents\s*\((.*)\)$")),
+            (Lang::Lua, false, r(r"(?s)^os\.getenv\s*\((.*)\)$")),
+            (
+                Lang::Lua,
+                true,
+                r(r"(?s)^io\.open\s*\((.*?)\)\s*:\s*read\s*\(.*\)$"),
+            ),
+        ]
+    });
+    let (file, args) = PATTERNS
+        .iter()
+        .filter(|(l, _, _)| *l == lang)
+        .find_map(|(_, file, re)| re.captures(t).map(|c| (*file, c[1].to_string())))?;
+    let parts = top_level_split(&args);
+    let first = parts.first().map(|p| p.trim()).unwrap_or("");
+    // A bare word names the variable itself (`process.env.CMD`, `$ENV{CMD}`).
+    let key = if first.chars().all(|c| c.is_alphanumeric() || c == '_') && !first.is_empty() {
+        first.to_string()
+    } else {
+        eval(first, lang, env, depth + 1).first().map(Val::text)?
+    };
+    let value = if file {
+        super::context::file(&key)
+    } else {
+        super::context::var(&key)
+    };
+    Some(match value {
+        Some(v) => vec![Val::Str(v)],
+        // `os.environ.get("X", "default")`, `ENV.fetch("X", "default")`: the default when the command doesn't set X.
+        None if !file && parts.len() > 1 => eval(&parts[1], lang, env, depth + 1),
+        None => Vec::new(),
+    })
 }
 
 fn first_text(expr: &str, lang: Lang, env: &Env, depth: usize) -> String {
