@@ -138,6 +138,11 @@ Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `ba
    or through brace expansion; recursive `grep`; `rg --hidden`/`--no-ignore` without `-g '!.env*'`. Templates
    (`.env.example`, ...) stay readable, and jq/yq filters such as `'.env.FOO'` are not files. File tests only test:
    `[ -f .env ]`, `test -f .env`, and (Rust only) `[[ -f .env && -s .env ]]`, `[ ! -f .env ]`, `test ! -e .envrc`.
+   Also not reads (Rust only): a grep/rg search pattern (`rg 'process\.env' src`, `grep -e .env x`; a `-f`
+   pattern file and a pattern holding a glob or brace still count, as the shell expands those into files), a `case`
+   word or pattern (`case $p in /.env)`), and `readlink`, `realpath`, `chown`, `chgrp`. A substitution that only
+   prints a path reads as that path in the command around it (`cat $(readlink -f .env)`, `cat $(echo .env)`: Rust
+   only; the Python guard let those through).
 3. `git push --force` / `-f` (`--force-with-lease` is allowed).
 4. `sudo`.
 5. `pip install` (tells Claude to use `uv` instead), also after a keyword, wrapper or assignment (`then pip install`,

@@ -2825,3 +2825,76 @@ fn home_prefix_applies_to_what_it_runs() {
         fails.join("\n")
     );
 }
+
+#[test]
+fn search_patterns_case_patterns_and_path_verbs_are_not_reads() {
+    // A grep/rg pattern, a case pattern, readlink/realpath (print a path) and chown/chgrp (change metadata) name .env
+    // without reading it. The files a search reads, `-f` pattern files and commands after a case pattern still count.
+    let allow = [
+        "rg -n 'process\\.env' src",
+        "rg 'process.env' src",
+        "rg -e .env -e x src",
+        "rg --regexp=.env src",
+        "rg -g '*.ts' -n .env src",
+        "rg -t ts -A 2 .env src",
+        "grep -n '.env' README.md",
+        "grep -e .env -e x README.md",
+        "grep -A3 .env README.md",
+        "grep -m 1 -- .env README.md",
+        "egrep 'env_file: .env' docker-compose.yml",
+        "fgrep .env.local notes.txt",
+        "git ls-files | grep .env",
+        "case \"$p\" in /.env|/.git/config) t=1;; esac",
+        "case $f in .env) echo secret;; *.env.local) echo local;; esac",
+        "case $f in a) echo a;; .env) echo b;; esac",
+        "readlink -f current/.env",
+        "E=$(readlink -f current/.env); echo \"$E\"",
+        "realpath shared/.env",
+        "chown ec2-user:ec2-user .env docker-compose.yml",
+        "chgrp staff .env",
+        "E=$(readlink -f .env); echo \"$E\"",
+        "ls -l $(realpath .env)",
+    ];
+    let deny = [
+        "grep KEY .env",
+        "grep -n x .env.local",
+        "grep -e x -- .env",
+        "grep -f .env README.md",
+        "rg x .env",
+        "rg -e x .env",
+        "rg --file .env src",
+        "rg -n KEY -- .env",
+        "grep -A 3 KEY .env",
+        // A brace (or glob) pattern word is expanded first, into files the search then reads.
+        "grep {x,.env} README.md",
+        "case $f in a) cat .env;; esac",
+        "case $f in a) echo a;; b) cat .env;; esac",
+        "cat $(readlink -f .env)",
+        "readlink -f .env; cat .env",
+        // A substitution that only prints a path reads as that path in the command around it.
+        "cat \"$(realpath shared/.env)\"",
+        "cat $(echo .env)",
+        "cat $(ls .env)",
+        "cat \"$(printf %s .env)\"",
+        "f=$(readlink -f .env); cat \"$f\"",
+    ];
+    let mut fails = Vec::new();
+    for c in allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    for c in deny {
+        let o = run(&["bash"], &bash_input(c));
+        if !o.stdout.contains("reading a secrets file") {
+            fails.push(format!("want deny :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}

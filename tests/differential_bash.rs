@@ -163,6 +163,13 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "HOME=/srv/h bash -c 'rm -rf ~/x'",
     "HOME=/tmp/h bash -c \"rm -rf $HOME/x\"",
     "env HOME=/tmp/h sh -c '@@'",
+    "rg -n 'process\\.env' src",
+    "grep -n .env README.md",
+    "case $p in /.env) t=1;; esac",
+    "readlink -f .env",
+    "chown u:g .env",
+    "cat $(readlink -f .env)",
+    "cat $(echo .env)",
     "x=$(date); @@",
     "echo $(pwd)&& @@",
     "echo \"$(@@)\"",
@@ -1221,6 +1228,10 @@ const KNOWN_KINDS: &[&str] = &[
     "work-budget",
     "rm-redirect-target",
     "substitution-word",
+    "search-pattern",
+    "case-pattern",
+    "path-only-verb",
+    "printed-path",
 ];
 
 /// A `$(...)` or backticks with more of the same simple command after it: its closing `)` or backtick (glued to
@@ -1254,6 +1265,40 @@ fn known_difference(
         && test_bracket(input)
     {
         return Some("test-bracket");
+    }
+    // Names of .env files that Rust doesn't count as reads where the Python guard did: Rust allows, or blocks for
+    // another file or rule. A grep/rg search pattern, a `case` word or pattern, and readlink/realpath/chown/chgrp.
+    if reference.stdout.contains("reading a secrets file")
+        && (reference.stdout != rust.stdout || reference.code != rust.code)
+    {
+        let cmd = input_command(input).replace('\\', "");
+        if at_command("grep|egrep|fgrep|rg").is_match(&cmd) {
+            return Some("search-pattern");
+        }
+        if rx(r"\bcase\b|;;|;&").is_match(&cmd) {
+            return Some("case-pattern");
+        }
+        if at_command("readlink|realpath|chown|chgrp").is_match(&cmd) {
+            return Some("path-only-verb");
+        }
+    }
+    // A hook input whose cwd isn't text (Claude Code always sends text): the Python guard crashed (blocked) judging
+    // a glob in a word Rust no longer reads as a file (after a case arm's end, a chown argument, a search pattern),
+    // where both used to crash. Rust then allows, or blocks for another reason.
+    let cwd_text = serde_json::from_str::<Value>(input)
+        .map(|v| v["cwd"].is_string() || v["cwd"].is_null())
+        .unwrap_or(true);
+    if reference.stdout.contains("guard-bash crashed") && !cwd_text {
+        let cmd = input_command(input).replace('\\', "");
+        if rx(r";;|;&|\bcase\b").is_match(&cmd) {
+            return Some("case-pattern");
+        }
+        if at_command("readlink|realpath|chown|chgrp").is_match(&cmd) {
+            return Some("path-only-verb");
+        }
+        if at_command("grep|egrep|fgrep|rg").is_match(&cmd) {
+            return Some("search-pattern");
+        }
     }
     // The work budget: more pieces than one check reads (deep nesting the Python guard never followed).
     if rust
@@ -1325,6 +1370,14 @@ fn known_difference(
         // pass, which reads the substitution as one word; the Python guard ended the command at its `)`.
         if words_after_substitution(input) {
             return Some("substitution-word");
+        }
+        // A substitution that only prints a path (`cat $(readlink -f .env)`) reads as that path in Rust's newline
+        // pass; the Python guard read it as words and operators.
+        if at_command("echo|printf|ls|readlink|realpath")
+            .is_match(&input_command(input).replace('\\', ""))
+            && (input_command(input).contains("$(") || input_command(input).contains('`'))
+        {
+            return Some("printed-path");
         }
         // pip run as a simple command after blanks, a keyword or an assignment (`then pip install`): block-pip's
         // pattern only matched at a line start or after ; & |.

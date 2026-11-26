@@ -70,6 +70,68 @@ const KEYWORDS: &[&str] = &[
 ];
 const ENV_SAFE_VERBS: &[&str] = &[
     "ls", "test", "[", "[[", "stat", "touch", "rm", "chmod", "mkdir", "echo", "printf", "ln",
+    // Print a path, or change an owner, without reading the file (Rust only).
+    "readlink", "realpath", "chown", "chgrp",
+];
+const GREP_VERBS: &[&str] = &["grep", "egrep", "fgrep"];
+/// Options that take a value in the next word (or glued: `-m1`, `--max-count=1`), so the word after isn't the
+/// pattern. `e`/`regexp` give a pattern and `f`/`file` a pattern file; both are handled on their own.
+const GREP_VALUE_SHORT: &str = "efmABCdD";
+const GREP_VALUE_LONG: &[&str] = &[
+    "regexp",
+    "file",
+    "max-count",
+    "after-context",
+    "before-context",
+    "context",
+    "directories",
+    "devices",
+    "label",
+    "include",
+    "exclude",
+    "exclude-dir",
+    "exclude-from",
+    "binary-files",
+    "group-separator",
+];
+const RG_VALUE_SHORT: &str = "efgtTmABCjMErd";
+const RG_VALUE_LONG: &[&str] = &[
+    "regexp",
+    "file",
+    "glob",
+    "iglob",
+    "type",
+    "type-not",
+    "type-add",
+    "type-clear",
+    "max-count",
+    "after-context",
+    "before-context",
+    "context",
+    "threads",
+    "max-columns",
+    "encoding",
+    "replace",
+    "max-depth",
+    "maxdepth",
+    "max-filesize",
+    "pre",
+    "pre-glob",
+    "sort",
+    "sortr",
+    "path-separator",
+    "colors",
+    "color",
+    "context-separator",
+    "field-context-separator",
+    "field-match-separator",
+    "engine",
+    "dfa-size-limit",
+    "regex-size-limit",
+    "ignore-file",
+    "hyperlink-format",
+    "hostname-bin",
+    "generate",
 ];
 const WRITE_REDIRECTS: &[&str] = &[">", ">>", ">|", "&>", "&>>"];
 const JQ_VERBS: &[&str] = &["jq", "gojq", "jaq", "yq"];
@@ -230,6 +292,97 @@ fn dash_letters_contain(a: &str, wanted: &[char]) -> bool {
     }
     it.take_while(|c| c.is_ascii_alphabetic())
         .any(|c| wanted.contains(&c))
+}
+
+/// Which arguments of a grep or rg call are search patterns, not files it reads (Rust only): each `-e`/`--regexp`
+/// value, else the first argument that isn't an option or an option's value (also after `--`). A pattern file
+/// (`-f F`, `--file F`) is read, so it isn't one; with `-f`, or `rg --files`, no plain argument is a pattern.
+fn search_pattern_indices(verb: &str, args: &[String]) -> Vec<usize> {
+    let (short_val, long_val) = if contains(GREP_VERBS, verb) {
+        (GREP_VALUE_SHORT, GREP_VALUE_LONG)
+    } else if verb == "rg" {
+        (RG_VALUE_SHORT, RG_VALUE_LONG)
+    } else {
+        return Vec::new();
+    };
+    let mut pats = Vec::new();
+    let mut given = verb == "rg" && args.iter().any(|a| a == "--files" || a == "--type-list");
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            if !given && i + 1 < args.len() {
+                pats.push(i + 1);
+            }
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, glued) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            match name {
+                "regexp" => {
+                    given = true;
+                    pats.push(if glued { i } else { i + 1 });
+                }
+                "file" => given = true,
+                _ => {}
+            }
+            if !glued && contains(long_val, name) {
+                i += 1;
+            }
+        } else if a.len() > 1 && a.starts_with('-') {
+            let letters: Vec<char> = a[1..].chars().collect();
+            if let Some(k) = letters.iter().position(|c| short_val.contains(*c)) {
+                let glued = k + 1 < letters.len();
+                match letters[k] {
+                    'e' => {
+                        given = true;
+                        pats.push(if glued { i } else { i + 1 });
+                    }
+                    'f' => given = true,
+                    _ => {}
+                }
+                if !glued {
+                    i += 1;
+                }
+            }
+        } else {
+            if !given {
+                pats.push(i);
+            }
+            break;
+        }
+        i += 1;
+    }
+    // A glob or brace word is expanded by the shell first (`grep .env* x` is `grep .env .env.local x`, which reads
+    // .env.local), so it stays checked like any other argument.
+    pats.retain(|&p| {
+        args.get(p)
+            .is_some_and(|a| !a.contains(['*', '?', '[', '{']))
+    });
+    pats
+}
+
+/// Words a substitution's body only prints, for the command around it (Rust only): `$(readlink -f .env)`,
+/// `$(echo .env)`, `$(ls x)`, `$(realpath x)`, `$(printf %s x)` read as those words (`cat $(readlink -f .env)`
+/// reads .env). None for anything else, or a body that prints no arguments.
+fn printed_words(body: &str) -> Option<String> {
+    const PRINTERS: &[&str] = &["echo", "printf", "ls", "readlink", "realpath"];
+    let tokens = lex_lines(body).ok()?;
+    let segs = segments_with_seps(tokens);
+    let [(seg, _)] = segs.as_slice() else {
+        return None;
+    };
+    if !contains(PRINTERS, pyfs::basename(&seg[0])) {
+        return None;
+    }
+    let words: Vec<String> = strip_redirs(&seg[1..])
+        .into_iter()
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 fn jq_filter_index(verb: &str, args: &[String]) -> Option<usize> {
@@ -1750,7 +1903,8 @@ fn substitutions(command: &str) -> Vec<String> {
 /// The command with each outermost substitution (`$(...)`, backticks) replaced by one placeholder word, or None
 /// when it has none. The lexers read an unquoted `$(` ... `)` as words and operators, so the simple command around
 /// it ended at the `)`: `cat $(true) .env` and `rm -rf $(true) /srv/x` left their last arguments unchecked (in the
-/// Python guard too). Its bodies are checked on their own (`substitutions`). Newline pass only.
+/// Python guard too). Its bodies are checked on their own (`substitutions`). A body that only prints words
+/// (`printed_words`) is replaced by them instead. Newline pass only.
 fn flatten_substitutions(command: &str) -> Option<String> {
     let chars: Vec<char> = command.chars().collect();
     let spans = substitution_spans(&chars);
@@ -1761,7 +1915,11 @@ fn flatten_substitutions(command: &str) -> Option<String> {
     let mut at = 0;
     for s in spans {
         out.extend(&chars[at..s.whole.start]);
-        out.push_str("__substitution__");
+        let body: String = chars[s.body.clone()].iter().collect();
+        match printed_words(&body) {
+            Some(words) => out.push_str(&words),
+            None => out.push_str("__substitution__"),
+        }
         at = s.whole.end;
     }
     out.extend(&chars[at..]);
@@ -2146,7 +2304,8 @@ fn check_mode(
         {
             return Ok(Some("rg with --hidden/--no-ignore also reads .env files. Run plain rg, or exclude them with -g '!.env*'.".into()));
         }
-        if !contains(ENV_SAFE_VERBS, &verb) {
+        // `case WORD in PATTERN)`: the word and patterns are matched as text, not read (Rust only).
+        if !contains(ENV_SAFE_VERBS, &verb) && verb != "case" {
             let mut written: HashSet<usize> = args
                 .iter()
                 .enumerate()
@@ -2155,6 +2314,16 @@ fn check_mode(
                 .collect();
             if let Some(f) = jq_filter_index(&verb, args) {
                 written.insert(f);
+            }
+            // Search patterns (`rg 'process\.env' src`) aren't files (Rust only).
+            written.extend(search_pattern_indices(&verb, args));
+            // The first pass reads a case arm's end (`;;`) as a word: what follows it, up to the `)`, is the next
+            // arm's pattern (Rust only).
+            if let Some(end) = args
+                .iter()
+                .position(|a| matches!(a.as_str(), ";;" | ";&" | ";;&"))
+            {
+                written.extend(end..args.len());
             }
             let mut secret: Vec<String> = Vec::new();
             for (i, a) in args.iter().enumerate() {
