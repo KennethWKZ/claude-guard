@@ -401,8 +401,9 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
             out.push(q);
             continue;
         }
-        // A cat or tee heredoc piped into a shell, or into something else.
-        if (verb == "cat" || verb == "tee") && rng.chance(20) {
+        // A heredoc read by cat or a filter (grep -v), through more filters (sed), piped into a shell or into
+        // something else, on its own line or on the line after the body (`cat <<EOF |`).
+        if (verb == "cat" || verb == "tee" || verb == "grep") && rng.chance(20) {
             let to = [
                 "bash",
                 "sh -s",
@@ -416,10 +417,19 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
             ];
             let body = heredoc_bodies[rng.below(heredoc_bodies.len())].replace("PIP", p);
             let delim = ["EOF", "'EOF'", "\"EOF\""][rng.below(3)];
-            out.push_str(&format!(
-                " <<{delim} | {}\n{body}\nEOF\n",
-                to[rng.below(to.len())]
-            ));
+            let target = to[rng.below(to.len())];
+            if verb == "grep" {
+                out.push_str(" -v zz");
+            }
+            let filter = if rng.chance(30) { " | sed s/a/b/" } else { "" };
+            if rng.chance(40) {
+                let gap = ["", "\n", "\n# then\n"][rng.below(3)];
+                out.push_str(&format!(
+                    " <<{delim}{filter} |\n{body}\nEOF\n{gap}{target}\n"
+                ));
+            } else {
+                out.push_str(&format!(" <<{delim}{filter} | {target}\n{body}\nEOF\n"));
+            }
             continue;
         }
         if verb == "echo" && rng.chance(10) {
@@ -564,22 +574,27 @@ fn nested_kind(input: &str) -> Option<&'static str> {
     }
 }
 
-/// True if a line of the hook input's command has a `<<WORD` followed by a pipe into a shell, `source` or `.`.
+/// True if a line of the hook input's command has a `<<WORD` followed by a pipe into a shell, `source` or `.`, on
+/// that line or, when the line ends in `|`, as the first word of a later line.
 fn heredoc_piped_to_shell(input: &str) -> bool {
     let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let cmd = v["tool_input"]["command"].as_str().unwrap_or("");
-    cmd.split('\n').any(|line| {
+    let shellish = |piece: &str| {
+        let first = piece
+            .split(|c: char| c.is_whitespace() || "();&".contains(c))
+            .find(|x| !x.is_empty())
+            .unwrap_or("");
+        [
+            "bash", "sh", "zsh", "dash", "ksh", "source", ".", "timeout", "env",
+        ]
+        .contains(&unquoted_base(first))
+    };
+    let lines: Vec<&str> = cmd.split('\n').collect();
+    lines.iter().enumerate().any(|(i, line)| {
         line.split_once("<<").is_some_and(|(_, after)| {
-            after.split('|').skip(1).any(|piece| {
-                let first = piece
-                    .split(|c: char| c.is_whitespace() || "();&".contains(c))
-                    .find(|x| !x.is_empty())
-                    .unwrap_or("");
-                [
-                    "bash", "sh", "zsh", "dash", "ksh", "source", ".", "timeout", "env",
-                ]
-                .contains(&unquoted_base(first))
-            })
+            after.split('|').skip(1).any(shellish)
+                || (after.trim_end().ends_with('|')
+                    && lines[i + 1..].iter().any(|l| l.split('|').any(shellish)))
         })
     })
 }

@@ -25,8 +25,9 @@
 //! In that newline pass a heredoc starts only where bash starts one: outside quotes and comments, or inside `$(...)`
 //! and backticks. A heredoc inside a quoted `bash -c '...'` string stays in the string and is checked with it; the
 //! Python guard's reading cut the "body" out of the string, which then failed to parse and was allowed.
-//! A `cat` or `tee` heredoc piped into a shell that runs its stdin (`cat <<EOF | bash`) has its body checked too;
-//! the Python guard read it as data.
+//! A heredoc whose command's output is piped into a shell that runs its stdin (`cat <<EOF | bash`, `sed ... <<EOF |
+//! sh`, `cat <<EOF |` with `bash` on the line after the body) has its body checked as written too; the Python guard
+//! read it as data.
 //!
 //! Same contract as the Python guard: a parse error allows the command (a quoting mistake never locks the
 //! shell); any other failure blocks it (fail closed) and is logged. It only sees what is written in the command.
@@ -368,16 +369,32 @@ fn code_mask(line: &[char], stack: &mut Vec<Ctx>) -> (Vec<bool>, bool) {
     (mask, false)
 }
 
-/// True if the rest of a heredoc's line (from its `<<`) pipes the command's output into a shell that runs its
-/// stdin: `cat <<EOF | bash`, `cat <<'X' | sh -s`, `tee log <<EOF | source /dev/stdin`.
-fn heredoc_piped_to_shell(rest: &[char]) -> bool {
-    let rest: String = rest.iter().collect();
-    let Ok(tokens) = shlex::split_lines(&rest) else {
-        return false;
+/// Where a pipeline carrying a heredoc's body ends up: in a shell that runs its stdin, somewhere else, or not yet
+/// known because the line ends in `|` and the pipeline goes on after the heredoc bodies.
+#[derive(PartialEq)]
+enum Pipe {
+    Shell,
+    Data,
+    NextLine,
+}
+
+/// Follows a pipeline through its segments: any filter on the way (`sed`, `grep`, `tr`) passes the body on.
+/// `from_first`: the first segment is already a pipe target (a line continuing a pipeline), not the producer.
+fn pipe_walk(text: &str, from_first: bool) -> Pipe {
+    let Ok(tokens) = shlex::split_lines(text) else {
+        return Pipe::Data;
     };
     let segs = segments_with_seps(tokens);
-    segs.first().is_some_and(|(_, sep)| sep == "|")
-        && segs.get(1).is_some_and(|(seg, _)| runs_stdin(seg))
+    for (k, (seg, sep)) in segs.iter().enumerate() {
+        if (k > 0 || from_first) && runs_stdin(seg) {
+            return Pipe::Shell;
+        }
+        if sep != "|" {
+            return Pipe::Data;
+        }
+    }
+    // Ended in `|`, or a blank or comment-only line: the pipeline goes on.
+    Pipe::NextLine
 }
 
 /// Remove heredoc bodies (data for the command that reads them); bodies a shell reads come back to be checked.
@@ -386,16 +403,16 @@ fn heredoc_piped_to_shell(rest: &[char]) -> bool {
 /// it only as code, outside quotes and comments, and starts the bodies after the first line that ends outside
 /// quotes, as bash does: a heredoc written inside a quoted `bash -c '...'` string stays in that string, which is
 /// then checked on its own, and a quoted `<<WORD` no longer hides the lines after it.
-/// It also counts a `cat` or `tee` heredoc piped straight into a shell that runs its stdin (`cat <<EOF | bash`) as fed
-/// to that shell. Heredocs inside `"$(...)"`
+/// It also counts a heredoc whose command's output is piped into a shell that runs its stdin as fed to that shell
+/// (`cat <<EOF | bash`, `sed s/a/b/ <<EOF | sh`, or `cat <<EOF |` with `bash` on the line after the bodies). Heredocs inside `"$(...)"`
 /// and backticks are code, so `git commit -m "$(cat <<'EOF' ...)"` still drops its message.
 fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out: Vec<&str> = Vec::new();
     let mut run_as_shell = Vec::new();
     let mut stack = vec![Ctx::Code { parens: 0 }];
-    // (strip leading tabs, delimiter, body fed to a shell)
-    let mut pending: Vec<(bool, String, bool)> = Vec::new();
+    // (strip leading tabs, delimiter, body fed to a shell, pipeline goes on after the bodies)
+    let mut pending: Vec<(bool, String, bool, bool)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -414,18 +431,29 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
             let before: String = chars[..start].iter().collect();
             let last = before.rsplit([';', '&', '|', '(']).next().unwrap_or("");
             let first_word = last.split(py_isspace).find(|w| !w.is_empty());
-            let to_shell = first_word.is_some_and(|w| contains(SHELLS, pyfs::basename(w)))
-                || (quoted
-                    && first_word.is_some_and(|w| ["cat", "tee"].contains(&pyfs::basename(w)))
-                    && heredoc_piped_to_shell(&chars[start..]));
-            pending.push((tabs, delim, to_shell));
+            let shell_reads = first_word.is_some_and(|w| contains(SHELLS, pyfs::basename(w)));
+            // The newline pass also follows the command's output: piped into a shell that runs its stdin (on this
+            // line, or on the line after the bodies when this one ends in `|`), the body is checked as written.
+            let pipe = if quoted && !shell_reads && first_word.is_some() {
+                let rest: String = chars[start..].iter().collect();
+                pipe_walk(&rest, false)
+            } else {
+                Pipe::Data
+            };
+            pending.push((
+                tabs,
+                delim,
+                shell_reads || pipe == Pipe::Shell,
+                pipe == Pipe::NextLine,
+            ));
         }
         let ready = !quoted
             || (!continued && matches!(stack.last(), Some(Ctx::Code { .. } | Ctx::Backtick)));
         if !ready {
             continue;
         }
-        for (tabs, delim, to_shell) in pending.drain(..) {
+        let mut pipe_next: Vec<String> = Vec::new();
+        for (tabs, delim, to_shell, next) in pending.drain(..) {
             let mut body: Vec<&str> = Vec::new();
             while i < lines.len() {
                 let body_line = lines[i];
@@ -442,6 +470,21 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
             }
             if to_shell {
                 run_as_shell.push(body.join("\n"));
+            } else if next {
+                pipe_next.push(body.join("\n"));
+            }
+        }
+        // `cat <<EOF |`: the pipeline goes on at the first command line after the bodies.
+        if !pipe_next.is_empty() {
+            for later in &lines[i..] {
+                match pipe_walk(later, true) {
+                    Pipe::Shell => {
+                        run_as_shell.append(&mut pipe_next);
+                        break;
+                    }
+                    Pipe::Data => break,
+                    Pipe::NextLine => {}
+                }
             }
         }
     }

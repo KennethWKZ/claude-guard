@@ -1171,6 +1171,147 @@ fn heredoc_piped_into_shell_every_rule() {
 }
 
 #[test]
+fn heredoc_through_filters_and_next_line_pipes_every_rule() {
+    let p = "pip"; // kept apart so this file's text doesn't trip the live pip hook
+    // (command, words the deny reason must hold)
+    let deny = [
+        // Any command reading the heredoc, piped into a shell: the body is checked as written.
+        ("sed s/a/b/ <<EOF | bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        (
+            "sed 's/x/y/' <<EOF | sh⏎rm -rf /srv/app⏎EOF",
+            "recursive force delete",
+        ),
+        ("sed -e 's/x/y/' <<'X' | bash⏎cat .env⏎X", ".env"),
+        (
+            "sed s/a/b/ <<EOF | bash⏎grep -r token .⏎EOF",
+            "recursive grep",
+        ),
+        (
+            "sed s/a/b/ <<EOF | bash⏎rg --hidden token⏎EOF",
+            "rg with --hidden",
+        ),
+        (
+            "sed s/a/b/ <<EOF | bash⏎git push -f⏎EOF",
+            "git push --force",
+        ),
+        (
+            "sed s/a/b/ <<EOF | bash⏎rust-anything build rust/util⏎EOF",
+            "rust-anything build",
+        ),
+        ("awk '{print}' <<EOF | bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        ("envsubst <<EOF | sh -s⏎sudo ls⏎EOF", "sudo is blocked"),
+        (
+            "tr a-z a-z <<EOF | source /dev/stdin⏎sudo ls⏎EOF",
+            "sudo is blocked",
+        ),
+        // Filters between the heredoc and the shell.
+        (
+            "cat <<EOF | sed s/a/b/ | bash⏎sudo ls⏎EOF",
+            "sudo is blocked",
+        ),
+        (
+            "cat <<EOF | grep -v '^#' | sh⏎git push -f⏎EOF",
+            "git push --force",
+        ),
+        // A line ending in `|`: the pipeline goes on after the bodies.
+        ("cat <<EOF |⏎sudo ls⏎EOF⏎bash", "sudo is blocked"),
+        (
+            "cat <<EOF |⏎rm -rf /srv/app⏎EOF⏎sh",
+            "recursive force delete",
+        ),
+        ("cat <<EOF |⏎cat .env⏎EOF⏎bash", ".env"),
+        ("cat <<EOF |⏎grep -r token .⏎EOF⏎bash", "recursive grep"),
+        ("cat <<EOF |⏎rg --hidden token⏎EOF⏎bash", "rg with --hidden"),
+        ("cat <<EOF |⏎git push -f⏎EOF⏎bash", "git push --force"),
+        (
+            "cat <<EOF |⏎rust-anything build rust/util⏎EOF⏎bash",
+            "rust-anything build",
+        ),
+        ("cat <<'X' |⏎sudo ls⏎X⏎  sh -s", "sudo is blocked"),
+        (
+            "cat <<EOF |⏎sudo ls⏎EOF⏎⏎# run it⏎timeout 9 bash",
+            "sudo is blocked",
+        ),
+        (
+            "cat <<EOF |⏎sudo ls⏎EOF⏎sed s/a/b/ | bash",
+            "sudo is blocked",
+        ),
+        (
+            "cat <<EOF |⏎sudo ls⏎EOF⏎sed s/a/b/ |⏎bash",
+            "sudo is blocked",
+        ),
+        (
+            "cat <<EOF | sed s/a/b/ |⏎sudo ls⏎EOF⏎bash",
+            "sudo is blocked",
+        ),
+        (
+            "sed s/a/b/ <<EOF |⏎sudo ls⏎EOF⏎source /dev/stdin",
+            "sudo is blocked",
+        ),
+        ("cat <<-EOF |⏎\tsudo ls⏎\tEOF⏎bash", "sudo is blocked"),
+        // Inside strings run as commands.
+        ("bash -c 'cat <<EOF |⏎sudo ls⏎EOF⏎bash'", "sudo is blocked"),
+        (
+            "eval 'sed s/a/b/ <<EOF | sh⏎git push -f⏎EOF'",
+            "git push --force",
+        ),
+    ];
+    let allow = [
+        "sed s/a/b/ <<EOF > run.sh⏎sudo ls⏎EOF",
+        "sed s/a/b/ <<EOF | grep x⏎sudo ls⏎EOF",
+        "grep -v x <<EOF | wc -l⏎rm -rf /srv/app⏎EOF",
+        "cat <<EOF |⏎sudo ls⏎EOF⏎grep x",
+        "cat <<EOF |⏎sudo ls⏎EOF⏎bash -c cat",
+        "cat <<EOF |⏎sudo ls⏎EOF⏎tee notes.md",
+        "cat <<EOF |⏎git push -f⏎EOF⏎wc -l⏎ls",
+        "sed s/a/b/ <<EOF | bash⏎ls -la⏎EOF",
+        "cat <<EOF |⏎ls -la⏎EOF⏎bash",
+        "git commit -m \"$(cat <<'EOF'⏎sudo ls |⏎EOF⏎)\"",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in &deny {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains(want);
+        if !ok {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in [
+        format!("sed s/a/b/ <<EOF | bash⏎{p} install y⏎EOF"),
+        format!("cat <<EOF |⏎{p} install y⏎EOF⏎bash"),
+    ] {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (2, "") {
+            fails.push(format!(
+                "want pip :: {c:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &allow {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [

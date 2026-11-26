@@ -150,8 +150,10 @@ read such a string as one word; the strings are checked after the rest of the co
 blocked keeps its reason. A heredoc is read only where bash reads one: outside quotes and comments, or inside
 `$(…)` and backticks. So a heredoc written inside a quoted `bash -c '…'` string is checked as part of that string
 (its body when a shell reads it, and the lines after its end marker), and a `<<WORD` inside quotes or a comment no
-longer hides the lines after it. A `cat` or `tee` heredoc piped into a shell that runs its input (`cat <<EOF | bash`,
-`| sh -s`, `| source /dev/stdin`) has its body checked as commands. A quoting error in the command allows it, so a typo never locks
+longer hides the lines after it. A heredoc whose command's output is piped into a shell that runs its input (`cat <<EOF | bash`,
+`| sh -s`, `| source /dev/stdin`, through filters such as `sed <<EOF | bash` or `cat <<EOF | sed … | bash`, and
+`cat <<EOF |` with the shell on the first command line after the body) has its body checked as commands, as written:
+what a filter changes isn't known, so a filter that adds a blocked command isn't caught. A quoting error in the command allows it, so a typo never locks
 the shell; any other failure blocks it and is logged. Input nested too deep to check blocks.
 
 ### `claude-guard read`
