@@ -159,6 +159,10 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "cat $(true) .env",
     "rm -rf $(true) /srv/x",
     "rm -rf $(mktemp -d)/x",
+    "HOME=/tmp/h bash -c 'rm -rf ~/x'",
+    "HOME=/srv/h bash -c 'rm -rf ~/x'",
+    "HOME=/tmp/h bash -c \"rm -rf $HOME/x\"",
+    "env HOME=/tmp/h sh -c '@@'",
     "x=$(date); @@",
     "echo $(pwd)&& @@",
     "echo \"$(@@)\"",
@@ -1220,11 +1224,13 @@ const KNOWN_KINDS: &[&str] = &[
 ];
 
 /// A `$(...)` or backticks with more of the same simple command after it: its closing `)` or backtick (glued to
-/// more of the word or not) followed by a word or `(`, not an operator or the end.
+/// more of the word or not) followed by a word or `(`, not an operator or the end. Redirects on the way (`&> f`,
+/// `2>/dev/null`) are skipped: bash reads the words after them as the same command's arguments.
 fn words_after_substitution(input: &str) -> bool {
     let cmd = input_command(input);
     (cmd.contains("$(") || cmd.contains('`'))
-        && rx(r"[)`][^\s;&|]*(?:[ \t]+[^\s;&|#)]|\()").is_match(&cmd)
+        && rx(r"[)`][^\s;&|]*(?:[ \t]+[0-9]*(?:&>>?|>>?\|?|<>?|>&|<&)[ \t]*[^\s;&|]+)*(?:[ \t]+[^\s;&|#)]|\()")
+            .is_match(&cmd)
 }
 
 /// Differences that are intended. Anything else fails the test.

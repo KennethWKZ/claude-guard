@@ -2730,3 +2730,98 @@ fn words_after_a_substitution_stay_in_its_command() {
         fails.join("\n")
     );
 }
+
+#[test]
+fn home_prefix_applies_to_what_it_runs() {
+    // `HOME=x CMD` runs CMD with that home: `~` and `$HOME` in the string or script it runs mean x. Not where the
+    // command's own shell expands them first (unquoted, `"$HOME"`, `eval` arguments), not past the simple command,
+    // and not when x can't be known (a substitution).
+    let dir = format!(
+        "{}/claude-guard-table-home-{}",
+        tmpdir(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        format!("{dir}/inst.sh"),
+        "#!/bin/sh\nmkdir -p \"$HOME/.local/share\"\nrm -rf \"$HOME/.local/share/x\"\nrm -rf ~/.cache/x\n",
+    )
+    .unwrap();
+    let allow = [
+        "HOME=/tmp/h bash -c 'rm -rf \"$HOME/.local/x\"'",
+        "HOME=/tmp/h bash -c 'rm -rf ~/.local/x'",
+        "HOME=/tmp/h bash -c \"rm -rf ~/x\"",
+        "env HOME=/tmp/h bash -c 'rm -rf ~/x'",
+        "HOME=/tmp/h sh -c 'rm -rf ${HOME}/x'",
+        "h=/tmp/h; HOME=\"$h\" bash -c 'rm -rf ~/x'",
+        "HOME=/tmp/h timeout 9 bash -c 'rm -rf ~/x'",
+        "HOME=/tmp/h nice timeout 9 sh -c 'rm -rf \"$HOME/x\"'",
+        "HOME=/tmp/h bash -c 'bash -c \"rm -rf ~/x\"'",
+        "HOME=/tmp/h bash <<< 'rm -rf ~/x'",
+        "HOME=/tmp/h bash inst.sh",
+        "HOME=/tmp/h timeout 9 bash inst.sh",
+        "env HOME=/tmp/h sh inst.sh",
+        "ih=/tmp/h/home; HOME=\"$ih\" bash inst.sh",
+        // heeler-kit's test: a home under a mktemp folder the guard can't know, read like any unknown variable.
+        "okd=$(mktemp -d); ih=\"$okd/home\"; HOME=\"$ih\" bash inst.sh >/dev/null 2>&1",
+    ];
+    let deny = [
+        "HOME=/tmp/h rm -rf ~/x",
+        "HOME=/tmp/h true; bash -c 'rm -rf ~/x'",
+        "HOME=/srv/h bash -c 'rm -rf ~/x'",
+        "HOME=~ bash -c 'rm -rf ~/x'",
+        "HOME=$HOME bash -c 'rm -rf ~/x'",
+        "HOME=/ bash -c 'rm -rf ~'",
+        "HOME=$(mktemp -d) bash -c 'rm -rf ~/x'",
+        "h=/srv/h; HOME=\"$h\" bash -c 'rm -rf ~/x'",
+        "HOME=/tmp/h bash -c \"rm -rf $HOME/x\"",
+        "HOME=/tmp/h eval rm -rf ~/x",
+        "HOME=/tmp/h bash -c 'HOME=/srv/q bash -c \"rm -rf ~/x\"'",
+        "HOME=/tmp/h bash -c 'rm -rf /srv/y'",
+        // A wrapper's own words are expanded by the shell around it, before the prefix applies.
+        "HOME=/tmp/h timeout 9 rm -rf ~/x",
+        "HOME=/tmp/h timeout 9 rm -rf \"$HOME/x\"",
+        "HOME=/tmp/h nice rm -rf ~/x",
+        "env HOME=/tmp/h rm -rf ~/x",
+        "HOME=/tmp/h timeout 9 bash -c \"rm -rf $HOME/x\"",
+        "timeout 9 env HOME=/tmp/h bash -c \"rm -rf $HOME/x\"",
+        "HOME=/tmp/h timeout 9 eval rm -rf ~/x",
+        // Only a `HOME=` among the leading words counts, not one behind another wrapper (kept blocked).
+        "timeout 9 env HOME=/tmp/h bash -c 'rm -rf ~/x'",
+        "bash inst.sh",
+        "HOME=/srv/h bash inst.sh",
+        "HOME=/tmp/h true; bash inst.sh",
+        "bash inst.sh; HOME=/tmp/h bash inst.sh",
+        "HOME=/tmp/h bash inst.sh; bash inst.sh",
+        "HOME=$(mktemp -d) bash inst.sh",
+        "HOME=$HOME/sub bash inst.sh",
+        // A script written here may hold this shell's expansion of `~` or `$HOME`: its home isn't changed.
+        "printf 'rm -rf ~/x\\n' > s.sh; HOME=/tmp/h bash s.sh",
+        "cat > s.sh <<EOF\nrm -rf $HOME/x\nEOF\nHOME=/tmp/h bash s.sh",
+    ];
+    let input = |c: &str| {
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": c}, "cwd": dir})
+            .to_string()
+    };
+    let mut fails = Vec::new();
+    for c in allow {
+        let o = run(&["bash"], &input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    for c in deny {
+        let o = run(&["bash"], &input(c));
+        if !o.stdout.contains("recursive force delete") {
+            fails.push(format!("want deny :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}

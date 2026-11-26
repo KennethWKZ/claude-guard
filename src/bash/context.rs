@@ -21,6 +21,30 @@ struct Frame {
 
 thread_local! {
     static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+    /// The `HOME=` a command runs what it runs with (`HOME=/tmp/h bash -c ...`), innermost last.
+    static HOMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Pops its home when dropped.
+pub(super) struct HomeGuard;
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        HOMES.with(|h| {
+            h.borrow_mut().pop();
+        });
+    }
+}
+
+/// Check what a command runs with `HOME` set to `home` (`~` and `$HOME` there), until the guard drops.
+pub(super) fn push_home(home: String) -> HomeGuard {
+    HOMES.with(|h| h.borrow_mut().push(home));
+    HomeGuard
+}
+
+/// The home the code being checked runs with, if a command around it set one.
+pub(super) fn home() -> Option<String> {
+    HOMES.with(|h| h.borrow().last().cloned())
 }
 
 /// Pops its frame when dropped.

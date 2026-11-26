@@ -127,7 +127,13 @@ Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `ba
 
 1. `rm` with recursive and force flags on an absolute path (`~` and `$HOME` count) outside `$TMPDIR` and `/tmp`, in
    every spelling (`-fr`, `-r -f`, `--recursive --force`, `..` tricks). A redirect's target (`2>/dev/null`,
-   `> out.log`) is a file the shell opens, not an rm path (Rust only; the Python guard listed it).
+   `> out.log`) is a file the shell opens, not an rm path (Rust only; the Python guard listed it). In a string or
+   script run with a `HOME=` prefix (`HOME=/tmp/h bash -c '...'`, `env HOME=/tmp/h bash x.sh`), `~` and `$HOME` mean
+   that home (Rust only), except where the shell around it expands them first (unquoted, `"$HOME"`, `eval`
+   arguments, the command's own words, a script it writes itself) and when the value comes from a substitution
+   (`HOME=$(mktemp -d)`): those keep the real home. A value naming another variable the command doesn't set is read
+   like any unknown variable. Only a `HOME=` among the leading words counts (`env HOME=x`, not one behind another
+   wrapper).
 2. Commands that name a secrets env file (`.env`, `.env.local`, `prod.env`, `.envrc`, ...) directly, through a glob
    or through brace expansion; recursive `grep`; `rg --hidden`/`--no-ignore` without `-g '!.env*'`. Templates
    (`.env.example`, ...) stay readable, and jq/yq filters such as `'.env.FOO'` are not files. File tests only test:

@@ -849,25 +849,167 @@ fn test_word(cur: &[String], t: &str) -> bool {
 /// Split into simple commands: [verb, args...], skipping prefixes like `env`, `xargs`, keywords, VAR=value; each
 /// with the separator that ended it (`;` for the last).
 fn segments_with_seps(tokens: Vec<String>) -> Vec<(Vec<String>, String)> {
+    split_simple(&tokens, true)
+        .into_iter()
+        .map(|s| (s.words, s.sep))
+        .collect()
+}
+
+/// A simple command from `split_simple`: its words, the separator that ended it, and the value of a `HOME=` it was
+/// run with (`HOME=/tmp/h bash -c ...`, `env HOME=/tmp/h bash x.sh`), as written.
+struct Simple {
+    words: Vec<String>,
+    sep: String,
+    home: Option<String>,
+}
+
+/// Split at separators and newlines (`;` ends the last), dropping leading keywords and assignments, and wrappers
+/// too when `drop_wrappers` (`segments_with_seps`; `raw_segments` keeps them).
+fn split_simple(tokens: &[String], drop_wrappers: bool) -> Vec<Simple> {
     let mut out = Vec::new();
     let mut cur: Vec<String> = Vec::new();
-    for t in tokens.into_iter().chain(std::iter::once(";".to_string())) {
+    for t in tokens.iter().chain(std::iter::once(&";".to_string())) {
         // "\n": an unquoted newline (`shlex::split_lines`) ends a command as `;` does.
-        if (contains(SEPARATORS, &t) || t == "\n") && !test_word(&cur, &t) {
+        if (contains(SEPARATORS, t) || t == "\n") && !test_word(&cur, t) {
+            let home = home_prefix(&cur);
             let skip = cur
                 .iter()
-                .take_while(|w| contains(PREFIXES, w) || contains(KEYWORDS, w) || is_assignment(w))
+                .take_while(|w| {
+                    (drop_wrappers && contains(PREFIXES, w))
+                        || contains(KEYWORDS, w)
+                        || is_assignment(w)
+                })
                 .count();
             cur.drain(..skip);
             if !cur.is_empty() {
-                out.push((std::mem::take(&mut cur), t));
+                out.push(Simple {
+                    words: std::mem::take(&mut cur),
+                    sep: t.clone(),
+                    home,
+                });
             }
             cur.clear();
         } else {
-            cur.push(t);
+            cur.push(t.clone());
         }
     }
     out
+}
+
+/// The value of the last `HOME=` among a simple command's leading keywords, assignments and wrappers (`env`, `nice`,
+/// ...: `env HOME=x cmd`), as written.
+fn home_prefix(words: &[String]) -> Option<String> {
+    words
+        .iter()
+        .take_while(|w| contains(PREFIXES, w) || contains(KEYWORDS, w) || is_assignment(w))
+        .filter_map(|w| w.strip_prefix("HOME="))
+        .last()
+        .map(str::to_string)
+}
+
+/// Whether `text` names the home: `$HOME`/`${HOME}`, and `~` at the start of a word.
+fn names_home(text: &str) -> (bool, bool) {
+    static VAR: LazyLock<Regex> = LazyLock::new(|| re(r"\$HOME\b|\$\{HOME\}"));
+    static TILDE: LazyLock<Regex> = LazyLock::new(|| re(r#"(?:^|[\s=:;&|('"])~(?:/|$|\s)"#));
+    (VAR.is_match(text), TILDE.is_match(text))
+}
+
+/// Whether string `s`, which `command` runs (`bash -c S`, `eval S`), may take the `HOME=` its simple command set.
+/// Where `command`'s own shell expands `$HOME` or `~` in it, before the prefix applies (`HOME=/tmp/h bash -c "rm -rf
+/// $HOME/x"`, `HOME=/tmp/h eval rm -rf ~/x`), they mean the real home. So `$HOME` must sit in single quotes and `~` in
+/// quotes: `s` found inside such a span of `command`. Without either, it may.
+fn home_applies(command: &str, s: &str) -> bool {
+    let (var, tilde) = names_home(s);
+    if !var && !tilde {
+        return true;
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let (mut single, mut double) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            q @ ('\'' | '"') => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != q {
+                    if q == '"' && chars[j] == '\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let span: String = chars[start..j.min(chars.len())].iter().collect();
+                if q == '\'' {
+                    single.push(span);
+                } else {
+                    double.push(span);
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let inside = |spans: &[String]| spans.iter().any(|sp| sp.contains(s));
+    if var {
+        inside(&single)
+    } else {
+        inside(&single) || inside(&double)
+    }
+}
+
+/// How a nested check gets its home (Rust only).
+enum RunHome {
+    /// Run with `HOME` set to this (resolved): `~` and `$HOME` in it mean it.
+    Set(String),
+    /// A wrapper's command line, rebuilt from its words (`timeout 9 bash -c ...`), which lost their quoting: its own
+    /// words keep the home around them (that shell expanded them). What it runs takes `home` (or a `HOME=` among its
+    /// words), judged against `command`, the text as first written.
+    Rebuilt {
+        home: Option<String>,
+        command: String,
+    },
+}
+
+thread_local! {
+    /// Handed from a check to the one it starts on a rebuilt wrapper line: (inherited home, text as first written).
+    static REBUILT: std::cell::RefCell<Option<(Option<String>, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The home a command run with `HOME=raw` sees, for `~` and `$HOME` in what it runs (Rust only): `raw` with a
+/// leading `~`/`$HOME` or a variable the command sets resolved. A value built by a substitution (`$(mktemp -d)`)
+/// can't be known here, so None: the real home stays, and a delete there stays blocked. A value naming a variable the
+/// command doesn't set stays as written, read like any unknown variable (`rm -rf "$x/y"` isn't blocked either).
+fn resolve_home(raw: &str) -> Option<String> {
+    if raw.contains("$(") || raw.contains('`') || raw.contains("__substitution__") {
+        return None;
+    }
+    let mut v = home_path(raw);
+    if let Some(rest) = v.strip_prefix('$') {
+        let (name, after) = match rest.strip_prefix('{') {
+            Some(r) => match r.split_once('}') {
+                Some((n, a)) => (n.to_string(), a.to_string()),
+                None => (String::new(), String::new()),
+            },
+            None => {
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                (rest[..end].to_string(), rest[end..].to_string())
+            }
+        };
+        if let Some(val) = (!name.is_empty()).then(|| context::var(&name)).flatten() {
+            v = home_path(&val) + &after;
+        }
+    }
+    // `HOME=/` stays `/` (`rm -rf ~` is then `rm -rf /`); an empty HOME stays empty, as bash expands `~` then.
+    let trimmed = v.trim_end_matches('/');
+    Some(if trimmed.is_empty() && !v.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    })
 }
 
 /// Where a shell, `source` or `.` sits in a simple command: the verb, or after a wrapper and its options.
@@ -914,24 +1056,10 @@ fn strip_redirs(seg: &[String]) -> Vec<String> {
 /// Simple commands as written: split at separators and newlines, leading keywords and assignments dropped, but
 /// wrappers (`env`, `nice`, `xargs`) kept with their options, unlike `segments_with_seps`.
 fn raw_segments(tokens: &[String]) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let mut cur: Vec<String> = Vec::new();
-    for t in tokens.iter().chain(std::iter::once(&";".to_string())) {
-        if (contains(SEPARATORS, t) || t == "\n") && !test_word(&cur, t) {
-            let skip = cur
-                .iter()
-                .take_while(|w| contains(KEYWORDS, w) || is_assignment(w))
-                .count();
-            cur.drain(..skip);
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-            cur.clear();
-        } else {
-            cur.push(t.clone());
-        }
-    }
-    out
+    split_simple(tokens, false)
+        .into_iter()
+        .map(|s| s.words)
+        .collect()
 }
 
 fn shell_runs_stdin(seg: &[String]) -> bool {
@@ -1206,7 +1334,8 @@ fn is_redirect_op(t: &str) -> bool {
 fn home_path(arg: &str) -> String {
     for start in ["~", "$HOME", "${HOME}"] {
         if arg == start || arg.starts_with(&format!("{start}/")) {
-            return home() + &arg[start.len()..];
+            // The `HOME=` the command around this one ran it with (Rust only), else the real home.
+            return context::home().unwrap_or_else(home) + &arg[start.len()..];
         }
     }
     arg.to_string()
@@ -1327,11 +1456,16 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
         .iter()
         .flat_map(|s| wrappers::wrapped_commands(s))
         .collect();
-    more.extend(scripts_run(&raw_segs, &mut written));
+    // pip doesn't depend on HOME: no homes.
+    more.extend(
+        scripts_run(&raw_segs, &[], &mut written)
+            .into_iter()
+            .map(|(s, _)| s),
+    );
     more.extend(substitutions(&command));
     more.extend(interp_file_commands(&raw_segs, cwd));
     let segs = segments_with_seps(raw);
-    let disk = files_run(&raw_segs, &segs, &written);
+    let disk = files_run(&raw_segs, &[], &segs, &[], &written);
     // Each simple command with its keywords, wrappers and assignments dropped (`then pip install`, `X=1 pip
     // install`, `{ pip install`): block-pip's pattern only matched at a line start or after ; & |.
     if segs.iter().any(|(s, _)| PIP.is_match(&s.join(" "))) {
@@ -1346,7 +1480,7 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
     {
         return true;
     }
-    disk.iter().any(|(file, explicit, chain)| {
+    disk.iter().any(|(file, explicit, chain, _)| {
         let scripts::Script::Text(text, canon) =
             scripts::read_script(file, cwd_str(cwd), *explicit)
         else {
@@ -1447,18 +1581,23 @@ fn runs_file(seg: &[String]) -> Option<(String, bool)> {
 
 /// Bodies of scripts written in this command (heredocs in `written`, plus `echo`/`printf` to a file) that a later
 /// simple command runs.
-fn scripts_run(raw_segs: &[Vec<String>], written: &mut Vec<(String, String)>) -> Vec<String> {
+/// Each with the `HOME=` its simple command ran it with (`homes`, one per simple command; empty: none).
+fn scripts_run(
+    raw_segs: &[Vec<String>],
+    homes: &[Option<String>],
+    written: &mut Vec<(String, String)>,
+) -> Vec<(String, Option<String>)> {
     for rs in raw_segs {
         if let Some(w) = printed_to_file(rs) {
             written.push(w);
         }
     }
     let mut out = Vec::new();
-    for rs in raw_segs {
+    for (i, rs) in raw_segs.iter().enumerate() {
         if let Some((f, _)) = runs_file(rs) {
             for (w, body) in written.iter() {
                 if same_path(w, &f) {
-                    out.push(body.clone());
+                    out.push((body.clone(), homes.get(i).cloned().flatten()));
                 }
             }
         }
@@ -1470,17 +1609,21 @@ fn scripts_run(raw_segs: &[Vec<String>], written: &mut Vec<(String, String)>) ->
 /// `./FILE` (`runs_file`), `cat FILE... | bash`, `bash < FILE`; files written in the same command are left to
 /// `scripts_run`.
 /// (path as written, fed to a shell explicitly, filters on the way: `cat x | sed ... | bash`)
-type FileRun = (String, bool, Vec<Vec<String>>);
+/// And the `HOME=` the simple command that runs it set (`HOME=/tmp/h bash x.sh`), as written.
+type FileRun = (String, bool, Vec<Vec<String>>, Option<String>);
 
 fn files_run(
     raw_segs: &[Vec<String>],
+    raw_homes: &[Option<String>],
     segs: &[(Vec<String>, String)],
+    seg_homes: &[Option<String>],
     written: &[(String, String)],
 ) -> Vec<FileRun> {
+    let home = |homes: &[Option<String>], i: usize| homes.get(i).cloned().flatten();
     let mut out: Vec<FileRun> = raw_segs
         .iter()
-        .filter_map(|s| runs_file(s))
-        .map(|(f, e)| (f, e, Vec::new()))
+        .enumerate()
+        .filter_map(|(i, s)| runs_file(s).map(|(f, e)| (f, e, Vec::new(), home(raw_homes, i))))
         .collect();
     // `cat FILE | [filters |] bash`.
     for (i, (seg, sep)) in segs.iter().enumerate() {
@@ -1488,13 +1631,14 @@ fn files_run(
             continue;
         }
         let mut chain: Vec<Vec<String>> = Vec::new();
-        for (next, next_sep) in &segs[i + 1..] {
+        for (k, (next, next_sep)) in segs[i + 1..].iter().enumerate() {
             if runs_stdin(next) {
+                let h = home(seg_homes, i + 1 + k);
                 out.extend(
                     strip_redirs(&seg[1..])
                         .into_iter()
                         .filter(|a| !a.starts_with('-'))
-                        .map(|a| (a, true, chain.clone())),
+                        .map(|a| (a, true, chain.clone(), h.clone())),
                 );
                 break;
             }
@@ -1504,16 +1648,16 @@ fn files_run(
             chain.push(next.clone());
         }
     }
-    for rs in raw_segs {
+    for (k, rs) in raw_segs.iter().enumerate() {
         if let Some(i) = rs.iter().position(|w| w == "<") {
             if runs_stdin(rs) {
                 if let Some(f) = rs.get(i + 1) {
-                    out.push((f.clone(), true, Vec::new()));
+                    out.push((f.clone(), true, Vec::new(), home(raw_homes, k)));
                 }
             }
         }
     }
-    out.retain(|(f, _, _)| !written.iter().any(|(w, _)| same_path(w, f)));
+    out.retain(|(f, ..)| !written.iter().any(|(w, _)| same_path(w, f)));
     out
 }
 
@@ -1780,6 +1924,8 @@ fn check_mode(
     lines: bool,
     expand: bool,
 ) -> Result<Option<String>, Crash> {
+    // Set when this check runs a rebuilt wrapper line (`RunHome::Rebuilt`); taken first, so it reaches this check only.
+    let rebuilt = REBUILT.with(|r| r.borrow_mut().take());
     if depth > MAX_DEPTH {
         return Err(Crash(
             "RecursionError: maximum recursion depth exceeded".into(),
@@ -1824,10 +1970,43 @@ fn check_mode(
     } else {
         None
     };
+    // The `HOME=` each simple command runs what it runs with (`HOME=/tmp/h bash -c ...`; Rust only), per raw
+    // segment and per segment.
+    let raw_homes: Vec<Option<String>> = split_simple(&raw, false)
+        .into_iter()
+        .map(|s| s.home)
+        .collect();
+    let seg_homes: Vec<Option<String>> = split_simple(&raw, true)
+        .into_iter()
+        .map(|s| s.home)
+        .collect();
     let segs = segments_with_seps(raw);
-    let mut nested: Vec<String> = piped_scripts(&segs);
-    // `$(...)` and backticks, also inside double quotes (`echo "$(cat .env)"`).
-    nested.extend(substitutions(&command));
+    // The home what a simple command runs takes: its own `HOME=` (resolved here), else the one a rebuilt wrapper line
+    // inherited; and the text that tells where this shell expanded `$HOME` and `~` first (`home_applies`).
+    let home_of = |raw_home: Option<String>| -> Option<String> {
+        match raw_home {
+            Some(r) => resolve_home(&r),
+            None => rebuilt.as_ref().and_then(|(h, _)| h.clone()),
+        }
+    };
+    let judged_by: String = rebuilt
+        .as_ref()
+        .map(|(_, c)| c.clone())
+        .unwrap_or_else(|| command.clone());
+    // A string from this command takes the home only where this shell left `$HOME` and `~` in it alone.
+    let in_command = |s: String, raw_home: Option<String>| {
+        let h = home_of(raw_home)
+            .filter(|_| home_applies(&judged_by, &s))
+            .map(RunHome::Set);
+        (s, h)
+    };
+    let mut nested: Vec<(String, Option<RunHome>)> = piped_scripts(&segs)
+        .into_iter()
+        .map(|s| (s, None))
+        .collect();
+    // `$(...)` and backticks, also inside double quotes (`echo "$(cat .env)"`). They run before a `HOME=` prefix
+    // applies.
+    nested.extend(substitutions(&command).into_iter().map(|s| (s, None)));
     // Files echo/printf write, for interpreter code that reads them later in the command.
     for rs in &raw_segs {
         if let Some(w) = printed_to_file(rs) {
@@ -1835,21 +2014,55 @@ fn check_mode(
         }
     }
     // What wrappers run: `timeout 9 CMD`, `ssh HOST CMD`, `docker exec C CMD`, `su -c STRING`, `find -exec CMD`.
-    for rs in &raw_segs {
-        nested.extend(wrappers::wrapped_commands(rs));
+    for (i, rs) in raw_segs.iter().enumerate() {
+        let h = home_of(raw_homes.get(i).cloned().flatten());
+        nested.extend(wrappers::wrapped_commands(rs).into_iter().map(|s| {
+            let r = RunHome::Rebuilt {
+                home: h.clone(),
+                command: judged_by.clone(),
+            };
+            (s, Some(r))
+        }));
     }
     // Scripts written and run in the same command (newline pass): `cat > run.sh <<EOF ...; bash run.sh`,
     // `echo '...' > run.sh && ./run.sh`.
     let mut disk: Vec<FileRun> = Vec::new();
     if lines {
-        nested.extend(scripts_run(&raw_segs, &mut written));
-        // Script files on disk it runs (`bash scripts/x.sh`, `cat x | bash`), checked last.
-        disk = files_run(&raw_segs, &segs, &written);
+        // A script written in this command may hold this shell's expansion of `$HOME` or `~` (an unquoted heredoc,
+        // `printf ~/x`): the home only applies when it names neither.
+        nested.extend(
+            scripts_run(&raw_segs, &raw_homes, &mut written)
+                .into_iter()
+                .map(|(s, h)| {
+                    let h = home_of(h)
+                        .filter(|_| names_home(&s) == (false, false))
+                        .map(RunHome::Set);
+                    (s, h)
+                }),
+        );
+        // Script files on disk it runs (`bash scripts/x.sh`, `cat x | bash`), checked last. Their text is the
+        // running shell's to expand.
+        disk = files_run(&raw_segs, &raw_homes, &segs, &seg_homes, &written)
+            .into_iter()
+            .map(|(f, e, c, h)| (f, e, c, home_of(h)))
+            .collect();
         // Interpreter scripts on disk (`python3 x.py`, `node x.js`, `./x.rb`): the commands their code runs.
-        nested.extend(interp_file_commands(&raw_segs, cwd));
+        for (i, rs) in raw_segs.iter().enumerate() {
+            let h = home_of(raw_homes.get(i).cloned().flatten());
+            nested.extend(
+                interp_file_commands(std::slice::from_ref(rs), cwd)
+                    .into_iter()
+                    .map(|s| (s, h.clone().map(RunHome::Set))),
+            );
+        }
     }
-    for (seg, _) in segs {
-        nested.extend(nested_commands(&seg));
+    for (k, (seg, _)) in segs.into_iter().enumerate() {
+        let h = seg_homes.get(k).cloned().flatten();
+        nested.extend(
+            nested_commands(&seg)
+                .into_iter()
+                .map(|s| in_command(s, h.clone())),
+        );
         let verb = pyfs::basename(&seg[0]).to_string();
         let args = &seg[1..];
         if verb == "sudo" {
@@ -1976,7 +2189,16 @@ fn check_mode(
         }
     }
     // A string that doesn't parse is allowed, as the whole command is.
-    for inner in nested {
+    for (inner, home) in nested {
+        // `~` and `$HOME` in it mean the home its simple command set; a rebuilt wrapper line hands it on.
+        let _home = match home {
+            Some(RunHome::Set(h)) => Some(context::push_home(h)),
+            Some(RunHome::Rebuilt { home, command }) => {
+                REBUILT.with(|r| *r.borrow_mut() = Some((home, command)));
+                None
+            }
+            None => None,
+        };
         if let Some(r) = check_mode(&inner, cwd, depth + 1, lines, true)? {
             return Ok(Some(r));
         }
@@ -1995,7 +2217,8 @@ fn check_mode(
             }
         }
     }
-    for (file, explicit, chain) in disk {
+    for (file, explicit, chain, home) in disk {
+        let _home = home.map(context::push_home);
         match scripts::read_script(&file, cwd_str(cwd), explicit) {
             scripts::Script::Text(text, canon) => {
                 if !scripts::enter(&canon) {
