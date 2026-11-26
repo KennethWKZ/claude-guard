@@ -2312,6 +2312,164 @@ fn interpreter_env_files_and_indirect_calls_every_rule() {
 }
 
 #[test]
+fn glued_operators_every_rule() {
+    // A `)` glued to `;`, `&&`, `||` or `|` ends the command before it, as in bash (the Python guard read `);` as one
+    // word, so the next command was its argument).
+    every_rule_table(
+        &[
+            "x=$(date); C",
+            "echo $(date); C",
+            "x=$(date)&& C",
+            "y=$(pwd)|| C",
+            "(cd x)&& C",
+            "(cd x); C",
+            "echo $((1+2)); C",
+            "x=$(date)⏎C",
+            "bash -c \"x=\\$(date); C\"",
+            "f() { ls; }; f; C",
+        ],
+        &[
+            "x=$(date); ls -la",
+            "cmd 2>&1 >/dev/null",
+            "echo hi >| out.txt; cat out.txt",
+            "diff <(ls a)<(ls b)",
+            "git commit -m \"$(cat <<'EOF'⏎a);b⏎EOF⏎)\"",
+            "x=$(git rev-parse HEAD)&& echo $x",
+        ],
+    );
+}
+
+#[test]
+fn nesting_and_work_budget() {
+    // Nested substitutions are checked once each: deep nesting stays fast, and a blocked command inside is found.
+    let nest =
+        |n: usize, inner: &str| format!("echo {}{}{}", "$(echo ".repeat(n), inner, ")".repeat(n));
+    for (cmd, want_deny) in [
+        (nest(100, "hi"), false),
+        (nest(100, "$(sudo ls)"), true),
+        (
+            format!(
+                "echo \"{}`git push -f`{}\"",
+                "$(echo ".repeat(60),
+                ")".repeat(60)
+            ),
+            true,
+        ),
+    ] {
+        let start = std::time::Instant::now();
+        let o = run(&["bash"], &bash_input(&cmd));
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "too slow: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            o.stdout.contains("\"deny\""),
+            want_deny,
+            "{} -> {}",
+            &cmd[..60],
+            o.stdout
+        );
+    }
+    // More pieces than one check reads: blocked with a plain reason, never left to time out.
+    let wide = format!(
+        "echo {}",
+        (0..12_000)
+            .map(|i| format!("$(ls {i})"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let o = run(&["bash"], &bash_input(&wide));
+    assert!(
+        o.stdout
+            .contains("more nested commands, strings and scripts"),
+        "{}",
+        o.stdout
+    );
+    // Large interpreter code is read in one pass per piece.
+    let code = format!(
+        "import os\n{}os.system('sudo ls')\n",
+        "os.system('ls')\n".repeat(8000)
+    );
+    let start = std::time::Instant::now();
+    let o = run(
+        &["bash"],
+        &bash_input(&format!("python3 - <<'EOF'\n{code}EOF")),
+    );
+    assert!(
+        start.elapsed().as_secs() < 10,
+        "too slow: {:?}",
+        start.elapsed()
+    );
+    assert!(o.stdout.contains("sudo is blocked"), "{}", o.stdout);
+}
+
+#[test]
+fn case_patterns_in_quoted_substitutions_every_rule() {
+    every_rule_table(
+        &[
+            "echo \"$(case a in a) C;; esac)\"",
+            // (A `*)` arm is left out: with no cwd, the Python reading takes its `*` as a glob that could match
+            // .env, an existing rule.)
+            "x=\"$(case $y in a|b) C;; c) ls;; esac)\"",
+            "x=\"$(case $y in (a) ls;; b) C;; esac)\"",
+            "echo \"$(case a in a) echo \"$(case b in b) C;; esac)\";; esac)\"",
+        ],
+        &[
+            "echo \"$(case a in a) echo hi;; esac)\"",
+            "x=\"$(case $y in a) ls;; esac)\"; echo \"$x\"",
+            "echo \"case a) is fine\"",
+        ],
+    );
+}
+
+#[test]
+fn nul_bytes_in_scripts_every_rule() {
+    let dir = format!("{}/claude-guard-table-nul-{}", tmpdir(), std::process::id());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut fails = Vec::new();
+    for (i, (c, want)) in EVERY_RULE.iter().enumerate() {
+        // A NUL after the first line: bash still runs the file, so it is read (NULs dropped).
+        let mut later = format!("#!/bin/bash\n{c}\n#").into_bytes();
+        later.extend(b"\0tail\n");
+        std::fs::write(format!("{dir}/later{i}.sh"), later).unwrap();
+        // A NUL inside the command word: bash drops it and runs the rest.
+        let split = c.replacen(' ', "\0 ", 1);
+        std::fs::write(format!("{dir}/inside{i}.sh"), format!("ls\n{split}\n")).unwrap();
+        for f in [format!("later{i}.sh"), format!("inside{i}.sh")] {
+            let input = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": format!("bash {f}")}, "cwd": dir}).to_string();
+            let o = run(&["bash"], &input);
+            if !(o.stdout.contains("\"deny\"") && o.stdout.contains(want)) {
+                fails.push(format!(
+                    "want deny ({want}) :: bash {f} -> {}",
+                    o.stdout.trim()
+                ));
+            }
+        }
+    }
+    // A NUL in the first line: bash refuses the file ("cannot execute binary file"), so it isn't read.
+    let mut first = b"#!/bin/bash\0\n".to_vec();
+    first.extend(b"sudo ls\n");
+    std::fs::write(format!("{dir}/first.sh"), first).unwrap();
+    let input = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "bash first.sh"}, "cwd": dir}).to_string();
+    let o = run(&["bash"], &input);
+    if (o.code, o.stdout.as_str()) != (0, "") {
+        fails.push(format!(
+            "want allow :: bash first.sh -> {}",
+            o.stdout.trim()
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [

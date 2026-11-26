@@ -113,7 +113,7 @@ fn statements(code: &str) -> Vec<String> {
 }
 
 static ASSIGN: LazyLock<[(Lang, Regex); 7]> = LazyLock::new(|| {
-    let r = |s: &str| Regex::new(s).expect("static regex");
+    let r = |s: &str| super::re(s);
     [
         (Lang::Python, r(r"^([A-Za-z_]\w*)\s*(\+?=)\s*([^=].*)$")),
         (
@@ -285,10 +285,8 @@ fn list_items(t: &str, lang: Lang) -> Option<Vec<String>> {
 }
 
 fn is_var(t: &str, lang: Lang) -> bool {
-    static PLAIN: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^[A-Za-z_$][\w$]*$").expect("static regex"));
-    static SIGIL: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^[$@]\w+$").expect("static regex"));
+    static PLAIN: LazyLock<Regex> = LazyLock::new(|| super::re(r"^[A-Za-z_$][\w$]*$"));
+    static SIGIL: LazyLock<Regex> = LazyLock::new(|| super::re(r"^[$@]\w+$"));
     match lang {
         Lang::Perl | Lang::Php => SIGIL.is_match(t),
         _ => PLAIN.is_match(t),
@@ -352,7 +350,7 @@ pub(super) fn eval(expr: &str, lang: Lang, env: &Env, depth: usize) -> Vec<Val> 
 /// same command (`open("cmd.txt").read()`). None when `t` is neither; an empty list when its value is unknown.
 fn env_or_file(t: &str, lang: Lang, env: &Env, depth: usize) -> Option<Vec<Val>> {
     static PATTERNS: LazyLock<Vec<(Lang, bool, Regex)>> = LazyLock::new(|| {
-        let r = |s: &str| Regex::new(s).expect("static regex");
+        let r = |s: &str| super::re(s);
         vec![
             // (language, is a file read, pattern with the argument list in group 1)
             (Lang::Python, false, r(r"(?s)^(?:os\.)?environ\s*\[(.+)\]$")),
@@ -431,20 +429,15 @@ fn first_text(expr: &str, lang: Lang, env: &Env, depth: usize) -> String {
 /// `" ".join(xs)`, `xs.join(" ")`, perl `join(" ", ...)`, python `"%s" % x` and `"{}".format(x)`.
 fn joins_and_formats(t: &str, lang: Lang, env: &Env, depth: usize) -> Option<Vec<Val>> {
     static PY_JOIN: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)^((?:[rRbBuU]?)(?:"[^"]*"|'[^']*'))\s*\.\s*join\s*\((.*)\)$"#)
-            .expect("static regex")
+        super::re(r#"(?s)^((?:[rRbBuU]?)(?:"[^"]*"|'[^']*'))\s*\.\s*join\s*\((.*)\)$"#)
     });
-    static METHOD_JOIN: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)^(.+?)\s*\.\s*join\s*(?:\((.*)\))?$").expect("static regex")
-    });
-    static PERL_JOIN: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)^join\s*\(?(.*?)\)?$").expect("static regex"));
-    static PY_PERCENT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)^((?:"[^"]*"|'[^']*'))\s*%\s*(.+)$"#).expect("static regex")
-    });
-    static PY_FORMAT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)^((?:"[^"]*"|'[^']*'))\s*\.\s*format\s*\((.*)\)$"#).expect("static regex")
-    });
+    static METHOD_JOIN: LazyLock<Regex> =
+        LazyLock::new(|| super::re(r"(?s)^(.+?)\s*\.\s*join\s*(?:\((.*)\))?$"));
+    static PERL_JOIN: LazyLock<Regex> = LazyLock::new(|| super::re(r"(?s)^join\s*\(?(.*?)\)?$"));
+    static PY_PERCENT: LazyLock<Regex> =
+        LazyLock::new(|| super::re(r#"(?s)^((?:"[^"]*"|'[^']*'))\s*%\s*(.+)$"#));
+    static PY_FORMAT: LazyLock<Regex> =
+        LazyLock::new(|| super::re(r#"(?s)^((?:"[^"]*"|'[^']*'))\s*\.\s*format\s*\((.*)\)$"#));
     let list_words = |e: &str| -> Vec<String> {
         eval(e, lang, env, depth + 1)
             .into_iter()
@@ -465,10 +458,7 @@ fn joins_and_formats(t: &str, lang: Lang, env: &Env, depth: usize) -> Option<Vec
                 let mut s = fmt.to_string();
                 for a in args {
                     let re = if brace { r"\{[^}]*\}" } else { r"%[sdr]" };
-                    s = Regex::new(re)
-                        .expect("static regex")
-                        .replace(&s, a.as_str())
-                        .into_owned();
+                    s = super::re(re).replace(&s, a.as_str()).into_owned();
                 }
                 s
             };

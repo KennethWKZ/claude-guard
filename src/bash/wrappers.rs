@@ -16,7 +16,7 @@
 //! and pipes.
 
 use super::{dash_letters_contain, runs_stdin, segments_with_seps};
-use crate::{pyfs, shlex};
+use crate::pyfs;
 
 /// One word of a command line: as is when it needs no quoting, else in single quotes.
 pub(super) fn shell_quote(w: &str) -> String {
@@ -447,7 +447,7 @@ pub(super) fn runs_stdin_through(seg: &[String]) -> bool {
         if cmd.is_empty() {
             return true;
         }
-        let Ok(tokens) = shlex::split_lines(&cmd.join(" ")) else {
+        let Ok(tokens) = super::lex_lines(&cmd.join(" ")) else {
             return false;
         };
         return segments_with_seps(tokens)

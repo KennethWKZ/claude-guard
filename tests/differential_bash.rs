@@ -85,6 +85,7 @@ fn fixture_dir() -> String {
         ("run/ok.sh", "#!/bin/sh\nls -la\n"),
         ("run/pip.sh", "pip install x\n"),
         ("run/r.py", "import os\nos.system(\"sudo ls\")\n"),
+        ("run/nul.sh", "#!/bin/bash\ngit push -f\n#\0x\n"),
         (
             "run/r.js",
             "require('child_process').execSync('git push -f')\n",
@@ -113,6 +114,7 @@ const SCRIPT_RUNS: &[&str] = &[
     "cat run/sudo.sh",
     "cat run/ok.sh | sed 's/^/sudo /' | bash",
     "python3 run/r.py",
+    "bash run/nul.sh",
     "node run/r.js",
 ];
 
@@ -148,6 +150,11 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "cat > run.sh <<EOF\n@@\nEOF\nbash run.sh",
     "echo '@@' > run.sh; sh run.sh",
     "x=\"$(case $y in a) bash <<EOF;; esac\n@@\nEOF\n)\"",
+    "echo $(echo $(echo $(echo $(@@))))",
+    "echo \"$(case a in a) @@;; esac)\"",
+    "echo `@@`",
+    "x=$(date); @@",
+    "echo $(pwd)&& @@",
     "echo \"$(@@)\"",
     "x=`@@`",
     "echo \"a `@@` b\"",
@@ -699,154 +706,96 @@ fn nested_kind(input: &str) -> Option<&'static str> {
     }
 }
 
+/// A command name in command position: at the start, after an operator, `$(`, a backtick, or the noise prefixes
+/// the generator puts in front of a verb (`FOO=1`, `env`, `nice`, `then`, ...).
+/// A cached regex for the classifiers (they run on every input).
+fn rx(pattern: &str) -> regex::Regex {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> = Default::default();
+    }
+    CACHE.with(|c| {
+        c.borrow_mut()
+            .entry(pattern.to_string())
+            .or_insert_with(|| regex::Regex::new(pattern).unwrap())
+            .clone()
+    })
+}
+
+fn at_command(names: &str) -> regex::Regex {
+    rx(&format!(
+        r#"(?:^|[;&|()\n`!]|\$\()\s*(?:(?:[A-Za-z_]\w*=(?:'[^']*'|"[^"]*"|\S*)|env|xargs|nice|do|then|else|\{{|command|time|if|!|exec|builtin|nohup)\s+)*(?:\S*/)?(?:{names})\b"#
+    ))
+}
+
 /// Which Rust-only reading of a wrapped command the hook input's command holds, if any (all after the Python
-/// reading passed): case patterns in `$(...)`, heredoc output run, variables, scripts written and run, ssh,
-/// find -exec, user switches, containers, string runners, argv wrappers with options.
+/// reading passed). Each kind needs its own construct in command position, not just a word somewhere, so a block
+/// on an unrelated command isn't excused.
 fn wrapped_kind(input: &str) -> Option<&'static str> {
     let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
-    let cmd = v["tool_input"]["command"].as_str().unwrap_or("");
-    // A backslash inside a word only quotes the next letter (`do\\cker` is docker).
-    let words: Vec<String> = cmd
-        .split(|c: char| c.is_whitespace() || ";&|()\"'`".contains(c))
-        .filter(|w| !w.is_empty())
-        .map(|w| unquoted_base(w).replace('\\', ""))
-        .collect();
-    let has = |names: &[&str]| words.iter().any(|w| names.contains(&w.as_str()));
-    let assigned = words
-        .iter()
-        .filter_map(|w| w.split_once('='))
-        .any(|(n, _)| {
-            !n.is_empty()
-                && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && (cmd.contains(&format!("${n}")) || cmd.contains(&format!("${{{n}}}")))
-        });
-    // `./ru\\n/x.sh` is ./run/x.sh to bash: a backslash quotes the next letter.
-    if cmd.replace('\\', "").contains("run/") {
+    let raw = v["tool_input"]["command"].as_str().unwrap_or("");
+    // A backslash inside a word only quotes the next letter (`do\\cker` is docker, `./ru\\n/x` is ./run/x).
+    let cmd = raw.replace('\\', "");
+    let cmd = cmd.as_str();
+    let m = |re: &str| rx(re).is_match(cmd);
+    let interp = "python[\\d.]*|pypy3|perl|node|bun|deno|ruby|php|lua|osascript";
+    let interp_at = at_command(interp).is_match(cmd);
+    let assigned = rx(r"(?:^|[;&|(\n]\s*|export\s+|local\s+)([A-Za-z_]\w*)=")
+        .captures_iter(cmd)
+        .any(|c| cmd.contains(&format!("${}", &c[1])) || cmd.contains(&format!("${{{}}}", &c[1])));
+    if m(r"(?:^|[\s;&|(<]|\./)run/[a-z]+\.(?:sh|py|js)\b") {
         Some("script-on-disk")
-    } else if [
-        "environ",
-        "getenv",
-        "process.env",
-        "ENV[",
-        "$ENV{",
-        "getattr",
-        "readFileSync",
-        "File.read",
-        "file_get_contents",
-        "io.open",
-        "open(",
-        "call_user_func",
-        "send(:",
-        "method(:",
-        "[\"exec",
-    ]
-    .iter()
-    .any(|k| cmd.contains(k))
+    } else if interp_at
+        && [
+            "environ", "getenv", "process.env", "ENV[", "$ENV{", "getattr", "readFileSync", "File.read",
+            "file_get_contents", "io.open", "open(", "call_user_func", "send(:", "method(:", "[\"exec",
+        ]
+        .iter()
+        .any(|k| cmd.contains(k))
     {
         // Interpreter code taking the command from the environment the command sets, a file, or an indirect call.
         Some("interpreter-dynamic")
-    } else if words.iter().any(|w| {
-        let w = w.as_str();
-        [
-            "perl",
-            "node",
-            "bun",
-            "deno",
-            "ruby",
-            "php",
-            "lua",
-            "osascript",
-            "pypy3",
-        ]
-        .contains(&w)
-            || w.starts_with("python")
-    }) && (cmd.contains(" = ")
-        || cmd.contains("eval")
-        || cmd.contains("exec(")
-        || cmd.contains("set c to"))
+    } else if interp_at
+        && (cmd.contains(" = ") || cmd.contains("eval") || cmd.contains("exec(") || cmd.contains("set c to"))
     {
         // A command an interpreter's code builds from variables or runs through eval/exec of a built string.
         Some("interpreter-built")
-    } else if words.iter().any(|w| {
-        let w = w.as_str();
-        [
-            "perl",
-            "node",
-            "bun",
-            "deno",
-            "ruby",
-            "php",
-            "lua",
-            "osascript",
-            "pypy3",
-        ]
-        .contains(&w)
-            || w.starts_with("python")
-    }) {
+    } else if interp_at {
         // Commands an interpreter's code runs (`python3 -c 'os.system(...)'`, `node -e`, code on stdin).
         Some("interpreter-command")
-    } else if cmd.contains("system(") || cmd.contains("getline") {
+    } else if at_command("awk|gawk").is_match(cmd)
+        && (cmd.contains("system(") || cmd.contains("getline") || m(r#"\|\s*""#))
+    {
         // Commands awk runs itself.
         Some("awk-command")
-    } else if cmd.contains("sed")
-        && ["'e ", "1e ", "$e ", "#e'", "/e'", "sed e", "e'"]
-            .iter()
-            .any(|e| cmd.contains(e))
-    {
+    } else if at_command("sed|gsed").is_match(cmd) && m(r#"(?:'|;|\d|\$)e\s|[/#]e(?:\W|$)|\bsed\s+e\b"#) {
         // Commands sed runs itself (`e CMD`, `s///e`).
         Some("sed-exec")
-    } else if ["sed ", "awk ", "perl "].iter().any(|f| cmd.contains(f)) && cmd.contains('|') {
+    } else if m(r"(?s)\b(?:sed|awk|perl)\b.*\|\s*(?:\S*/)?(?:bash|sh|zsh|dash|source|\.)\b") {
         // A filter on the way to a shell builds the command (`sed 's/^/sudo /' <<EOF | bash`).
         Some("filter-built")
     } else if cmd.contains("$(case") {
         Some("case-in-substitution")
-    } else if (cmd.contains("$(") || cmd.contains("<(")) && cmd.contains("<<") {
+    } else if m(r"(?:\$\(|<\()\s*\w+[^)]*<<") {
         Some("heredoc-output-run")
     } else if assigned {
         Some("variable-expansion")
-    } else if cmd.contains(".sh") && (cmd.contains('>') || cmd.contains("tee")) {
+    } else if m(r"(?:>|\btee)\s*\S*\.sh\b") {
         Some("script-file")
-    } else if has(&["ssh"]) {
+    } else if at_command("ssh").is_match(cmd) {
         Some("ssh-command")
-    } else if has(&["-exec", "-execdir", "-ok", "-okdir"]) {
+    } else if m(r"\bfind\b.*\s-(?:exec|execdir|ok|okdir)\b") {
         Some("find-exec")
-    } else if has(&["su", "runuser", "sg"]) {
+    } else if at_command("su|runuser|sg").is_match(cmd) {
         Some("user-switch")
-    } else if has(&[
-        "docker",
-        "podman",
-        "nerdctl",
-        "docker-compose",
-        "kubectl",
-        "oc",
-    ]) {
+    } else if at_command("docker|podman|nerdctl|docker-compose|kubectl|oc").is_match(cmd) {
         Some("container-command")
-    } else if has(&["watch", "script", "flock"]) || cmd.contains("env -S") {
+    } else if at_command("watch|script|flock").is_match(cmd) || m(r"\benv\s+-S") {
         Some("string-runner")
-    } else if has(&[
-        "timeout",
-        "gtimeout",
-        "caffeinate",
-        "stdbuf",
-        "arch",
-        "nice",
-        "env",
-        "xargs",
-        "setsid",
-        "ionice",
-        "chroot",
-        "taskset",
-        "chrt",
-        "unbuffer",
-        "sandbox-exec",
-        "doas",
-        "pkexec",
-        "exec",
-        "time",
-        "command",
-        "nohup",
-        "builtin",
-    ]) {
+    } else if at_command(
+        "timeout|gtimeout|caffeinate|stdbuf|arch|nice|env|xargs|setsid|ionice|chroot|taskset|chrt|unbuffer|sandbox-exec|doas|pkexec|exec|time|command|nohup|builtin",
+    )
+    .is_match(cmd)
+    {
         Some("argv-wrapper")
     } else {
         None
@@ -859,6 +808,12 @@ fn input_command(input: &str) -> String {
         .as_str()
         .unwrap_or("")
         .to_string()
+}
+
+/// True if the command has a `)` glued to an operator (`);`, `)&&`, `)|`), or one glued to `(` (`;(`).
+fn glued_operator(input: &str) -> bool {
+    let cmd = input_command(input);
+    rx(r"\)[;&|<>!]|[;&|!]\(").is_match(&cmd)
 }
 
 /// True if the command holds `$(` inside double quotes, or a backtick outside single quotes (roughly).
@@ -1071,6 +1026,17 @@ fn rust_matches_python_and_dash() {
     ] {
         inputs.push(raw.to_string());
     }
+    // More pieces than one check reads: the work budget blocks it (the Python guard never followed them).
+    {
+        let wide = format!(
+            "echo {}",
+            (0..12_000)
+                .map(|i| format!("$(ls {i})"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        inputs.push(hook_input(&wide, &Value::Null));
+    }
 
     // Reference: guard-bash.py in-process (driver), block-pip.sh per input.
     let driver = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference_driver.py");
@@ -1192,9 +1158,58 @@ fn rust_matches_python_and_dash() {
         bad.is_empty(),
         "{} unexpected differences (first 15):\n{}",
         bad.len(),
-        bad.iter().take(15).cloned().collect::<Vec<_>>().join("\n")
+        bad.iter().take(60).cloned().collect::<Vec<_>>().join("\n")
     );
+    // Every known difference must still excuse something in a full-size run: one that matches nothing is stale
+    // (drop it) or the generator stopped producing its input (fix the generator).
+    if n >= 20_000 {
+        let stale: Vec<&&str> = KNOWN_KINDS
+            .iter()
+            .filter(|k| !counts.contains_key(**k))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "known differences that matched nothing: {stale:?}"
+        );
+    }
 }
+
+/// Every kind `known_difference` can return.
+const KNOWN_KINDS: &[&str] = &[
+    "both-crashed",
+    "rust-anything-rule",
+    "shell-c-string",
+    "eval-string",
+    "here-string",
+    "process-substitution",
+    "piped-script",
+    "newline-separator",
+    "quoted-heredoc",
+    "heredoc-piped-to-shell",
+    "glued-operator",
+    "case-arm-end",
+    "quoted-substitution",
+    "pip-in-simple-command",
+    "test-bracket",
+    "script-on-disk",
+    "interpreter-dynamic",
+    "interpreter-built",
+    "interpreter-command",
+    "awk-command",
+    "sed-exec",
+    "filter-built",
+    "case-in-substitution",
+    "heredoc-output-run",
+    "variable-expansion",
+    "script-file",
+    "ssh-command",
+    "find-exec",
+    "user-switch",
+    "container-command",
+    "string-runner",
+    "argv-wrapper",
+    "work-budget",
+];
 
 /// Differences that are intended. Anything else fails the test.
 fn known_difference(
@@ -1208,13 +1223,6 @@ fn known_difference(
     {
         return Some("both-crashed");
     }
-    // A lone surrogate escape: Python kept it, Rust reads it as U+FFFD (as jq does); same decision.
-    if input.contains("\\ud800")
-        && rule(&reference.stdout) == rule(&rust.stdout)
-        && reference.code == rust.code
-    {
-        return Some("lone-surrogate-text");
-    }
     // `[[ -f .env ]]`, `[ ! -f .env ]`: an existence test in Rust (allowed); the Python guard split the test and read
     // `.env` as a file a command opens.
     // Also when both block but name other files, and when the test swallows a stray `)` or a missing `]]` (a syntax
@@ -1224,6 +1232,13 @@ fn known_difference(
         && test_bracket(input)
     {
         return Some("test-bracket");
+    }
+    // The work budget: more pieces than one check reads (deep nesting the Python guard never followed).
+    if rust
+        .stdout
+        .contains("more nested commands, strings and scripts")
+    {
+        return Some("work-budget");
     }
     // The rust-anything rule is Rust only (added after the port); Python allows those commands, or blocks them for
     // a later rule when Rust's check reaches the rust-anything run first (a heredoc body fed to a shell is checked
@@ -1247,8 +1262,18 @@ fn known_difference(
     if reference.stdout.is_empty() && rust_blocks {
         // A `<<WORD` inside quotes or a comment is no heredoc in Rust's newline pass (a heredoc in a quoted `-c`
         // string stays in the string, checked on its own); the Python guard cut its "body" out of the string.
+        // A `)` glued to an operator (`x=$(date); sudo ls`): Rust splits the run into operators, the Python guard
+        // read it as one word.
+        if glued_operator(input) {
+            return Some("glued-operator");
+        }
         if let Some(kind) = wrapped_kind(input) {
             return Some(kind);
+        }
+        // `;;` (a case arm's end) ends the command before it in Rust's newline pass; outside a case, bash refuses it
+        // as a syntax error, so nothing runs. The Python guard read `;;` as a word.
+        if input_command(input).contains(";;") {
+            return Some("case-arm-end");
         }
         // A cat or tee heredoc piped into a shell runs its body in Rust's newline pass; the Python guard read the
         // body as data.

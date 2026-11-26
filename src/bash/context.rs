@@ -35,8 +35,9 @@ impl Drop for Guard {
 }
 
 static ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_]\w*)=(?:'([^']*)'|"((?:[^"\\]|\\.)*)"|([^\s;&|)]*))"#)
-        .expect("static regex")
+    super::re(
+        r#"(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_]\w*)=(?:'([^']*)'|"((?:[^"\\]|\\.)*)"|([^\s;&|)]*))"#,
+    )
 });
 
 /// A frame for checking `command` (its variable assignments) in `cwd`.

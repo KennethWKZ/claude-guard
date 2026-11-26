@@ -8,7 +8,8 @@
 //! - Only scripts Claude could have written are read: inside `cwd` (the project) or a temp folder (`/tmp`,
 //!   `$TMPDIR`). Tools and dotfiles elsewhere (`/opt/homebrew/bin/brew`, `~/.zshrc`) are not, so their own internals
 //!   don't trip the rules. A `cwd` of the home folder or `/` is too broad to count; then only temp folders do.
-//! - Binaries are not scripts: ELF and Mach-O headers, or a NUL byte in the first 8 KiB.
+//! - Binaries are not scripts: ELF and Mach-O headers, or a NUL byte in the first line (bash's own test). NUL bytes
+//!   later in a file are dropped before the check.
 //! - Run as the command itself (`./x`), a file counts only with a shell shebang (`#!/bin/bash`,
 //!   `#!/usr/bin/env -S zsh -e`) or none (the kernel hands it to sh); `#!/usr/bin/env node` is not a shell script.
 //!   Fed to a shell explicitly (`bash x.py`, `cat x | sh`), any text file counts.
@@ -58,7 +59,10 @@ fn is_binary(head: &[u8]) -> bool {
         b"\xfe\xed\xfa\xce",
         b"\xca\xfe\xba\xbe",
     ];
-    MAGICS.iter().any(|m| head.starts_with(m)) || head.contains(&0)
+    // bash refuses a file with a NUL in its first line ("cannot execute binary file") and runs one with a NUL later,
+    // so only a NUL in the first line makes it binary; a later one can't hide the rest from the check.
+    let first_line = head.split(|b| *b == b'\n').next().unwrap_or(head);
+    MAGICS.iter().any(|m| head.starts_with(m)) || first_line.contains(&0)
 }
 
 /// True if the first line names a shell, or there is no shebang.
@@ -118,7 +122,8 @@ pub(super) fn read_script(file: &str, cwd: Option<&str>, explicit: bool) -> Scri
         return Script::Skip;
     }
     head.extend(rest);
-    Script::Text(String::from_utf8_lossy(&head).into_owned(), canon)
+    let text = String::from_utf8_lossy(&head).replace('\0', "");
+    Script::Text(text, canon)
 }
 
 /// Third-party code inside a project (installed packages, vendored code), which Claude didn't write.

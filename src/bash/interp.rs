@@ -30,8 +30,7 @@ use crate::pyfs;
 use regex::Regex;
 use std::sync::LazyLock;
 
-static INTERP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[$#]\{[^}]*\}").expect("static regex"));
+static INTERP: LazyLock<Regex> = LazyLock::new(|| super::re(r"[$#]\{[^}]*\}"));
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum Lang {
@@ -208,6 +207,7 @@ pub(super) fn code_commands(lang: Lang, code: &str) -> Vec<String> {
 
 fn code_commands_at(lang: Lang, code: &str, depth: usize) -> Vec<String> {
     let env = values::env_of(code, lang);
+    let in_str = string_mask(code, lang);
     let mut calls: Vec<(&str, Kind)> = match lang {
         Lang::Perl => vec![
             (r"\bsystem\b", Kind::Cmd),
@@ -273,8 +273,7 @@ fn code_commands_at(lang: Lang, code: &str, depth: usize) -> Vec<String> {
     };
     // Python: modules imported under another name (`import subprocess as sp`).
     let alias_pats: Vec<String> = if lang == Lang::Python {
-        Regex::new(r"\bimport\s+(os|subprocess)\s+as\s+(\w+)")
-            .expect("static regex")
+        super::re(r"\bimport\s+(os|subprocess)\s+as\s+(\w+)")
             .captures_iter(code)
             .map(|c| {
                 if &c[1] == "os" {
@@ -312,9 +311,11 @@ fn code_commands_at(lang: Lang, code: &str, depth: usize) -> Vec<String> {
     }
     let mut out = Vec::new();
     for (pat, kind) in calls {
-        let Ok(re) = Regex::new(pat) else { continue };
+        let re = super::re(pat);
         for m in re.find_iter(code) {
-            if inside_string(code, m.start(), lang) || not_a_call(code, m.start(), m.end(), lang) {
+            if in_str.get(m.start()).copied().unwrap_or(false)
+                || not_a_call(code, m.start(), m.end(), lang)
+            {
                 continue;
             }
             let Some(args) = call_args(code, m.end(), lang) else {
@@ -361,7 +362,8 @@ fn code_commands_at(lang: Lang, code: &str, depth: usize) -> Vec<String> {
     }
     if lang == Lang::Node {
         // Bun shell and zx: $`cmd`.
-        if let Ok(re) = Regex::new(r"\$`((?:[^`\\]|\\.)*)`") {
+        {
+            let re = super::re(r"\$`((?:[^`\\]|\\.)*)`");
             out.extend(re.captures_iter(code).map(|c| fill(c[1].to_string())));
         }
     }
@@ -407,8 +409,9 @@ fn rest_args(args: &str) -> String {
 /// - ruby `send(:system, ...)` (also `public_send`, `__send__`), `method(:system).call(...)`;
 /// - php `call_user_func("system", ...)`, `call_user_func_array("system", [...])`, `$f = "system"; $f(...)`.
 fn indirect_calls(code: &str, lang: Lang, env: &Env) -> Vec<(String, Kind)> {
+    let in_str = string_mask(code, lang);
     let mut out = Vec::new();
-    let r = |s: &str| Regex::new(s).expect("static regex");
+    let r = |s: &str| super::re(s);
     // Calls of these names (aliases) anywhere in the code.
     let mut aliases: Vec<(String, Kind)> = Vec::new();
     match lang {
@@ -539,11 +542,9 @@ fn indirect_calls(code: &str, lang: Lang, env: &Env) -> Vec<(String, Kind)> {
         _ => {}
     }
     for (name, kind) in aliases {
-        let Ok(re) = Regex::new(&format!(r"(?:^|[^.\w$]){}\s*\(", regex::escape(&name))) else {
-            continue;
-        };
+        let re = super::re(&format!(r"(?:^|[^.\w$]){}\s*\(", regex::escape(&name)));
         for m in re.find_iter(code) {
-            if inside_string(code, m.start(), lang) {
+            if in_str.get(m.start()).copied().unwrap_or(false) {
                 continue;
             }
             out.extend(call_args(code, m.end() - 1, lang).map(|a| (a, kind)));
@@ -569,11 +570,14 @@ fn not_a_call(code: &str, start: usize, end: usize, lang: Lang) -> bool {
     after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>")
 }
 
-/// True if byte `at` sits inside a string literal (a call name in text, not code).
-fn inside_string(code: &str, at: usize, lang: Lang) -> bool {
+/// For each byte of `code`, whether it sits inside a string literal (a call name in text, not code). One pass per
+/// piece of code, so checking every match stays linear.
+fn string_mask(code: &str, lang: Lang) -> Vec<bool> {
+    let mut mask = vec![false; code.len()];
     let mut q: Option<char> = None;
     let mut esc = false;
-    for c in code[..at].chars() {
+    for (i, c) in code.char_indices() {
+        mask[i] = q.is_some();
         if esc {
             esc = false;
             continue;
@@ -593,32 +597,33 @@ fn inside_string(code: &str, at: usize, lang: Lang) -> bool {
             }
         }
     }
-    q.is_some()
+    mask
 }
 
-/// The argument text of a call whose name ends at `at`: inside its parentheses, or (perl, ruby, lua, osascript, php)
-/// to the end of the statement when there are none.
+/// The argument text of a call whose name ends at byte `at`: inside its parentheses, or (perl, ruby, lua,
+/// osascript, php) to the end of the statement when there are none. Reads only as far as the call goes.
 fn call_args(code: &str, at: usize, lang: Lang) -> Option<String> {
-    let chars: Vec<char> = code[at..].chars().collect();
-    let mut i = 0;
-    while i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
-        i += 1;
+    let rest = code.get(at..)?;
+    let s = rest.trim_start_matches([' ', '\t']);
+    if s.starts_with('(') {
+        return Some(balanced(s, '(', ')', lang));
     }
-    if chars.get(i) == Some(&'(') {
-        return Some(balanced(&chars, i, '(', ')', lang));
-    }
-    if matches!(lang, Lang::Python | Lang::Node) && chars.get(i) != Some(&'(') {
+    if matches!(lang, Lang::Python | Lang::Node) {
         return None; // a name, not a call
     }
     // Paren-less: to `;`, a newline or a closing brace, outside strings.
     let mut q: Option<char> = None;
-    let mut end = i;
-    while end < chars.len() {
-        let c = chars[end];
+    let mut esc = false;
+    let mut end = s.len();
+    for (i, c) in s.char_indices() {
+        if esc {
+            esc = false;
+            continue;
+        }
         match q {
             Some(open) => {
                 if c == '\\' && open != '\'' {
-                    end += 1;
+                    esc = true;
                 } else if c == open {
                     q = None;
                 }
@@ -627,27 +632,31 @@ fn call_args(code: &str, at: usize, lang: Lang) -> Option<String> {
                 if c == '"' || c == '\'' || c == '`' {
                     q = Some(c);
                 } else if c == ';' || c == '\n' || c == '}' {
+                    end = i;
                     break;
                 }
             }
         }
-        end += 1;
     }
-    let text: String = chars[i..end.min(chars.len())].iter().collect();
-    (!text.trim().is_empty()).then_some(text)
+    let text = &s[..end];
+    (!text.trim().is_empty()).then(|| text.to_string())
 }
 
-/// The text between `open` at `start` and its matching `close`, quote-aware.
-fn balanced(chars: &[char], start: usize, open: char, close: char, lang: Lang) -> String {
+/// The text between the `open` that starts `s` and its matching `close`, quote-aware; the rest of `s` if it never
+/// closes.
+fn balanced(s: &str, open: char, close: char, lang: Lang) -> String {
     let mut depth = 0;
     let mut q: Option<char> = None;
-    let mut i = start;
-    while i < chars.len() {
-        let c = chars[i];
+    let mut esc = false;
+    for (i, c) in s.char_indices() {
+        if esc {
+            esc = false;
+            continue;
+        }
         match q {
             Some(o) => {
                 if c == '\\' && o != '\'' {
-                    i += 1;
+                    esc = true;
                 } else if c == o {
                     q = None;
                 }
@@ -660,14 +669,13 @@ fn balanced(chars: &[char], start: usize, open: char, close: char, lang: Lang) -
                 } else if c == close {
                     depth -= 1;
                     if depth == 0 {
-                        return chars[start + 1..i].iter().collect();
+                        return s[open.len_utf8()..i].to_string();
                     }
                 }
             }
         }
-        i += 1;
     }
-    chars[start + 1..].iter().collect()
+    s.get(open.len_utf8()..).unwrap_or("").to_string()
 }
 
 /// Splits on commas outside strings and brackets.
@@ -722,11 +730,9 @@ fn strip_interp(s: &str) -> String {
 /// The command lines a call runs, from its argument text: each argument's values (literals, variables,
 /// concatenation), one string as a command line, a list or several arguments as an argv.
 fn command_of(args: &str, kind: Kind, lang: Lang, env: &Env) -> Vec<String> {
-    static KEY_LIST: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"["']?(?:cmd|args)["']?\s*:\s*(\[[^\]]*\])"#).expect("static regex")
-    });
-    static KEYWORD: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^\w+\s*[=:]\s*[^=]").expect("static regex"));
+    static KEY_LIST: LazyLock<Regex> =
+        LazyLock::new(|| super::re(r#"["']?(?:cmd|args)["']?\s*:\s*(\[[^\]]*\])"#));
+    static KEYWORD: LazyLock<Regex> = LazyLock::new(|| super::re(r"^\w+\s*[=:]\s*[^=]"));
     // Objects: the list under `cmd:` or `args:` (`Deno.run({cmd: [...]})`, `{args: [...]}`); other objects (an env
     // hash, options) and keyword arguments (`shell=True`, `cwd: x`) aren't part of the command.
     let parts: Vec<String> = top_level_split(args)
@@ -794,7 +800,7 @@ fn command_of(args: &str, kind: Kind, lang: Lang, env: &Env) -> Vec<String> {
 
 /// Backtick substitutions in perl, ruby and php code.
 fn backticks(code: &str) -> Vec<String> {
-    let re = Regex::new(r"`((?:[^`\\]|\\.)*)`").expect("static regex");
+    let re = super::re(r"`((?:[^`\\]|\\.)*)`");
     re.captures_iter(code)
         .map(|c| strip_interp(&c[1]))
         .collect()
@@ -836,9 +842,7 @@ fn quoted_forms(code: &str, prefix: &str) -> Vec<String> {
 /// perl `open(FH, "cmd |")`, `open(FH, "| cmd")`, `open(my $f, "-|", "cmd", @args)`.
 fn perl_pipe_opens(code: &str, env: &Env) -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(re) = Regex::new(r"\bopen\b") else {
-        return out;
-    };
+    let re = super::re(r"\bopen\b");
     for m in re.find_iter(code) {
         let Some(args) = call_args(code, m.end(), Lang::Perl) else {
             continue;

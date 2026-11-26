@@ -207,11 +207,20 @@ The rules also hold for what a wrapper runs (Rust only):
 Script files a command runs are read from disk and checked with every rule (Rust only): `bash|sh|zsh FILE`,
 `source FILE`, `. FILE`, `./FILE` or `/path/FILE` as the command (also behind wrappers), `cat FILE | bash` and
 `bash < FILE`. Only files Claude could have written count: inside the session's `cwd` (unless that is the home folder
-or `/`) or a temp folder, so tools and dotfiles elsewhere (`brew`, `~/.zshrc`) aren't read. Binaries, files with
-another interpreter's shebang run as the command (`#!/usr/bin/env node`), missing files and `bash -n FILE` aren't
-either. A script over 256 KiB is blocked rather than checked in part ("run it yourself with !"), and scripts that
-source each other are each read once. The file can change between the check and the run. A quoting error in the command allows it, so a typo never locks
-the shell; any other failure blocks it and is logged. Input nested too deep to check blocks.
+or `/`) or a temp folder, so tools and dotfiles elsewhere (`brew`, `~/.zshrc`) aren't read. Binaries (an executable
+header, or a NUL byte in the first line, which bash refuses to run), files with another interpreter's shebang run as
+the command (`#!/usr/bin/env node`), missing files and `bash -n FILE` aren't either; NUL bytes later in a script are
+dropped before the check, as bash drops them. A script over 256 KiB is blocked rather than checked in part ("run it yourself with !"), and scripts that
+source each other are each read once. The file can change between the check and the run.
+
+In the newline pass, a run of operator characters is split the way bash splits it (Rust only): `x=$(date); sudo ls` is
+two commands (the Python guard read `);` as one word, so `sudo ls` was its argument), and a case arm's `;;` ends the
+command before it. Each `$(…)` and backtick is checked once, outermost first, so deep nesting costs one check per
+level; a work budget (20,000 pieces: the command, its nested strings, heredoc bodies and scripts) blocks anything
+bigger rather than let the hook time out, since a timed-out hook doesn't block.
+
+A quoting error in the command allows it, so a typo never locks the shell; any other failure blocks it and is logged.
+Input nested too deep to check blocks.
 
 ### `claude-guard read`
 

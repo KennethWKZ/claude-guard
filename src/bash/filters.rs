@@ -254,7 +254,7 @@ fn parse_sed(script: &str) -> Vec<SedCmd> {
 /// A sed regex as a Rust one (None if it won't translate).
 fn to_regex(pat: &str, ere: bool) -> Option<Regex> {
     if ere {
-        return Regex::new(pat).ok();
+        return super::re_try(pat);
     }
     let chars: Vec<char> = pat.chars().collect();
     let mut s = String::new();
@@ -282,7 +282,7 @@ fn to_regex(pat: &str, ere: bool) -> Option<Regex> {
         }
         i += 1;
     }
-    Regex::new(&s).ok()
+    super::re_try(&s)
 }
 
 /// A sed replacement in the regex crate's syntax: `&` the match, `\1` a group, `\n` a newline.
@@ -488,13 +488,15 @@ fn awk_commands(program: &str, input: Option<&str>) -> Vec<String> {
         }
     }
     let lit = r#""((?:[^"\\]|\\.)*)""#;
-    if let Ok(re) = Regex::new(&format!(r"{lit}\s*\|\s*getline")) {
+    {
+        let re = super::re(&format!(r"{lit}\s*\|\s*getline"));
         out.extend(
             re.captures_iter(program)
                 .map(|c| string_literals(&format!("\"{}\"", &c[1])).concat()),
         );
     }
-    if let Ok(re) = Regex::new(&format!(r"print([^;}}\n|]*)\|\s*{lit}")) {
+    {
+        let re = super::re(&format!(r"print([^;}}\n|]*)\|\s*{lit}"));
         for c in re.captures_iter(program) {
             let cmd = string_literals(&format!("\"{}\"", &c[2])).concat();
             let shell = cmd
@@ -518,13 +520,10 @@ fn awk(args: &[String], text: &str) -> Vec<String> {
     let Some(program) = awk_program(args) else {
         return vec![text.to_string()];
     };
-    let prints: Vec<String> = Regex::new(r"\bprint\b([^;}\n]*)")
-        .map(|re| {
-            re.captures_iter(program)
-                .map(|c| c[1].to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    let prints: Vec<String> = super::re(r"\bprint\b([^;}\n]*)")
+        .captures_iter(program)
+        .map(|c| c[1].to_string())
+        .collect();
     let literals = string_literals(program);
     let mut out = Vec::new();
     if !prints.is_empty() {

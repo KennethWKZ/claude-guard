@@ -128,22 +128,26 @@ const STDIN_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "source", ".
 
 // Python's `$` (no MULTILINE) also matches just before a final newline: `\n?\z` here.
 static ENV_FILE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|/)(?:\.env(?:\.[^/]+)?|\.envrc|[^/]+\.env)\n?\z").unwrap());
+    LazyLock::new(|| re(r"(?:^|/)(?:\.env(?:\.[^/]+)?|\.envrc|[^/]+\.env)\n?\z"));
 static ENV_TEMPLATE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\.(?:example|sample|template|dist|defaults)\n?\z").unwrap());
-static TEMP_ITEM: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:/private/tmp/[^/]+|/private/var/folders/[^/]+/[^/]+/T/[^/]+)").unwrap()
-});
+    LazyLock::new(|| re(r"\.(?:example|sample|template|dist|defaults)\n?\z"));
+static TEMP_ITEM: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^(?:/private/tmp/[^/]+|/private/var/folders/[^/]+/[^/]+/T/[^/]+)"));
 // block-pip.sh: grep -E '(^|[;&|][[:space:]]*)(python3? -m )?pip3? install' on each line of the command.
-static PIP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)(?:^|[;&|][ \t\x0B\x0C\r]*)(?:python3? -m )?pip3? install").unwrap()
-});
+static PIP: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?m)(?:^|[;&|][ \t\x0B\x0C\r]*)(?:python3? -m )?pip3? install"));
 
 pub const NOT_TEXT: &str = "guard-bash: couldn't check this command (input not text); allowed.";
 pub const PIP_MESSAGE: &str = "Do not use pip. Use uv instead. Example: uv add <packages>";
 /// Python's recursion limit made deep nesting a RecursionError (a crash: blocked). Rust would overflow its stack
 /// and abort, which Claude Code treats as a non-blocking error, so deep nesting is a crash here too.
 const MAX_DEPTH: usize = 400;
+/// The most pieces (the command, nested strings, heredoc bodies, scripts) one check reads before it blocks.
+const MAX_CHECKS: usize = 20_000;
+
+thread_local! {
+    static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// A failure that blocks the command (Python: any exception other than the parse error).
 #[derive(Debug)]
@@ -166,6 +170,32 @@ impl Cwd {
             _ => Cwd::Falsy,
         }
     }
+}
+
+/// A guard regex, compiled once per process and shared (one check compiles the same patterns many times).
+pub(super) fn re(pattern: &str) -> Regex {
+    // INFALLIBLE: every pattern given here is a literal in this crate or built with `regex::escape`; the table tests
+    // compile each of them.
+    re_try(pattern).expect("guard regex")
+}
+
+/// A regex from text the command supplies (a sed script's pattern), cached like `re`; None if it doesn't compile.
+pub(super) fn re_try(pattern: &str) -> Option<Regex> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<Regex>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|c| {
+        if let Some(r) = c.borrow().get(pattern) {
+            return r.clone();
+        }
+        let r = Regex::new(pattern).ok();
+        let mut c = c.borrow_mut();
+        if c.len() < 4096 {
+            c.insert(pattern.to_string(), r.clone());
+        }
+        r
+    })
 }
 
 fn contains(set: &[&str], s: &str) -> bool {
@@ -472,7 +502,7 @@ enum Pipe {
 /// Follows a pipeline through its segments: any filter on the way (`sed`, `grep`, `tr`) passes the body on.
 /// `from_first`: the first segment is already a pipe target (a line continuing a pipeline), not the producer.
 fn pipe_walk(text: &str, from_first: bool) -> Pipe {
-    let Ok(tokens) = shlex::split_lines(text) else {
+    let Ok(tokens) = lex_lines(text) else {
         return Pipe::Data(Vec::new());
     };
     let segs = segments_with_seps(tokens);
@@ -562,7 +592,7 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
                 // Behind a wrapper: `timeout 9 bash <<EOF`, `ssh host <<EOF`, `docker exec -i c sh <<EOF`.
                 // Lexed whole first, so quoted `;`, `&` or `(` in its arguments (`sed 's/.*/x &/'`) stay in them;
                 // the split piece when the line doesn't lex alone (`x="$(cat <<EOF`).
-                let tokens = shlex::split_lines(&before).or_else(|_| shlex::split_lines(piece));
+                let tokens = lex_lines(&before).or_else(|_| lex_lines(piece));
                 if let Ok(tokens) = tokens {
                     if let Some(seg) = raw_segments(&tokens).pop() {
                         shell_reads |= runs_stdin(&seg);
@@ -686,7 +716,7 @@ fn output_runs(before: &str) -> bool {
         .rsplit([';', '&', '|', '(', ')'])
         .next()
         .unwrap_or("");
-    let Ok(tokens) = shlex::split_lines(piece) else {
+    let Ok(tokens) = lex_lines(piece) else {
         return false;
     };
     match raw_segments(&tokens).into_iter().next() {
@@ -744,7 +774,7 @@ fn interp_file_commands(raw_segs: &[Vec<String>], cwd: &Cwd) -> Vec<String> {
 
 /// The file a heredoc's command writes its body to: `cat > f <<EOF`, `cat <<EOF >> f`, `tee [-a] f <<EOF`.
 fn heredoc_target(command: &str) -> Option<String> {
-    let tokens = shlex::split_lines(command).ok()?;
+    let tokens = lex_lines(command).ok()?;
     let seg = raw_segments(&tokens).into_iter().next()?;
     if pyfs::basename(&seg[0]) == "tee" {
         let args = strip_redirs(&seg[1..]);
@@ -754,6 +784,47 @@ fn heredoc_target(command: &str) -> Option<String> {
         .iter()
         .position(|w| w == ">" || w == ">>" || w == ">|")?;
     seg.get(i + 1).cloned()
+}
+
+/// bash's control and redirection operators (and process substitution's `<(` / `>(`), longest first.
+const OPERATORS: &[&str] = &[
+    "<(", ">(", ";;&", "&>>", "<<<", "<<-", "&&", "||", ";;", ";&", "|&", ">>", ">|", ">&", "<&",
+    "<<", "<>", "&>", ";", "&", "|", "(", ")", "!", "<", ">",
+];
+
+/// `shlex::split_lines`, then each run of punctuation the lexer kept as one token (`);`, `)&&`, `))|`) split into
+/// bash's operators, as bash reads it: `x=$(date); sudo ls` is two commands. The Python guard's shlex (and the first
+/// pass) read `);` as one word, so the command after it was an argument. A case arm's end (`;;`) reads as `;`.
+/// Newline pass only.
+fn lex_lines(text: &str) -> Result<Vec<String>, shlex::LexError> {
+    let tokens = shlex::split_lines(text)?;
+    let mut out = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        if t.len() < 2
+            || OPERATORS.contains(&t.as_str())
+            || !t.chars().all(|c| ";&|()!<>".contains(c))
+        {
+            out.push(t);
+            continue;
+        }
+        let mut rest = t.as_str();
+        while !rest.is_empty() {
+            let op = OPERATORS
+                .iter()
+                .find(|op| rest.starts_with(**op))
+                .copied()
+                .unwrap_or(&rest[..1]);
+            out.push(op.to_string());
+            rest = &rest[op.len()..];
+        }
+    }
+    // A case arm's end (`;;`, `;&`, `;;&`) ends the command before it, as `;` does.
+    for t in out.iter_mut() {
+        if matches!(t.as_str(), ";;" | ";&" | ";;&") {
+            *t = ";".to_string();
+        }
+    }
+    Ok(out)
 }
 
 /// True if separator token `t` is a word of the test command being collected in `cur`: inside `[[ ... ]]`,
@@ -1220,7 +1291,7 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
     if bodies.iter().any(|b| pip_in_nested(b, cwd, depth + 1)) {
         return true;
     }
-    let Ok(raw) = shlex::split_lines(&command) else {
+    let Ok(raw) = lex_lines(&command) else {
         return false;
     };
     // Variables set in the command, once (as check_mode does).
@@ -1510,12 +1581,16 @@ fn substitutions(command: &str) -> Vec<String> {
     #[derive(Clone, Copy, PartialEq)]
     enum F {
         Code,
-        Sub(usize, u32),
+        /// Start, open `(` count, open `case` count.
+        Sub(usize, u32, u32),
         Tick(usize),
         Single,
         Double,
         AnsiC,
     }
+    // Only the outermost substitutions: checking one finds those nested in it, so returning every level would check
+    // each nested body once per level around it (work doubling per level).
+    let outermost = |stack: &[F]| !stack.iter().any(|f| matches!(f, F::Sub(..) | F::Tick(_)));
     let chars: Vec<char> = command.chars().collect();
     let mut stack = vec![F::Code];
     let mut out: Vec<String> = Vec::new();
@@ -1542,7 +1617,7 @@ fn substitutions(command: &str) -> Vec<String> {
                 } else if c == '"' {
                     stack.pop();
                 } else if c == '$' && next == Some('(') {
-                    stack.push(F::Sub(i + 2, 0));
+                    stack.push(F::Sub(i + 2, 0, 0));
                     i += 1;
                 } else if c == '`' {
                     stack.push(F::Tick(i + 1));
@@ -1566,31 +1641,55 @@ fn substitutions(command: &str) -> Vec<String> {
                         i += 1;
                     }
                     '$' if next == Some('(') => {
-                        stack.push(F::Sub(i + 2, 0));
+                        stack.push(F::Sub(i + 2, 0, 0));
                         i += 1;
                     }
                     '`' => {
                         if let F::Tick(start) = top {
-                            out.push(chars[start..i].iter().collect());
                             stack.pop();
+                            if outermost(&stack) {
+                                out.push(chars[start..i].iter().collect());
+                            }
                         } else {
                             stack.push(F::Tick(i + 1));
                         }
                     }
                     '(' => {
-                        if let Some(F::Sub(_, depth)) = stack.last_mut() {
+                        if let Some(F::Sub(_, depth, _)) = stack.last_mut() {
                             *depth += 1;
                         }
                     }
                     ')' => match stack.last_mut() {
-                        Some(F::Sub(_, depth)) if *depth > 0 => *depth -= 1,
-                        Some(F::Sub(start, _)) => {
+                        Some(F::Sub(_, depth, _)) if *depth > 0 => *depth -= 1,
+                        // A case pattern's `)` (`$(case $x in a) ...;; esac)`), not the end of the substitution.
+                        Some(F::Sub(_, _, cases)) if *cases > 0 => {}
+                        Some(F::Sub(start, _, _)) => {
                             let start = *start;
-                            out.push(chars[start..i].iter().collect());
                             stack.pop();
+                            if outermost(&stack) {
+                                out.push(chars[start..i].iter().collect());
+                            }
                         }
                         _ => {}
                     },
+                    c if c.is_ascii_alphabetic()
+                        && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_')) =>
+                    {
+                        // `case` and `esac` words inside a `$(...)`: a pattern's `)` doesn't close it.
+                        let end = (i..chars.len())
+                            .find(|&k| !(chars[k].is_alphanumeric() || chars[k] == '_'))
+                            .unwrap_or(chars.len());
+                        let word: String = chars[i..end].iter().collect();
+                        if let Some(F::Sub(_, _, cases)) = stack.last_mut() {
+                            if word == "case" {
+                                *cases += 1;
+                            } else if word == "esac" && *cases > 0 {
+                                *cases -= 1;
+                            }
+                        }
+                        i = end;
+                        continue;
+                    }
                     _ => {}
                 }
             }
@@ -1606,8 +1705,11 @@ fn substitutions(command: &str) -> Vec<String> {
 ///
 /// Two passes over the whole command: first reading a newline as a space, as the Python guard did, so a command it
 /// blocked keeps its reason; then, if that passed, with newlines as separators. Each pass recurses in its own mode,
-/// so nesting never multiplies the work.
+/// and a work budget (`MAX_CHECKS`) bounds the whole check.
 pub fn check(command: &str, cwd: &Cwd, depth: usize) -> Result<Option<String>, Crash> {
+    if depth == 0 {
+        CHECKS.with(|c| c.set(0));
+    }
     if let Some(r) = check_mode(command, cwd, depth, false, true)? {
         return Ok(Some(r));
     }
@@ -1626,6 +1728,17 @@ fn check_mode(
             "RecursionError: maximum recursion depth exceeded".into(),
         ));
     }
+    // A work budget for the whole check, so no input can make it slow enough for the hook to time out (a timed-out
+    // hook doesn't block).
+    let checks = CHECKS.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    });
+    if checks > MAX_CHECKS {
+        return Ok(Some(format!(
+            "the command holds more nested commands, strings and scripts than the guard checks ({MAX_CHECKS}). Run it yourself with ! after reading it."
+        )));
+    }
     // What interpreter code in this command can read: its variables, the cwd, files it writes.
     let _frame = context::push(command, cwd_str(cwd));
     let (command, shell_bodies, mut written) = split_heredocs(command, lines);
@@ -1636,7 +1749,7 @@ fn check_mode(
         }
     }
     let lexed = if lines {
-        shlex::split_lines(&command)
+        lex_lines(&command)
     } else {
         shlex::split_python(&command)
     };
