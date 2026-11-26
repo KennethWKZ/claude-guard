@@ -179,6 +179,12 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "lua -e 'os.execute(\"@@\")'",
     "osascript -e 'do shell script \"@@\"'",
     "bun -e 'await $`@@`'",
+    "python3 -c 'import os; c = \"@@\"; os.system(c)'",
+    "python3 -c 'exec(\"import os; os.system(\\\"@@\\\")\")'",
+    "node -e 'const cp = require(\"child_process\"); const c = \"@@\"; cp.execSync(c)'",
+    "ruby -e 'eval(\"system(\\\"@@\\\")\")'",
+    "perl -e 'my $c = \"@@\"; system($c)'",
+    "php -r '$c = \"@@\"; shell_exec($c);'",
     "{ @@; }",
 ];
 
@@ -711,6 +717,28 @@ fn wrapped_kind(input: &str) -> Option<&'static str> {
     // `./ru\\n/x.sh` is ./run/x.sh to bash: a backslash quotes the next letter.
     if cmd.replace('\\', "").contains("run/") {
         Some("script-on-disk")
+    } else if words.iter().any(|w| {
+        let w = w.as_str();
+        [
+            "perl",
+            "node",
+            "bun",
+            "deno",
+            "ruby",
+            "php",
+            "lua",
+            "osascript",
+            "pypy3",
+        ]
+        .contains(&w)
+            || w.starts_with("python")
+    }) && (cmd.contains(" = ")
+        || cmd.contains("eval")
+        || cmd.contains("exec(")
+        || cmd.contains("set c to"))
+    {
+        // A command an interpreter's code builds from variables or runs through eval/exec of a built string.
+        Some("interpreter-built")
     } else if words.iter().any(|w| {
         let w = w.as_str();
         [

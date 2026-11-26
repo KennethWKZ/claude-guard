@@ -2189,6 +2189,64 @@ fn interpreter_script_files_every_rule() {
 }
 
 #[test]
+fn interpreter_variables_and_eval_every_rule() {
+    // `@@` = the rule's command; `@L@` = its words as a list. Built through variables, joins, formats and eval.
+    every_rule_table_with(
+        "@@",
+        &[
+            // python
+            "python3 -c 'import os; cmd = \"@@\"; os.system(cmd)'",
+            "python3 -c 'import subprocess; args = [@L@]; subprocess.run(args)'",
+            "python3 -c 'import os; os.system(\" \".join([@L@]))'",
+            "python3 -c 'import os; x = \"@@\"; os.system(f\"{x}\")'",
+            "python3 -c 'import os; os.system(\"%s\" % \"@@\")'",
+            "python3 -c 'import os; os.system(\"{}\".format(\"@@\"))'",
+            "python3 -c 'c = \"\"; c += \"@@\"; import os; os.system(c)'",
+            "python3 -c '__import__(\"os\").system(\"@@\")'",
+            "python3 -c 'exec(\"import os; os.system(\\\"@@\\\")\")'",
+            "python3 - <<EOF⏎c = \"@@\"⏎import os⏎os.system(c)⏎EOF",
+            // node
+            "node -e 'const cp = require(\"child_process\"); const c = \"@@\"; cp.execSync(c)'",
+            "node -e 'const cp = require(\"child_process\"); const c = \"@@\"; cp.execSync(`${c}`)'",
+            "node -e 'const cp = require(\"child_process\"); cp.execSync([@L@].join(\" \"))'",
+            "node -e 'eval(\"require(\\\"child_process\\\").execSync(\\\"@@\\\")\")'",
+            "node -e 'new Function(\"require(\\\"child_process\\\").execSync(\\\"@@\\\")\")()'",
+            // ruby
+            "ruby -e 'c = \"@@\"; system(c)'",
+            "ruby -e 'c = \"@@\"; system(\"#{c}\")'",
+            "ruby -e 'eval(\"system(\\\"@@\\\")\")'",
+            // perl
+            "perl -e 'my $c = \"@@\"; system($c)'",
+            "perl -e 'my @a = (@L@); system(@a)'",
+            "perl -e 'my $c = \"@@\"; system(\"$c\")'",
+            "perl -e 'eval \"system(\\\"@@\\\")\"'",
+            "perl -e 'my $c = join(\" \", @L@); system $c'",
+            // php, lua, osascript
+            "php -r '$c = \"@@\"; shell_exec($c);'",
+            "php -r 'eval(\"shell_exec(\\\"@@\\\");\");'",
+            "lua -e 'local c = \"@@\"; os.execute(c)'",
+            "lua -e 'load(\"os.execute(\\\"@@\\\")\")()'",
+            "osascript -e 'set c to \"@@\"' -e 'do shell script c'",
+        ],
+        &[
+            "python3 -c 'import os; cmd = \"ls -la\"; os.system(cmd)'",
+            "python3 -c 'x = \"sudo ls\"; print(x)'",
+            "node -e 'const cp = require(\"child_process\"); const d = process.argv[1]; cp.execSync(`rm -rf ${d}/build`)'",
+            "python3 -c 'import os, sys; p = sys.argv[1]; os.system(f\"rm -rf {p}/build\")'",
+            "python3 -c 'exec(\"print(1)\")'",
+            "perl -e 'eval { system(\"ls\") }'",
+            "node -e 'eval(\"1 + 1\")'",
+        ],
+    );
+    // Split across two variables.
+    let o = run(
+        &["bash"],
+        &bash_input("python3 -c 'import os; a = \"sud\"; b = \"o ls\"; os.system(a + b)'"),
+    );
+    assert!(o.stdout.contains("sudo is blocked"), "{}", o.stdout);
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [

@@ -50,6 +50,7 @@
 mod filters;
 mod interp;
 mod scripts;
+mod values;
 mod wrappers;
 
 use crate::hookio::{self, py_truthy, py_type_name};

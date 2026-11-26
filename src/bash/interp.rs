@@ -10,12 +10,17 @@
 //! | lua | `-e`, stdin, a file | `os.execute`, `io.popen` |
 //! | osascript | `-e`, stdin, a file | `do shell script` |
 //!
+//! Arguments are evaluated with the code's variables (`values`), and built code run through eval/exec (python
+//! `exec`/`eval`/`compile`, node `eval`/`new Function`/`vm.*`, ruby `eval`/`instance_eval`, perl string `eval`, php
+//! `eval`, lua `load`) is read again as code, up to `MAX_CODE_DEPTH` levels.
+//!
 //! A call's argument is read from its string literals: one string is a command line; a list (`["git", "push"]`) or
 //! several arguments are an argv. Literals joined with `.`, `+` or `&` count as one, and variables between them
 //! drop out (`"rm -rf " . $dir` reads as `rm -rf `); interpolations (`${x}`, `#{x}`, f-string `{x}`) read as the word
 //! `x`, so `/srv/${name}` stays absolute and `${dir}/build` stays relative. A heuristic: code that builds a command
 //! any other way (eval, variables, ffi) isn't followed.
 
+use super::values::{self, Env, Val};
 use super::wrappers::shell_join;
 use crate::pyfs;
 use regex::Regex;
@@ -23,8 +28,6 @@ use std::sync::LazyLock;
 
 static INTERP: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[$#]\{[^}]*\}").expect("static regex"));
-static FSTRING_FIELD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{[^}]*\}").expect("static regex"));
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum Lang {
@@ -185,15 +188,28 @@ enum Kind {
     ProgArgs,
     /// Python `os.spawn*`: a mode first, then the program and its argv.
     Spawn,
+    /// eval/exec of a built string: the first argument is more code in the same language.
+    Code,
+    /// `new Function(..., body)`: the last argument is the code.
+    CodeLast,
 }
+
+/// How deep eval of built code is followed.
+const MAX_CODE_DEPTH: usize = 4;
 
 /// The commands in one piece of code.
 pub(super) fn code_commands(lang: Lang, code: &str) -> Vec<String> {
+    code_commands_at(lang, code, 0)
+}
+
+fn code_commands_at(lang: Lang, code: &str, depth: usize) -> Vec<String> {
+    let env = values::env_of(code, lang);
     let mut calls: Vec<(&str, Kind)> = match lang {
         Lang::Perl => vec![
             (r"\bsystem\b", Kind::Cmd),
             (r"\bexec\b", Kind::Cmd),
             (r"\breadpipe\b", Kind::Cmd),
+            (r"\beval\b", Kind::Code),
         ],
         Lang::Python => vec![
             (r"\bos\.system\b", Kind::Cmd),
@@ -205,11 +221,23 @@ pub(super) fn code_commands(lang: Lang, code: &str) -> Vec<String> {
             (r"\bcommands\.getoutput\b", Kind::Cmd),
             (r"\bos\.exec\w+\b", Kind::ProgArgs),
             (r"\bos\.spawn\w+\b", Kind::Spawn),
+            (
+                r#"\b__import__\(\s*["'](?:os|subprocess)["']\s*\)\.(?:system|popen|run|call|check_call|check_output|Popen|getoutput)\b"#,
+                Kind::Cmd,
+            ),
+            (r"(?:^|[^.\w])(?:exec|eval|compile)\b", Kind::Code),
         ],
         Lang::Node => vec![
             (r"\bBun\.spawn(?:Sync)?\b", Kind::Cmd),
             (r"\bDeno\.run\b", Kind::Cmd),
             (r"\bnew\s+Deno\.Command\b", Kind::ProgArgs),
+            (r"(?:^|[^.\w])eval\b", Kind::Code),
+            (r"\bnew\s+Function\b", Kind::CodeLast),
+            (
+                r"\bvm\.(?:runInNewContext|runInThisContext|runInContext)\b",
+                Kind::Code,
+            ),
+            (r"\bnew\s+vm\.Script\b", Kind::Code),
         ],
         Lang::Ruby => vec![
             (r"\bsystem\b", Kind::Cmd),
@@ -220,14 +248,22 @@ pub(super) fn code_commands(lang: Lang, code: &str) -> Vec<String> {
                 r"\bOpen3\.(?:capture2e?|capture3|popen2e?|popen3|pipeline\w*)\b",
                 Kind::Cmd,
             ),
+            (
+                r"\b(?:eval|instance_eval|class_eval|module_eval)\b",
+                Kind::Code,
+            ),
         ],
-        Lang::Php => vec![(
-            r"\b(?:exec|shell_exec|system|passthru|popen|proc_open)\b",
-            Kind::Cmd,
-        )],
+        Lang::Php => vec![
+            (
+                r"\b(?:exec|shell_exec|system|passthru|popen|proc_open)\b",
+                Kind::Cmd,
+            ),
+            (r"\beval\b", Kind::Code),
+        ],
         Lang::Lua => vec![
             (r"\bos\.execute\b", Kind::Cmd),
             (r"\bio\.popen\b", Kind::Cmd),
+            (r"\b(?:load|loadstring)\b", Kind::Code),
         ],
         Lang::Osa => vec![(r"\bdo\s+shell\s+script\b", Kind::Cmd)],
     };
@@ -277,27 +313,48 @@ pub(super) fn code_commands(lang: Lang, code: &str) -> Vec<String> {
             if inside_string(code, m.start(), lang) || not_a_call(code, m.start(), m.end(), lang) {
                 continue;
             }
-            if let Some(args) = call_args(code, m.end(), lang) {
-                out.extend(command_of(&args, kind, lang));
+            let Some(args) = call_args(code, m.end(), lang) else {
+                continue;
+            };
+            match kind {
+                Kind::Code | Kind::CodeLast => {
+                    if depth >= MAX_CODE_DEPTH || args.trim_start().starts_with('{') {
+                        continue; // too deep, or perl/ruby `eval { block }` (already read as code)
+                    }
+                    let parts = top_level_split(&args);
+                    let part = if matches!(kind, Kind::CodeLast) {
+                        parts.last()
+                    } else {
+                        parts.first()
+                    };
+                    for v in part
+                        .map(|p| values::eval(p, lang, &env, 0))
+                        .unwrap_or_default()
+                    {
+                        out.extend(code_commands_at(lang, &v.text(), depth + 1));
+                    }
+                }
+                _ => out.extend(command_of(&args, kind, lang, &env)),
             }
         }
     }
     // Backtick and %x / qx substitutions.
+    let fill = |t: String| values::interpolate(&t, lang, &env);
     match lang {
-        Lang::Perl | Lang::Ruby | Lang::Php => out.extend(backticks(code)),
+        Lang::Perl | Lang::Ruby | Lang::Php => out.extend(backticks(code).into_iter().map(fill)),
         _ => {}
     }
     if lang == Lang::Perl {
-        out.extend(quoted_forms(code, "qx"));
-        out.extend(perl_pipe_opens(code));
+        out.extend(quoted_forms(code, "qx").into_iter().map(fill));
+        out.extend(perl_pipe_opens(code, &env));
     }
     if lang == Lang::Ruby {
-        out.extend(quoted_forms(code, "%x"));
+        out.extend(quoted_forms(code, "%x").into_iter().map(fill));
     }
     if lang == Lang::Node {
         // Bun shell and zx: $`cmd`.
         if let Ok(re) = Regex::new(r"\$`((?:[^`\\]|\\.)*)`") {
-            out.extend(re.captures_iter(code).map(|c| strip_interp(&c[1])));
+            out.extend(re.captures_iter(code).map(|c| fill(c[1].to_string())));
         }
     }
     out.retain(|c| !c.trim().is_empty());
@@ -424,7 +481,7 @@ fn balanced(chars: &[char], start: usize, open: char, close: char, lang: Lang) -
 }
 
 /// Splits on commas outside strings and brackets.
-fn top_level_split(text: &str) -> Vec<String> {
+pub(super) fn top_level_split(text: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i32;
@@ -472,130 +529,77 @@ fn strip_interp(s: &str) -> String {
     INTERP.replace_all(s, "x").into_owned()
 }
 
-/// The string literals in an expression, in order, unescaped, interpolations dropped.
-fn literals(expr: &str, lang: Lang) -> Vec<String> {
-    let chars: Vec<char> = expr.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        // Lua long strings: [[...]].
-        if lang == Lang::Lua && c == '[' && chars.get(i + 1) == Some(&'[') {
-            let rest: String = chars[i + 2..].iter().collect();
-            let end = rest.find("]]").unwrap_or(rest.len());
-            out.push(rest[..end].to_string());
-            i += 2 + rest[..end].chars().count() + 2;
-            continue;
-        }
-        if c == '"' || c == '\'' || (c == '`' && lang != Lang::Python) {
-            let fstring = lang == Lang::Python
-                && i > 0
-                && matches!(chars[i - 1], 'f' | 'F')
-                && (i < 2 || !chars[i - 2].is_alphanumeric());
-            let mut s = String::new();
-            i += 1;
-            while i < chars.len() && chars[i] != c {
-                if chars[i] == '\\' && i + 1 < chars.len() && c != '\'' {
-                    s.push(match chars[i + 1] {
-                        'n' => '\n',
-                        't' => '\t',
-                        o => o,
-                    });
-                    i += 2;
-                    continue;
-                }
-                if chars[i] == '\\'
-                    && i + 1 < chars.len()
-                    && c == '\''
-                    && matches!(chars[i + 1], '\'' | '\\')
-                {
-                    s.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                s.push(chars[i]);
-                i += 1;
-            }
-            let s = if fstring {
-                FSTRING_FIELD.replace_all(&s, "x").into_owned()
-            } else {
-                strip_interp(&s)
-            };
-            out.push(s);
-        }
-        i += 1;
-    }
-    out
-}
-
-/// One argument (an expression) as a word: its literals joined.
-fn word(expr: &str, lang: Lang) -> Option<String> {
-    let lits = literals(expr, lang);
-    (!lits.is_empty()).then(|| lits.concat())
-}
-
-/// A list expression (`[...]`, `%w(...)`, `qw(...)`) as an argv, if it is one.
-fn list_argv(expr: &str, lang: Lang) -> Option<Vec<String>> {
-    let t = expr.trim();
-    if let Some(rest) = t.strip_prefix("%w(").or_else(|| t.strip_prefix("qw(")) {
-        let words = rest.strip_suffix(')').unwrap_or(rest);
-        return Some(words.split_whitespace().map(str::to_string).collect());
-    }
-    let rest = t.strip_prefix('[')?;
-    let inner = rest.strip_suffix(']').unwrap_or(rest);
-    Some(
-        top_level_split(inner)
-            .iter()
-            .filter_map(|e| word(e, lang))
-            .collect(),
-    )
-}
-
-/// The command line a call runs, from its argument text.
-fn command_of(args: &str, kind: Kind, lang: Lang) -> Vec<String> {
-    let parts = top_level_split(args);
+/// The command lines a call runs, from its argument text: each argument's values (literals, variables,
+/// concatenation), one string as a command line, a list or several arguments as an argv.
+fn command_of(args: &str, kind: Kind, lang: Lang, env: &Env) -> Vec<String> {
+    static KEY_LIST: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"["']?(?:cmd|args)["']?\s*:\s*(\[[^\]]*\])"#).expect("static regex")
+    });
+    static KEYWORD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\w+\s*[=:]\s*[^=]").expect("static regex"));
     // Objects: the list under `cmd:` or `args:` (`Deno.run({cmd: [...]})`, `{args: [...]}`); other objects (an env
     // hash, options) and keyword arguments (`shell=True`, `cwd: x`) aren't part of the command.
-    let key_list =
-        Regex::new(r#"["']?(?:cmd|args)["']?\s*:\s*(\[[^\]]*\])"#).expect("static regex");
-    let keyword = Regex::new(r"^\w+\s*[=:]\s*[^=]").expect("static regex");
-    let parts: Vec<String> = parts
+    let parts: Vec<String> = top_level_split(args)
         .iter()
         .filter_map(|p| {
             let t = p.trim();
             if t.starts_with('{') {
-                return key_list.captures(t).map(|c| c[1].to_string());
+                return KEY_LIST.captures(t).map(|c| c[1].to_string());
             }
-            (!keyword.is_match(t)).then(|| t.to_string())
+            (!KEYWORD.is_match(t)).then(|| t.to_string())
         })
         .collect();
-    let mut argv: Vec<String> = Vec::new();
     let parts: Vec<String> = match kind {
         Kind::Spawn => parts.into_iter().skip(1).collect(),
         _ => parts,
     };
-    for (n, p) in parts.iter().enumerate() {
-        if let Some(list) = list_argv(p, lang) {
-            argv.extend(list);
+    // Each argument's values; the command lines are their combinations (at most 8).
+    let values: Vec<Vec<Val>> = parts
+        .iter()
+        .map(|p| values::eval(p, lang, env, 0))
+        .filter(|v| !v.is_empty())
+        .collect();
+    let mut combos: Vec<Vec<Val>> = vec![Vec::new()];
+    for vals in &values {
+        let mut next = Vec::new();
+        for c in &combos {
+            for v in vals {
+                if next.len() < 8 {
+                    let mut c = c.clone();
+                    c.push(v.clone());
+                    next.push(c);
+                }
+            }
+        }
+        combos = next;
+    }
+    let mut out = Vec::new();
+    for combo in combos {
+        if combo.is_empty() {
             continue;
         }
-        // Ruby/Node `Bun.spawn({cmd: [...]})`-style objects were dropped above; a leading env hash too.
-        if let Some(w) = word(p, lang) {
-            if n == 0 && parts.len() == 1 && matches!(kind, Kind::Cmd) {
-                return vec![w]; // one string: a command line
+        if combo.len() == 1 && matches!(kind, Kind::Cmd) {
+            if let Val::Str(s) = &combo[0] {
+                out.push(s.clone()); // one string: a command line
+                continue;
             }
-            argv.push(w);
+        }
+        let mut argv: Vec<String> = Vec::new();
+        for v in combo {
+            match v {
+                Val::List(l) => argv.extend(l),
+                Val::Str(s) => argv.push(s),
+            }
+        }
+        // `os.execvp("sudo", ["sudo", "ls"])`: argv[0] repeats the program.
+        if argv.len() > 1 && argv[0] == argv[1] {
+            argv.remove(1);
+        }
+        if !argv.is_empty() {
+            out.push(shell_join(&argv));
         }
     }
-    // `os.execvp("sudo", ["sudo", "ls"])`: argv[0] repeats the program.
-    if argv.len() > 1 && argv[0] == argv[1] {
-        argv.remove(1);
-    }
-    if argv.is_empty() {
-        return Vec::new();
-    }
-    // A Deno.run({cmd: [...]}) object holds the list inside.
-    vec![shell_join(&argv)]
+    out
 }
 
 /// Backtick substitutions in perl, ruby and php code.
@@ -640,7 +644,7 @@ fn quoted_forms(code: &str, prefix: &str) -> Vec<String> {
 }
 
 /// perl `open(FH, "cmd |")`, `open(FH, "| cmd")`, `open(my $f, "-|", "cmd", @args)`.
-fn perl_pipe_opens(code: &str) -> Vec<String> {
+fn perl_pipe_opens(code: &str, env: &Env) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(re) = Regex::new(r"\bopen\b") else {
         return out;
@@ -651,7 +655,7 @@ fn perl_pipe_opens(code: &str) -> Vec<String> {
         };
         let lits: Vec<String> = top_level_split(&args)
             .iter()
-            .filter_map(|p| word(p, Lang::Perl))
+            .filter_map(|p| values::eval(p, Lang::Perl, env, 0).first().map(Val::text))
             .collect();
         if let Some(i) = lits.iter().position(|l| l == "-|" || l == "|-") {
             if lits.len() > i + 1 {

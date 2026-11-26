@@ -183,7 +183,11 @@ The rules also hold for what a wrapper runs (Rust only):
   `os.exec*`, `os.spawn*`; node/bun/deno `child_process` `exec*`/`spawn*`/`execFile*`, `Bun.spawn`, `` $`…` `` (Bun,
   zx), `Deno.Command`, `Deno.run`; ruby `system`, `exec`, `spawn`, backticks, `%x()`, `IO.popen`, `Open3.*`; php
   `exec`, `shell_exec`, `system`, `passthru`, `popen`, `proc_open`, backticks; lua `os.execute`, `io.popen`;
-  osascript `do shell script`. One string is a command line, a list an argv; interpolations read as the word `x`;
+  osascript `do shell script`. One string is a command line, a list an argv. Arguments are evaluated: literals,
+  variables the code assigns (every value a name gets), concatenation, interpolation, `" ".join([…])`,
+  `[…].join(" ")`, perl `join`, python `%` and `.format()`; an unknown name reads as the word `x`. Built code run
+  through `exec`/`eval`/`compile` (python), `eval`/`new Function`/`vm.*` (node), `eval`/`instance_eval` (ruby),
+  string `eval` (perl), `eval` (php) or `load` (lua) is read again, up to 4 levels;
 - commands sed and awk run themselves: sed `e CMD`, a bare `e` and the `s///e` flag; awk `system("…")`,
   `"CMD" | getline` and `print … | "CMD"` (with a shell as CMD, what it prints too). With input the guard knows (a
   heredoc or `echo …` feeding them) each line is worked through; otherwise fields read as empty
