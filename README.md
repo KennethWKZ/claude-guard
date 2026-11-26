@@ -147,7 +147,10 @@ options before `-c`; after `env`, `timeout` or `xargs` options), `eval …` (its
 here-strings fed to a shell, `source` or `.` (`bash <<< '…'`), `source <(echo '…')` or `printf`, and `echo` or
 `printf` output piped into a shell or `source /dev/stdin` (`echo '…' | bash`, each line on its own). The Python guard
 read such a string as one word; the strings are checked after the rest of the command passed, so a command it
-blocked keeps its reason. A quoting error in the command allows it, so a typo never locks
+blocked keeps its reason. A heredoc is read only where bash reads one: outside quotes and comments, or inside
+`$(…)` and backticks. So a heredoc written inside a quoted `bash -c '…'` string is checked as part of that string
+(its body when a shell reads it, and the lines after its end marker), and a `<<WORD` inside quotes or a comment no
+longer hides the lines after it. A quoting error in the command allows it, so a typo never locks
 the shell; any other failure blocks it and is logged. Input nested too deep to check blocks.
 
 ### `claude-guard read`

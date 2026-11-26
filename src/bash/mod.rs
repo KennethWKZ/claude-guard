@@ -22,6 +22,10 @@
 //! continues the line. Rust only: the Python guard's shlex read a newline as a space, so a verb on a later line was
 //! an argument of the first line's command.
 //!
+//! In that newline pass a heredoc starts only where bash starts one: outside quotes and comments, or inside `$(...)`
+//! and backticks. A heredoc inside a quoted `bash -c '...'` string stays in the string and is checked with it; the
+//! Python guard's reading cut the "body" out of the string, which then failed to parse and was allowed.
+//!
 //! Same contract as the Python guard: a parse error allows the command (a quoting mistake never locks the
 //! shell); any other failure blocks it (fail closed) and is logged. It only sees what is written in the command.
 
@@ -271,18 +275,138 @@ fn heredoc_starts(line: &[char]) -> Vec<(usize, bool, String)> {
     out
 }
 
+/// Where the scanner is, for `split_heredocs`' quote-aware reading: code (top level, inside `$(...)` with its own
+/// open-paren count, or inside backticks), or inside '...', "...", $'...'.
+#[derive(Clone, Copy, PartialEq)]
+enum Ctx {
+    Code { parens: u32 },
+    Backtick,
+    Single,
+    Double,
+    AnsiC,
+}
+
+/// Which chars of one line are code (outside quotes and comments), given the contexts open at its start; updates
+/// them for the next line. Also returns whether the line ends in a backslash continuation.
+fn code_mask(line: &[char], stack: &mut Vec<Ctx>) -> (Vec<bool>, bool) {
+    let n = line.len();
+    let mut mask = vec![false; n];
+    let mut i = 0;
+    while i < n {
+        let c = line[i];
+        let next = line.get(i + 1).copied();
+        match *stack.last().unwrap_or(&Ctx::Code { parens: 0 }) {
+            Ctx::Single => {
+                if c == '\'' {
+                    stack.pop();
+                }
+            }
+            Ctx::AnsiC => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '\'' {
+                    stack.pop();
+                }
+            }
+            Ctx::Double => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    stack.pop();
+                } else if c == '$' && next == Some('(') {
+                    stack.push(Ctx::Code { parens: 0 });
+                    i += 1;
+                } else if c == '`' {
+                    stack.push(Ctx::Backtick);
+                }
+            }
+            top @ (Ctx::Code { .. } | Ctx::Backtick) => {
+                mask[i] = true;
+                let word_start =
+                    i == 0 || line[i - 1].is_whitespace() || ";&|()<>".contains(line[i - 1]);
+                match c {
+                    '\\' if i + 1 == n => return (mask, true),
+                    '\\' => i += 1,
+                    '#' if word_start => break,
+                    '\'' => stack.push(Ctx::Single),
+                    '"' => stack.push(Ctx::Double),
+                    '$' if next == Some('\'') => {
+                        stack.push(Ctx::AnsiC);
+                        i += 1;
+                    }
+                    '$' if next == Some('(') => {
+                        stack.push(Ctx::Code { parens: 0 });
+                        i += 1;
+                    }
+                    '`' if top == Ctx::Backtick => {
+                        stack.pop();
+                    }
+                    '`' => stack.push(Ctx::Backtick),
+                    '(' => {
+                        if let Some(Ctx::Code { parens }) = stack.last_mut() {
+                            *parens += 1;
+                        }
+                    }
+                    ')' => {
+                        let depth = stack.len();
+                        match stack.last_mut() {
+                            Some(Ctx::Code { parens }) if *parens > 0 => *parens -= 1,
+                            Some(Ctx::Code { .. }) if depth > 1 => {
+                                stack.pop();
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    (mask, false)
+}
+
 /// Remove heredoc bodies (data for the command that reads them); bodies a shell reads come back to be checked.
-fn split_heredocs(command: &str) -> (String, Vec<String>) {
+///
+/// `quoted` false reads `<<WORD` anywhere, as the Python guard's regex did. `quoted` true (the newline pass) reads
+/// it only as code, outside quotes and comments, and starts the bodies after the first line that ends outside
+/// quotes, as bash does: a heredoc written inside a quoted `bash -c '...'` string stays in that string, which is
+/// then checked on its own, and a quoted `<<WORD` no longer hides the lines after it. Heredocs inside `"$(...)"`
+/// and backticks are code, so `git commit -m "$(cat <<'EOF' ...)"` still drops its message.
+fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out: Vec<&str> = Vec::new();
     let mut run_as_shell = Vec::new();
+    let mut stack = vec![Ctx::Code { parens: 0 }];
+    // (strip leading tabs, delimiter, body fed to a shell)
+    let mut pending: Vec<(bool, String, bool)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         out.push(line);
         i += 1;
         let chars: Vec<char> = line.chars().collect();
+        let (mask, continued) = if quoted {
+            code_mask(&chars, &mut stack)
+        } else {
+            (vec![true; chars.len()], false)
+        };
         for (start, tabs, delim) in heredoc_starts(&chars) {
+            if !mask[start] {
+                continue;
+            }
+            let before: String = chars[..start].iter().collect();
+            let last = before.rsplit([';', '&', '|', '(']).next().unwrap_or("");
+            let first_word = last.split(py_isspace).find(|w| !w.is_empty());
+            let to_shell = first_word.is_some_and(|w| contains(SHELLS, pyfs::basename(w)));
+            pending.push((tabs, delim, to_shell));
+        }
+        let ready = !quoted
+            || (!continued && matches!(stack.last(), Some(Ctx::Code { .. } | Ctx::Backtick)));
+        if !ready {
+            continue;
+        }
+        for (tabs, delim, to_shell) in pending.drain(..) {
             let mut body: Vec<&str> = Vec::new();
             while i < lines.len() {
                 let body_line = lines[i];
@@ -297,13 +421,8 @@ fn split_heredocs(command: &str) -> (String, Vec<String>) {
                 }
                 body.push(body_line);
             }
-            let before: String = chars[..start].iter().collect();
-            let last = before.rsplit([';', '&', '|', '(']).next().unwrap_or("");
-            let first_word = last.split(py_isspace).find(|w| !w.is_empty());
-            if let Some(w) = first_word {
-                if contains(SHELLS, pyfs::basename(w)) {
-                    run_as_shell.push(body.join("\n"));
-                }
+            if to_shell {
+                run_as_shell.push(body.join("\n"));
             }
         }
     }
@@ -662,7 +781,7 @@ fn pip_in_nested(command: &str, depth: usize) -> bool {
     if depth > MAX_DEPTH {
         return false; // check() already crashed (blocked) at this depth
     }
-    let (command, bodies) = split_heredocs(command);
+    let (command, bodies) = split_heredocs(command, true);
     if bodies.iter().any(|b| pip_in_nested(b, depth + 1)) {
         return true;
     }
@@ -738,7 +857,7 @@ fn check_mode(
             "RecursionError: maximum recursion depth exceeded".into(),
         ));
     }
-    let (command, shell_bodies) = split_heredocs(command);
+    let (command, shell_bodies) = split_heredocs(command, lines);
     for body in shell_bodies {
         if let Some(r) = check_mode(&body, cwd, depth + 1, lines)? {
             return Ok(Some(r));

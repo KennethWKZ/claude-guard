@@ -963,6 +963,118 @@ fn newline_separates_commands_every_rule() {
 }
 
 #[test]
+fn heredocs_in_quoted_strings_every_rule() {
+    let p = "pip"; // kept apart so this file's text doesn't trip the live pip hook
+    // (command, words the deny reason must hold)
+    let deny = [
+        // A heredoc fed to a shell inside a `bash -c` string: every rule.
+        ("bash -c 'bash <<EOF⏎sudo ls⏎EOF'", "sudo is blocked"),
+        (
+            "bash -c 'sh <<EOF⏎rm -rf /srv/app⏎EOF'",
+            "recursive force delete",
+        ),
+        ("sh -c 'bash <<EOF⏎cat .env⏎EOF'", ".env"),
+        ("bash -c 'bash <<EOF⏎grep -r token .⏎EOF'", "recursive grep"),
+        (
+            "bash -c 'bash <<EOF⏎rg --hidden token⏎EOF'",
+            "rg with --hidden",
+        ),
+        ("bash -c 'bash <<EOF⏎git push -f⏎EOF'", "git push --force"),
+        (
+            "bash -c 'bash <<EOF⏎rust-anything build rust/util⏎EOF'",
+            "rust-anything build",
+        ),
+        // Quoted and tab-stripped delimiters, double-quoted strings, -lc.
+        ("sh -c \"sh <<'X'⏎git push -f⏎X\"", "git push --force"),
+        ("bash -lc 'bash <<-EOF⏎\tsudo ls⏎\tEOF'", "sudo is blocked"),
+        (
+            "bash -c 'source /dev/stdin <<EOF⏎sudo ls⏎EOF'",
+            "sudo is blocked",
+        ),
+        // The line after a data heredoc's delimiter is a command again.
+        ("bash -c 'cat <<EOF⏎x⏎EOF⏎sudo ls'", "sudo is blocked"),
+        (
+            "bash -c 'cat <<EOF > notes.md⏎x⏎EOF⏎rm -rf /srv/app'",
+            "recursive force delete",
+        ),
+        // Other strings run as commands, and nesting.
+        ("eval 'bash <<EOF⏎sudo ls⏎EOF'", "sudo is blocked"),
+        ("bash <<< 'bash <<EOF⏎git push -f⏎EOF'", "git push --force"),
+        (
+            "bash -c \"bash -c 'bash <<EOF⏎sudo ls⏎EOF'\"",
+            "sudo is blocked",
+        ),
+        // The Python reading takes a data heredoc whose line starts with a shell as fed to that shell; kept (it
+        // fails closed).
+        (
+            "bash -c 'cat <<EOF > notes.md⏎sudo ls⏎EOF⏎ls'",
+            "sudo is blocked",
+        ),
+        // A `<<WORD` in quotes or a comment is no heredoc, so it hides nothing.
+        ("echo 'a <<EOF'⏎sudo ls", "sudo is blocked"),
+        ("echo \"see <<EOF\"⏎git push -f⏎EOF", "git push --force"),
+        ("ls # cat <<EOF⏎sudo ls", "sudo is blocked"),
+        // A heredoc inside "$(...)" is code: its body fed to a shell is checked.
+        ("x=\"$(bash <<EOF⏎sudo ls⏎EOF⏎)\"", "sudo is blocked"),
+    ];
+    let allow = [
+        // Data heredocs inside strings stay data.
+        "bash -c 'cat <<EOF⏎sudo ls⏎EOF'",
+        "bash -c 'cat <<\"EOF\" > notes.md⏎# notes⏎EOF⏎ls'",
+        "sh -c \"cat <<'X'⏎cat .env⏎X\"",
+        "eval 'cat <<EOF⏎sudo ls⏎EOF'",
+        // Claude's commit messages: the body is data even with odd quotes in it.
+        "git commit -m \"$(cat <<'EOF'⏎Fix the \"quoted bug⏎⏎sudo ls and git push -f are blocked⏎EOF⏎)\"",
+        "git commit -m \"$(cat <<'EOF'⏎don't block this⏎EOF⏎)\" && git log -1",
+        "gh pr create --body \"$(cat <<'EOF'⏎`sudo ls` is blocked⏎EOF⏎)\"",
+        // Not heredocs at all.
+        "echo $((1<<2))",
+        "echo 'a <<EOF'⏎ls",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in &deny {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains(want);
+        if !ok {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in [
+        format!("bash -c 'bash <<EOF⏎{p} install y⏎EOF'"),
+        format!("bash -c 'cat <<EOF⏎x⏎EOF⏎{p} install y'"),
+    ] {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (2, "") {
+            fails.push(format!(
+                "want pip :: {c:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &allow {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [

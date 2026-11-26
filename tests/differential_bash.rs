@@ -320,6 +320,18 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
     .iter()
     .map(|c| c.replace("PIP", p))
     .collect();
+    let heredoc_bodies = [
+        "ls -la",
+        "sudo ls",
+        "rm -rf /srv/x",
+        "rm -rf /tmp/x",
+        "cat .env",
+        "grep -r x .",
+        "rg --hidden x",
+        "git push -f",
+        "rust-anything build x",
+        "PIP install x",
+    ];
     let mut out = String::new();
     let segs = 1 + rng.below(4);
     for s in 0..segs {
@@ -366,6 +378,33 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
             out.push_str(rng.pick(&c_strings));
             out.push_str(" | ");
             out.push_str(to[rng.below(to.len())]);
+            continue;
+        }
+        // A heredoc inside a quoted `-c` string, or a `<<WORD` in quotes or a comment before a later line.
+        if (verb == "bash" || verb == "sh") && rng.chance(15) {
+            let readers = ["bash", "sh", "cat", "source /dev/stdin", "cat > notes.md"];
+            let body = heredoc_bodies[rng.below(heredoc_bodies.len())].replace("PIP", p);
+            let after = heredoc_bodies[rng.below(heredoc_bodies.len())].replace("PIP", p);
+            let (q, delim) = if rng.chance(50) {
+                ('\'', "EOF")
+            } else {
+                ('"', "'X'")
+            };
+            let end = delim.trim_matches('\'');
+            out.push_str(&format!(
+                " -c {q}{} <<{delim}\n{body}\n{end}",
+                readers[rng.below(readers.len())]
+            ));
+            if rng.chance(50) {
+                out.push_str(&format!("\n{after}"));
+            }
+            out.push(q);
+            continue;
+        }
+        if verb == "echo" && rng.chance(10) {
+            let body = heredoc_bodies[rng.below(heredoc_bodies.len())].replace("PIP", p);
+            let hide = ["'a <<EOF'", "\"see <<EOF\"", "x # <<EOF"];
+            out.push_str(&format!(" {}\n{body}", hide[rng.below(hide.len())]));
             continue;
         }
         if verb == "eval" && rng.chance(40) {
@@ -471,7 +510,8 @@ fn nested_kind(input: &str) -> Option<&'static str> {
         .split(|c: char| c.is_whitespace() || ";&|()".contains(c))
         .filter(|w| !w.is_empty())
         .collect();
-    let base = |w: &str| unquoted_base(w).to_string();
+    // A backslash inside a word only quotes the next letter (`e\\val` is eval).
+    let base = |w: &str| unquoted_base(w).replace('\\', "");
     let shells = ["bash", "sh", "zsh", "dash", "ksh"];
     let shell_c = words.iter().enumerate().any(|(i, w)| {
         shells.contains(&base(w).as_str())
@@ -490,7 +530,7 @@ fn nested_kind(input: &str) -> Option<&'static str> {
     });
     if shell_c {
         Some("shell-c-string")
-    } else if words.iter().any(|w| unquoted_base(w) == "eval") {
+    } else if words.iter().any(|w| base(w) == "eval") {
         Some("eval-string")
     } else if stdin_shell && cmd.contains("<<<") {
         Some("here-string")
@@ -501,6 +541,29 @@ fn nested_kind(input: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// True if a `<<WORD` in the hook input's command sits inside quotes or a comment on its line (roughly: an odd
+/// number of ' or " before it, or a `#` word before it).
+fn quoted_heredoc(input: &str) -> bool {
+    let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+    let cmd = v["tool_input"]["command"].as_str().unwrap_or("");
+    let mut seen = String::new();
+    cmd.split('\n').any(|line| {
+        let hit = line.match_indices("<<").any(|(i, _)| {
+            let next = line[i + 2..].trim_start_matches(['-', ' ', '\'', '"']);
+            if !next.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                return false;
+            }
+            let before = format!("{seen}{}", &line[..i]);
+            before.matches('\'').count() % 2 == 1
+                || before.matches('"').count() % 2 == 1
+                || line[..i].split_whitespace().any(|w| w.starts_with('#'))
+        });
+        seen.push_str(line);
+        seen.push('\n');
+        hit
+    })
 }
 
 /// A word's command name as the shell sees it: leading quotes and backslashes dropped (`\\eval`, `"bash"`), then
@@ -773,11 +836,13 @@ fn known_difference(
     {
         return Some("lone-surrogate-text");
     }
-    // The rust-anything rule is Rust only (added after the port); Python allows those commands.
-    if reference.stdout.is_empty()
-        && reference.code == 0
+    // The rust-anything rule is Rust only (added after the port); Python allows those commands, or blocks them for
+    // a later rule when Rust's check reaches the rust-anything run first (a heredoc body fed to a shell is checked
+    // before the rest of the command). Same decision then; only the reason differs.
+    if reference.code == 0
         && rust.code == 0
         && rule(&rust.stdout).starts_with("rust-anything ")
+        && (reference.stdout.is_empty() || reference.stdout.contains("\"deny\""))
     {
         return Some("rust-anything-rule");
     }
@@ -790,6 +855,11 @@ fn known_difference(
     let rust_blocks =
         (rust.code == 0 && !rust.stdout.is_empty()) || (rust.code == 2 && rust.stdout.is_empty());
     if reference.stdout.is_empty() && rust_blocks {
+        // A `<<WORD` inside quotes or a comment is no heredoc in Rust's newline pass (a heredoc in a quoted `-c`
+        // string stays in the string, checked on its own); the Python guard cut its "body" out of the string.
+        if quoted_heredoc(input) {
+            return Some("quoted-heredoc");
+        }
         if let Some(kind) = nested_kind(input) {
             return Some(kind);
         }
