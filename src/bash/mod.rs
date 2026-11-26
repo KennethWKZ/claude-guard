@@ -457,7 +457,8 @@ fn code_mask(line: &[char], stack: &mut Vec<Ctx>) -> (Vec<bool>, bool) {
 enum Pipe {
     /// Reaches a shell, through these filters.
     Shell(Vec<Vec<String>>),
-    Data,
+    /// Ends elsewhere, after these filters.
+    Data(Vec<Vec<String>>),
     /// Goes on after the bodies, through these filters so far.
     NextLine(Vec<Vec<String>>),
 }
@@ -466,7 +467,7 @@ enum Pipe {
 /// `from_first`: the first segment is already a pipe target (a line continuing a pipeline), not the producer.
 fn pipe_walk(text: &str, from_first: bool) -> Pipe {
     let Ok(tokens) = shlex::split_lines(text) else {
-        return Pipe::Data;
+        return Pipe::Data(Vec::new());
     };
     let segs = segments_with_seps(tokens);
     let mut chain: Vec<Vec<String>> = Vec::new();
@@ -478,7 +479,7 @@ fn pipe_walk(text: &str, from_first: bool) -> Pipe {
             chain.push(seg.clone());
         }
         if sep != "|" {
-            return Pipe::Data;
+            return Pipe::Data(chain);
         }
     }
     // Ended in `|`, or a blank or comment-only line: the pipeline goes on.
@@ -504,7 +505,15 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
     // (strip leading tabs, delimiter, fed to a shell through these filters, pipeline goes on after the bodies
     // through these filters, file written)
     type Chain = Vec<Vec<String>>;
-    type Pending = (bool, String, Option<Chain>, Option<Chain>, Option<String>);
+    // ... and the commands reading it on the way (sed `e`, awk `system`).
+    type Pending = (
+        bool,
+        String,
+        Option<Chain>,
+        Option<Chain>,
+        Option<String>,
+        Chain,
+    );
     let mut pending: Vec<Pending> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -565,7 +574,7 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
                 let rest: String = chars[start..].iter().collect();
                 pipe_walk(&rest, false)
             } else {
-                Pipe::Data
+                Pipe::Data(Vec::new())
             };
             let with_producer = |mut filters: Chain| {
                 if !producer.is_empty() {
@@ -573,13 +582,16 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
                 }
                 filters
             };
+            let readers = match &pipe {
+                Pipe::Shell(f) | Pipe::Data(f) | Pipe::NextLine(f) => with_producer(f.clone()),
+            };
             let (feed, next) = match pipe {
                 _ if shell_reads => (Some(Vec::new()), None),
                 Pipe::Shell(filters) => (Some(with_producer(filters)), None),
                 Pipe::NextLine(filters) => (None, Some(with_producer(filters))),
-                Pipe::Data => (None, None),
+                Pipe::Data(_) => (None, None),
             };
-            pending.push((tabs, delim, feed, next, target));
+            pending.push((tabs, delim, feed, next, target, readers));
         }
         let ready = !quoted
             || (!continued && matches!(stack.last(), Some(Ctx::Code { .. } | Ctx::Backtick)));
@@ -587,7 +599,7 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
             continue;
         }
         let mut pipe_next: Vec<(String, Chain)> = Vec::new();
-        for (tabs, delim, feed, next, target) in pending.drain(..) {
+        for (tabs, delim, feed, next, target, readers) in pending.drain(..) {
             let mut body: Vec<&str> = Vec::new();
             while i < lines.len() {
                 let body_line = lines[i];
@@ -606,6 +618,10 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
                 written.push((f, body.join("\n")));
             }
             let body = body.join("\n");
+            // Commands sed or awk run on the way (`sed 's/^/sudo /e' <<EOF`), shell or not at the end.
+            for stage in &readers {
+                run_as_shell.extend(filters::executed(stage, Some(&body)));
+            }
             if let Some(chain) = feed {
                 run_as_shell.extend(filters::outputs(&chain, &body));
             } else if let Some(chain) = next {
@@ -623,7 +639,7 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
                         }
                         break;
                     }
-                    Pipe::Data => break,
+                    Pipe::Data(_) => break,
                     Pipe::NextLine(more) => {
                         for (_, chain) in pipe_next.iter_mut() {
                             chain.extend(more.iter().cloned());
@@ -882,9 +898,11 @@ fn piped_scripts(segs: &[(Vec<String>, String)]) -> Vec<String> {
         let Some(lines) = printed_lines(seg) else {
             continue;
         };
-        // Through filters (`echo ls | sed 's/^/sudo /' | bash`) to a shell that runs its stdin.
+        // Through filters (`echo ls | sed 's/^/sudo /' | bash`) to a shell that runs its stdin; sed `e` and awk
+        // `system` on the way run commands themselves.
         let mut chain: Vec<Vec<String>> = Vec::new();
         for (next, next_sep) in &segs[i + 1..] {
+            out.extend(filters::executed(next, Some(&lines.join("\n"))));
             if runs_stdin(next) {
                 for text in filters::outputs(&chain, &lines.join("\n")) {
                     out.extend(

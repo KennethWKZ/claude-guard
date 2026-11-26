@@ -8,7 +8,8 @@
 //! - user switches: `su -c STRING`, `runuser -c STRING`, `runuser -u USER -- CMD...`, `sg GROUP -c STRING`;
 //! - `find ... -exec|-execdir|-ok|-okdir CMD... {} +|;`, with `{}` read as each start path;
 //! - string runners: `watch [opts] CMD...` (run by sh -c), `script -c STRING` and macOS `script FILE CMD...`,
-//!   `flock FILE -c STRING` and `flock FILE CMD...`, `env -S STRING`.
+//!   `flock FILE -c STRING` and `flock FILE CMD...`, `env -S STRING`;
+//! - commands sed and awk run themselves (`sed 'e CMD'`, `s///e`, awk `system("CMD")`; see `filters::executed`).
 //!
 //! Each comes back as a command line for the nested check. `runs_stdin_through` says whether the wrapper hands its
 //! stdin to a shell that runs it (`ssh HOST`, `docker exec -i C sh`, `timeout 9 bash`), for heredocs, here-strings
@@ -434,6 +435,8 @@ pub(super) fn wrapped_commands(seg: &[String]) -> Vec<String> {
     }
     out.extend(find_execs(seg));
     out.extend(string_runs(seg));
+    // sed `e COMMAND` / `s///e`, awk `system(...)`: with no known input, from the program alone.
+    out.extend(super::filters::executed(seg, None));
     out
 }
 

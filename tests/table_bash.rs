@@ -1942,6 +1942,43 @@ fn filters_that_build_commands_every_rule() {
 }
 
 #[test]
+fn commands_sed_and_awk_run_every_rule() {
+    // awk system(), "CMD" | getline, print | "CMD"; sed `e CMD`, a bare `e`, `s///e` (`C` = the rule's command).
+    every_rule_table(
+        &[
+            "awk 'BEGIN{system(\"C\")}'",
+            "awk '{system(\"C \" $1)}' f.txt",
+            "awk 'BEGIN { \"C\" | getline x }'",
+            "awk '{print \"C\" | \"sh\"}' f.txt",
+            "awk 'BEGIN{print \"x\" | \"C\"}'",
+            "gawk -F, -v a=1 'BEGIN { system(\"C\") }'",
+            "awk '{system(\"C\")}' <<EOF⏎x⏎EOF",
+            "echo x | awk '{system(\"C\")}'",
+            "sed 'e C' f.txt",
+            "sed '1e C' f.txt",
+            "sed -n '$e C' f.txt",
+            "sed 's#.*#C#e' f.txt",
+            "sed 's#^#C #e' <<EOF⏎x⏎EOF",
+            "echo x | sed 's#.*#C#e'",
+            "sed e <<EOF⏎C⏎EOF",
+            "cat <<EOF | sed 's#^#C #e'⏎x⏎EOF",
+            "bash -c \"sed 'e C' f.txt\"",
+            "timeout 9 awk 'BEGIN{system(\"C\")}'",
+        ],
+        &[
+            "awk '{print $1}' f.txt",
+            "awk 'BEGIN{system(\"ls -la\")}'",
+            "sed 's/x/y/' f.txt",
+            "sed -e 's/e/E/g' f.txt",
+            "sed '/^#/d;s/edge/x/' f.txt",
+            "echo 'see the e command' | sed 's/see/x/'",
+            "sed 's/^/echo /e' <<EOF⏎hello⏎EOF",
+            "sed -n '/end/p' f.txt",
+        ],
+    );
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [

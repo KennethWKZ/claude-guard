@@ -156,6 +156,13 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "echo x | sed 's#^#@@ #' | bash",
     "awk '{print \"@@ \" $0}' <<EOF | sh\nx\nEOF\n",
     "perl -pe 's#^#@@ #' <<EOF | bash\nx\nEOF\n",
+    "awk 'BEGIN{system(\"@@\")}'",
+    "awk '{system(\"@@ \" $1)}' f.txt",
+    "awk 'BEGIN { \"@@\" | getline x }'",
+    "sed 'e @@' f.txt",
+    "sed 's#.*#@@#e' f.txt",
+    "echo x | sed 's#^#@@ #e'",
+    "sed 's#^#@@ #e' <<EOF\nx\nEOF\n",
     "{ @@; }",
 ];
 
@@ -688,6 +695,16 @@ fn wrapped_kind(input: &str) -> Option<&'static str> {
     // `./ru\\n/x.sh` is ./run/x.sh to bash: a backslash quotes the next letter.
     if cmd.replace('\\', "").contains("run/") {
         Some("script-on-disk")
+    } else if cmd.contains("system(") || cmd.contains("getline") {
+        // Commands awk runs itself.
+        Some("awk-command")
+    } else if cmd.contains("sed")
+        && ["'e ", "1e ", "$e ", "#e'", "/e'", "sed e", "e'"]
+            .iter()
+            .any(|e| cmd.contains(e))
+    {
+        // Commands sed runs itself (`e CMD`, `s///e`).
+        Some("sed-exec")
     } else if ["sed ", "awk ", "perl "].iter().any(|f| cmd.contains(f)) && cmd.contains('|') {
         // A filter on the way to a shell builds the command (`sed 's/^/sudo /' <<EOF | bash`).
         Some("filter-built")

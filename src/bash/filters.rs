@@ -10,6 +10,9 @@
 //! - `perl -pe`/`-ne`: its `s///` commands, read like sed `-E`.
 //! - Any other command passes the text on unchanged (grep, sort, tr, cat, tee, head).
 //!
+//! `executed` gives the commands sed and awk run themselves: sed `e CMD`, a bare `e`, `s///e`; awk `system(...)`,
+//! `"CMD" | getline`, `print ... | "CMD"`.
+//!
 //! A heuristic: a filter can build a command in ways no static reading follows (variables, `y///`, `tr`, `rev`).
 
 use crate::pyfs;
@@ -58,13 +61,35 @@ enum SedCmd {
         pat: String,
         repl: String,
         global: bool,
+        /// The `e` flag: the line after the substitution is run as a command.
+        exec: bool,
     },
     Insert(String),
     Append(String),
     Change(String),
+    /// `e COMMAND` runs COMMAND; a bare `e` runs the current line.
+    Exec(Option<String>),
 }
 
 fn sed(args: &[String], text: &str) -> Vec<String> {
+    let Some((cmds, ere)) = sed_script(args) else {
+        return vec![text.to_string()];
+    };
+    if cmds.is_empty() {
+        return vec![text.to_string()];
+    }
+    let mut out = vec![run_sed(&cmds, text, ere, false)];
+    if cmds
+        .iter()
+        .any(|c| matches!(c, SedCmd::Sub { pat, .. } if to_regex(pat, ere).is_none()))
+    {
+        out.push(run_sed(&cmds, text, ere, true));
+    }
+    out
+}
+
+/// sed's commands and whether its regexes are extended; None for a script in a file (`-f`), which isn't read.
+fn sed_script(args: &[String]) -> Option<(Vec<SedCmd>, bool)> {
     let mut scripts: Vec<String> = Vec::new();
     let mut ere = false;
     let mut k = 0;
@@ -81,7 +106,7 @@ fn sed(args: &[String], text: &str) -> Vec<String> {
         } else if a == "--regexp-extended" {
             ere = true;
         } else if a == "-f" || a.starts_with("--file") {
-            return vec![text.to_string()]; // script in a file: not read
+            return None; // script in a file: not read
         } else if a.starts_with("--") {
             // --quiet, --in-place, --null-data, ...
         } else if a.starts_with('-') && a.len() > 1 {
@@ -90,7 +115,7 @@ fn sed(args: &[String], text: &str) -> Vec<String> {
                 ere = true;
             }
             if letters.contains('f') {
-                return vec![text.to_string()];
+                return None;
             }
             if letters.ends_with('e') {
                 k += 1;
@@ -106,18 +131,7 @@ fn sed(args: &[String], text: &str) -> Vec<String> {
     if scripts.is_empty() {
         scripts.extend(positional);
     }
-    let cmds: Vec<SedCmd> = scripts.iter().flat_map(|s| parse_sed(s)).collect();
-    if cmds.is_empty() {
-        return vec![text.to_string()];
-    }
-    let mut out = vec![run_sed(&cmds, text, ere, false)];
-    if cmds
-        .iter()
-        .any(|c| matches!(c, SedCmd::Sub { pat, .. } if to_regex(pat, ere).is_none()))
-    {
-        out.push(run_sed(&cmds, text, ere, true));
-    }
-    out
+    Some((scripts.iter().flat_map(|s| parse_sed(s)).collect(), ere))
 }
 
 /// Reads up to an unescaped `delim`; returns (text, index after the delimiter).
@@ -174,18 +188,34 @@ fn parse_sed(script: &str) -> Vec<SedCmd> {
                 let (pat, j) = until_delim(&chars, i + 2, d);
                 let (repl, j) = until_delim(&chars, j, d);
                 let mut j = j;
-                let mut global = false;
+                let (mut global, mut exec) = (false, false);
                 while j < chars.len() && (chars[j].is_ascii_alphanumeric()) {
                     global |= chars[j] == 'g';
+                    exec |= chars[j] == 'e';
                     j += 1;
                 }
-                cmds.push(SedCmd::Sub { pat, repl, global });
+                cmds.push(SedCmd::Sub {
+                    pat,
+                    repl,
+                    global,
+                    exec,
+                });
                 i = j;
             }
             'y' if i + 1 < chars.len() => {
                 let d = chars[i + 1];
                 let (_, j) = until_delim(&chars, i + 2, d);
                 i = until_delim(&chars, j, d).1;
+            }
+            'e' => {
+                // `e COMMAND` to the end of the line; a bare `e` runs the line itself.
+                let end = (i + 1..chars.len())
+                    .find(|&k| chars[k] == '\n')
+                    .unwrap_or(chars.len());
+                let c: String = chars[i + 1..end].iter().collect();
+                let c = c.trim();
+                cmds.push(SedCmd::Exec((!c.is_empty()).then(|| c.to_string())));
+                i = end;
             }
             'i' | 'a' | 'c' => {
                 let mut j = i + 1;
@@ -287,29 +317,47 @@ fn to_replacement(repl: &str) -> String {
 /// The sed script applied to every line. `as_prefix`: a pattern that won't translate counts as `^`, and its
 /// replacement also gets a line of its own.
 fn run_sed(cmds: &[SedCmd], text: &str, ere: bool, as_prefix: bool) -> String {
+    run_sed_exec(cmds, text, ere, as_prefix).0
+}
+
+/// `run_sed`, and the commands sed runs on the way (`e`, `s///e`).
+fn run_sed_exec(cmds: &[SedCmd], text: &str, ere: bool, as_prefix: bool) -> (String, Vec<String>) {
     let mut out: Vec<String> = Vec::new();
+    let mut ran: Vec<String> = Vec::new();
     for line in text.split('\n') {
         let mut before: Vec<String> = Vec::new();
         let mut after: Vec<String> = Vec::new();
         let mut cur = line.to_string();
         for cmd in cmds {
             match cmd {
-                SedCmd::Sub { pat, repl, global } => match to_regex(pat, ere) {
-                    Some(re) => {
-                        let r = to_replacement(repl);
-                        cur = if *global {
-                            re.replace_all(&cur, r.as_str()).into_owned()
-                        } else {
-                            re.replace(&cur, r.as_str()).into_owned()
-                        };
+                SedCmd::Sub {
+                    pat,
+                    repl,
+                    global,
+                    exec,
+                } => {
+                    match to_regex(pat, ere) {
+                        Some(re) => {
+                            let r = to_replacement(repl);
+                            cur = if *global {
+                                re.replace_all(&cur, r.as_str()).into_owned()
+                            } else {
+                                re.replace(&cur, r.as_str()).into_owned()
+                            };
+                        }
+                        None if as_prefix => {
+                            let plain = repl.replace(['&', '\\'], "");
+                            before.push(plain.clone());
+                            cur = format!("{plain}{cur}");
+                        }
+                        None => {}
                     }
-                    None if as_prefix => {
-                        let plain = repl.replace(['&', '\\'], "");
-                        before.push(plain.clone());
-                        cur = format!("{plain}{cur}");
+                    if *exec {
+                        ran.push(cur.clone());
                     }
-                    None => {}
-                },
+                }
+                SedCmd::Exec(Some(c)) => ran.push(c.clone()),
+                SedCmd::Exec(None) => ran.push(cur.clone()),
                 SedCmd::Insert(t) => before.push(t.clone()),
                 SedCmd::Append(t) => after.push(t.clone()),
                 SedCmd::Change(t) => cur = t.clone(),
@@ -319,17 +367,60 @@ fn run_sed(cmds: &[SedCmd], text: &str, ere: bool, as_prefix: bool) -> String {
         out.push(cur);
         out.extend(after);
     }
-    out.join("\n")
+    (out.join("\n"), ran)
 }
 
-/// awk: the program's `print` lists evaluated for each line.
-fn awk(args: &[String], text: &str) -> Vec<String> {
+/// The commands a sed or awk program runs itself (sed `e COMMAND`, a bare `e`, `s///e`; awk `system(...)`,
+/// `"CMD" | getline`, `print ... | "CMD"`), for `input` when it is known (a heredoc or `echo` feeding it), else
+/// from the program alone (fields read as empty, `s///e` as its replacement).
+pub(super) fn executed(seg: &[String], input: Option<&str>) -> Vec<String> {
+    let Some(verb) = seg.first() else {
+        return Vec::new();
+    };
+    let args = &seg[1..];
+    let mut out: Vec<String> = match pyfs::basename(verb) {
+        "sed" | "gsed" => {
+            let Some((cmds, ere)) = sed_script(args) else {
+                return Vec::new();
+            };
+            match input {
+                Some(text) => {
+                    let mut ran = run_sed_exec(&cmds, text, ere, false).1;
+                    if cmds.iter().any(|c| matches!(c, SedCmd::Sub { pat, exec: true, .. } if to_regex(pat, ere).is_none())) {
+                        ran.extend(run_sed_exec(&cmds, text, ere, true).1);
+                    }
+                    ran
+                }
+                None => cmds
+                    .iter()
+                    .filter_map(|c| match c {
+                        SedCmd::Exec(Some(c)) => Some(c.clone()),
+                        SedCmd::Sub {
+                            repl, exec: true, ..
+                        } => Some(repl.replace(['&', '\\'], "")),
+                        _ => None,
+                    })
+                    .collect(),
+            }
+        }
+        "awk" | "gawk" | "mawk" | "nawk" => match awk_program(args) {
+            Some(program) => awk_commands(program, input),
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    out.retain(|c| !c.trim().is_empty());
+    out.dedup();
+    out
+}
+
+/// The program argument of an awk command; None for `-f FILE` or none.
+fn awk_program(args: &[String]) -> Option<&str> {
     let mut k = 0;
-    let mut program: Option<&str> = None;
     while k < args.len() {
         let a = args[k].as_str();
         if a == "-f" || a.starts_with("--file") {
-            return vec![text.to_string()];
+            return None;
         }
         if a == "-F" || a == "-v" {
             k += 2;
@@ -339,10 +430,91 @@ fn awk(args: &[String], text: &str) -> Vec<String> {
             k += 1;
             continue;
         }
-        program = Some(a);
-        break;
+        return Some(a);
     }
-    let Some(program) = program else {
+    None
+}
+
+/// The text of the parenthesised expression starting at `open` (the index of `(`), quote-aware.
+fn paren_expr(chars: &[char], open: usize) -> String {
+    let mut depth = 0;
+    let mut in_str = false;
+    let mut i = open;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            if c == '\\' {
+                i += 1;
+            } else if c == '"' {
+                in_str = false;
+            }
+        } else if c == '"' {
+            in_str = true;
+        } else if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return chars[open + 1..i].iter().collect();
+            }
+        }
+        i += 1;
+    }
+    chars[open + 1..].iter().collect()
+}
+
+/// awk: what `system(...)`, `"CMD" | getline` and `print ... | "CMD"` run, per input line (one empty line when
+/// the input isn't known). A `print` piped to a shell also runs what it prints.
+fn awk_commands(program: &str, input: Option<&str>) -> Vec<String> {
+    let lines: Vec<&str> = input
+        .map(|t| t.split('\n').collect())
+        .unwrap_or_else(|| vec![""]);
+    let chars: Vec<char> = program.chars().collect();
+    let mut out = Vec::new();
+    let mut search = 0;
+    while let Some(at) = program[search..].find("system") {
+        let start = search + at;
+        search = start + 6;
+        let rest = &program[start + 6..];
+        let open_rel = rest.len() - rest.trim_start().len();
+        if !rest.trim_start().starts_with('(') {
+            continue;
+        }
+        let open = program[..start + 6 + open_rel].chars().count();
+        let expr = paren_expr(&chars, open);
+        for line in &lines {
+            out.push(eval_print(&expr, line));
+        }
+    }
+    let lit = r#""((?:[^"\\]|\\.)*)""#;
+    if let Ok(re) = Regex::new(&format!(r"{lit}\s*\|\s*getline")) {
+        out.extend(
+            re.captures_iter(program)
+                .map(|c| string_literals(&format!("\"{}\"", &c[1])).concat()),
+        );
+    }
+    if let Ok(re) = Regex::new(&format!(r"print([^;}}\n|]*)\|\s*{lit}")) {
+        for c in re.captures_iter(program) {
+            let cmd = string_literals(&format!("\"{}\"", &c[2])).concat();
+            let shell = cmd
+                .split_whitespace()
+                .next()
+                .map(|w| w.rsplit('/').next().unwrap_or(w))
+                .is_some_and(|w| ["sh", "bash", "zsh", "dash", "ksh"].contains(&w));
+            if shell {
+                for line in &lines {
+                    out.push(eval_print(&c[1], line));
+                }
+            }
+            out.push(cmd);
+        }
+    }
+    out
+}
+
+/// awk: the program's `print` lists evaluated for each line.
+fn awk(args: &[String], text: &str) -> Vec<String> {
+    let Some(program) = awk_program(args) else {
         return vec![text.to_string()];
     };
     let prints: Vec<String> = Regex::new(r"\bprint\b([^;}\n]*)")
@@ -469,7 +641,7 @@ fn perl(args: &[String], text: &str) -> Vec<String> {
         Some(s) if looping => {
             let cmds: Vec<SedCmd> = parse_sed(s)
                 .into_iter()
-                .filter(|c| matches!(c, SedCmd::Sub { .. }))
+                .filter(|c| matches!(c, SedCmd::Sub { exec: false, .. }))
                 .collect();
             if cmds.is_empty() {
                 vec![text.to_string()]

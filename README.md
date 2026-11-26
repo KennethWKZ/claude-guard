@@ -176,6 +176,10 @@ The rules also hold for what a wrapper runs (Rust only):
 - user switches: `su -c '…'`, `runuser -c '…'`, `runuser -u USER -- CMD`, `sg GROUP -c '…'`;
 - `find … -exec|-execdir|-ok|-okdir CMD {} +|;`, with `{}` read as each start path (`find /srv/old -exec rm -rf {} +`);
 - string runners: `watch '…'`, `script -c '…'` and macOS `script FILE CMD`, `flock FILE -c '…'`, `env -S '…'`;
+- commands sed and awk run themselves: sed `e CMD`, a bare `e` and the `s///e` flag; awk `system("…")`,
+  `"CMD" | getline` and `print … | "CMD"` (with a shell as CMD, what it prints too). With input the guard knows (a
+  heredoc or `echo …` feeding them) each line is worked through; otherwise fields read as empty
+  (`awk '{system("rm -rf /srv/" $1)}'` reads as `rm -rf /srv/`);
 - variables set in the same command: `c='sudo ls'; bash -c "$c"`, `$c` as the command, `rm -rf "$d"` after
   `d=/srv/app` (the command is checked once more with the values put in);
 - scripts written and run in the same command: `cat > run.sh <<EOF … EOF` or `echo … > run.sh`, then `bash run.sh`,
