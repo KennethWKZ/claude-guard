@@ -27,10 +27,18 @@
 //! Python guard's reading cut the "body" out of the string, which then failed to parse and was allowed.
 //! A heredoc whose command's output is piped into a shell that runs its stdin (`cat <<EOF | bash`, `sed ... <<EOF |
 //! sh`, `cat <<EOF |` with `bash` on the line after the body) has its body checked as written too; the Python guard
-//! read it as data.
+//! read it as data. Heredocs behind a wrapper (`timeout 9 bash <<EOF`, `ssh host <<EOF`) or whose output is run
+//! (`eval "$(cat <<EOF`, `bash <(cat <<EOF`) count as fed to a shell; a `case` pattern's `)` doesn't end `$(...)`.
+//!
+//! The rules also hold for what a wrapper runs (`wrappers`: argv wrappers with options, ssh, containers, su/runuser/
+//! sg, find -exec, watch/script/flock/env -S), for the command again with the values of variables it sets put in
+//! (`c='sudo ls'; bash -c "$c"`), and for scripts it writes and then runs (`cat > run.sh <<EOF ...; bash run.sh`).
+//! Rust only, all checked after the rest of the command passed.
 //!
 //! Same contract as the Python guard: a parse error allows the command (a quoting mistake never locks the
 //! shell); any other failure blocks it (fail closed) and is logged. It only sees what is written in the command.
+
+mod wrappers;
 
 use crate::hookio::{self, py_truthy, py_type_name};
 use crate::{pyfs, shlex};
@@ -278,27 +286,49 @@ fn heredoc_starts(line: &[char]) -> Vec<(usize, bool, String)> {
     out
 }
 
-/// Where the scanner is, for `split_heredocs`' quote-aware reading: code (top level, inside `$(...)` with its own
-/// open-paren count, or inside backticks), or inside '...', "...", $'...'.
+/// Where the scanner is, for `split_heredocs`' quote-aware reading: code (top level, inside `$(...)`, or inside
+/// backticks), or inside '...', "...", $'...'. A code frame counts its open `(` and `case ... esac` blocks, so a
+/// `)` that closes either (`$(case $x in a) ...;; esac)`) doesn't end the substitution, and knows whether the
+/// next word is in command position (where `case` and `esac` are keywords).
 #[derive(Clone, Copy, PartialEq)]
 enum Ctx {
-    Code { parens: u32 },
+    Code { parens: u32, cases: u32, cmd: bool },
     Backtick,
     Single,
     Double,
     AnsiC,
 }
 
+const CODE: Ctx = Ctx::Code {
+    parens: 0,
+    cases: 0,
+    cmd: true,
+};
+
+/// Keywords after which the next word is a command again.
+const LEAD_KEYWORDS: &[&str] = &[
+    "do", "then", "else", "elif", "if", "while", "until", "!", "{", "time",
+];
+
 /// Which chars of one line are code (outside quotes and comments), given the contexts open at its start; updates
 /// them for the next line. Also returns whether the line ends in a backslash continuation.
 fn code_mask(line: &[char], stack: &mut Vec<Ctx>) -> (Vec<bool>, bool) {
     let n = line.len();
     let mut mask = vec![false; n];
+    // A new line starts a command (unless the last one ended in `|`, `&&`: still command position).
+    if let Some(Ctx::Code { cmd, .. }) = stack.last_mut() {
+        *cmd = true;
+    }
+    let set_cmd = |stack: &mut Vec<Ctx>, v: bool| {
+        if let Some(Ctx::Code { cmd, .. }) = stack.last_mut() {
+            *cmd = v;
+        }
+    };
     let mut i = 0;
     while i < n {
         let c = line[i];
         let next = line.get(i + 1).copied();
-        match *stack.last().unwrap_or(&Ctx::Code { parens: 0 }) {
+        match *stack.last().unwrap_or(&CODE) {
             Ctx::Single => {
                 if c == '\'' {
                     stack.pop();
@@ -317,7 +347,7 @@ fn code_mask(line: &[char], stack: &mut Vec<Ctx>) -> (Vec<bool>, bool) {
                 } else if c == '"' {
                     stack.pop();
                 } else if c == '$' && next == Some('(') {
-                    stack.push(Ctx::Code { parens: 0 });
+                    stack.push(CODE);
                     i += 1;
                 } else if c == '`' {
                     stack.push(Ctx::Backtick);
@@ -329,36 +359,80 @@ fn code_mask(line: &[char], stack: &mut Vec<Ctx>) -> (Vec<bool>, bool) {
                     i == 0 || line[i - 1].is_whitespace() || ";&|()<>".contains(line[i - 1]);
                 match c {
                     '\\' if i + 1 == n => return (mask, true),
-                    '\\' => i += 1,
+                    '\\' => {
+                        set_cmd(stack, false);
+                        i += 1;
+                    }
                     '#' if word_start => break,
-                    '\'' => stack.push(Ctx::Single),
-                    '"' => stack.push(Ctx::Double),
+                    '\'' => {
+                        set_cmd(stack, false);
+                        stack.push(Ctx::Single);
+                    }
+                    '"' => {
+                        set_cmd(stack, false);
+                        stack.push(Ctx::Double);
+                    }
                     '$' if next == Some('\'') => {
+                        set_cmd(stack, false);
                         stack.push(Ctx::AnsiC);
                         i += 1;
                     }
                     '$' if next == Some('(') => {
-                        stack.push(Ctx::Code { parens: 0 });
+                        set_cmd(stack, false);
+                        stack.push(CODE);
                         i += 1;
                     }
                     '`' if top == Ctx::Backtick => {
                         stack.pop();
                     }
                     '`' => stack.push(Ctx::Backtick),
+                    ';' | '&' | '|' => set_cmd(stack, true),
                     '(' => {
-                        if let Some(Ctx::Code { parens }) = stack.last_mut() {
+                        if let Some(Ctx::Code { parens, cmd, .. }) = stack.last_mut() {
                             *parens += 1;
+                            *cmd = true;
                         }
                     }
                     ')' => {
                         let depth = stack.len();
                         match stack.last_mut() {
-                            Some(Ctx::Code { parens }) if *parens > 0 => *parens -= 1,
+                            Some(Ctx::Code { parens, cmd, .. }) if *parens > 0 => {
+                                *parens -= 1;
+                                *cmd = true;
+                            }
+                            // A case pattern's `)`: the arm's command follows.
+                            Some(Ctx::Code { cases, cmd, .. }) if *cases > 0 => *cmd = true,
                             Some(Ctx::Code { .. }) if depth > 1 => {
                                 stack.pop();
                             }
                             _ => {}
                         }
+                    }
+                    c if word_start && !c.is_whitespace() && !"<>".contains(c) => {
+                        // A plain word: `case`/`esac` in command position open and close a case block.
+                        let end = (i + 1..n)
+                            .find(|&k| {
+                                line[k].is_whitespace() || ";&|()<>'\"`$\\".contains(line[k])
+                            })
+                            .unwrap_or(n);
+                        let word: String = line[i..end].iter().collect();
+                        let boundary = end == n || !"'\"`$\\".contains(line[end]);
+                        if let Some(Ctx::Code { cases, cmd, .. }) = stack.last_mut() {
+                            if *cmd && boundary && word == "case" {
+                                *cases += 1;
+                                *cmd = false;
+                            } else if *cmd && boundary && word == "esac" && *cases > 0 {
+                                *cases -= 1;
+                                *cmd = false;
+                            } else if !(*cmd && boundary && contains(LEAD_KEYWORDS, &word)) {
+                                *cmd = false;
+                            }
+                        }
+                        for m in mask.iter_mut().take(end).skip(i) {
+                            *m = true;
+                        }
+                        i = end;
+                        continue;
                     }
                     _ => {}
                 }
@@ -406,13 +480,15 @@ fn pipe_walk(text: &str, from_first: bool) -> Pipe {
 /// It also counts a heredoc whose command's output is piped into a shell that runs its stdin as fed to that shell
 /// (`cat <<EOF | bash`, `sed s/a/b/ <<EOF | sh`, or `cat <<EOF |` with `bash` on the line after the bodies). Heredocs inside `"$(...)"`
 /// and backticks are code, so `git commit -m "$(cat <<'EOF' ...)"` still drops its message.
-fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
+fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(String, String)>) {
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out: Vec<&str> = Vec::new();
     let mut run_as_shell = Vec::new();
-    let mut stack = vec![Ctx::Code { parens: 0 }];
-    // (strip leading tabs, delimiter, body fed to a shell, pipeline goes on after the bodies)
-    let mut pending: Vec<(bool, String, bool, bool)> = Vec::new();
+    let mut stack = vec![CODE];
+    // Bodies written to a file (`cat > run.sh <<EOF`): (file, body), for a later `bash run.sh` in the command.
+    let mut written: Vec<(String, String)> = Vec::new();
+    // (strip leading tabs, delimiter, body fed to a shell, pipeline goes on after the bodies, file written)
+    let mut pending: Vec<(bool, String, bool, bool, Option<String>)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -430,8 +506,34 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
             }
             let before: String = chars[..start].iter().collect();
             let last = before.rsplit([';', '&', '|', '(']).next().unwrap_or("");
-            let first_word = last.split(py_isspace).find(|w| !w.is_empty());
-            let shell_reads = first_word.is_some_and(|w| contains(SHELLS, pyfs::basename(w)));
+            let mut first_word = last.split(py_isspace).find(|w| !w.is_empty());
+            // The newline pass also ends a command at `)` (a case pattern, `(a) bash <<EOF`) and skips keywords
+            // and assignments (`then bash <<EOF`, `X=1 bash <<EOF`).
+            if quoted {
+                let last = before
+                    .rsplit([';', '&', '|', '(', ')'])
+                    .next()
+                    .unwrap_or("");
+                first_word = last
+                    .split(py_isspace)
+                    .find(|w| !w.is_empty() && !contains(KEYWORDS, w) && !is_assignment(w));
+            }
+            let mut shell_reads = first_word.is_some_and(|w| contains(SHELLS, pyfs::basename(w)));
+            let mut target = None;
+            if quoted {
+                let piece = before
+                    .rsplit([';', '&', '|', '(', ')'])
+                    .next()
+                    .unwrap_or("");
+                // Behind a wrapper: `timeout 9 bash <<EOF`, `ssh host <<EOF`, `docker exec -i c sh <<EOF`.
+                if let Ok(tokens) = shlex::split_lines(piece) {
+                    shell_reads |= raw_segments(&tokens).last().is_some_and(|s| runs_stdin(s));
+                }
+                // Its output run as commands: `eval "$(cat <<EOF`, `bash <(cat <<EOF`.
+                shell_reads |= output_runs(&before);
+                let rest: String = chars[start..].iter().collect();
+                target = heredoc_target(&format!("{piece}{rest}"));
+            }
             // The newline pass also follows the command's output: piped into a shell that runs its stdin (on this
             // line, or on the line after the bodies when this one ends in `|`), the body is checked as written.
             let pipe = if quoted && !shell_reads && first_word.is_some() {
@@ -445,6 +547,7 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
                 delim,
                 shell_reads || pipe == Pipe::Shell,
                 pipe == Pipe::NextLine,
+                target,
             ));
         }
         let ready = !quoted
@@ -453,7 +556,7 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
             continue;
         }
         let mut pipe_next: Vec<String> = Vec::new();
-        for (tabs, delim, to_shell, next) in pending.drain(..) {
+        for (tabs, delim, to_shell, next, target) in pending.drain(..) {
             let mut body: Vec<&str> = Vec::new();
             while i < lines.len() {
                 let body_line = lines[i];
@@ -467,6 +570,9 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
                     break;
                 }
                 body.push(body_line);
+            }
+            if let Some(f) = target {
+                written.push((f, body.join("\n")));
             }
             if to_shell {
                 run_as_shell.push(body.join("\n"));
@@ -488,7 +594,63 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
             }
         }
     }
-    (out.join("\n"), run_as_shell)
+    (out.join("\n"), run_as_shell, written)
+}
+
+/// True if the heredoc whose line runs up to `before` (ending just before `<<`) has its output run as commands:
+/// `$(cat <<EOF ...)` as a command, `eval "$(cat <<EOF`, `bash -c "$(cat <<EOF`, `bash <(cat <<EOF`,
+/// `source <(cat <<EOF`. An assignment or argument (`x=$(cat <<EOF`, `echo "$(cat <<EOF`) is data.
+fn output_runs(before: &str) -> bool {
+    let Some(cut) = before.rfind('(') else {
+        return false;
+    };
+    let (opener, inside) = (&before[..cut], &before[cut + 1..]);
+    if inside.contains([')', ';', '&', '|']) {
+        return false;
+    }
+    let dollar = opener.ends_with('$');
+    if !dollar && !opener.ends_with('<') {
+        return false;
+    }
+    let consumer = &opener[..opener.len() - 1];
+    let consumer = consumer.strip_suffix('"').unwrap_or(consumer);
+    if consumer
+        .chars()
+        .last()
+        .is_some_and(|c| !c.is_whitespace() && !";&|()".contains(c))
+    {
+        return false; // part of a word: `x=$(`, `--opt=$(`
+    }
+    let piece = consumer
+        .rsplit([';', '&', '|', '(', ')'])
+        .next()
+        .unwrap_or("");
+    let Ok(tokens) = shlex::split_lines(piece) else {
+        return false;
+    };
+    match raw_segments(&tokens).into_iter().next() {
+        None => dollar,
+        Some(seg) if !dollar => stdin_shell_at(&seg).is_some(),
+        Some(seg) => {
+            seg[0] == "eval"
+                || (contains(C_SHELLS, pyfs::basename(&seg[0]))
+                    && seg.last().is_some_and(|a| dash_letters_contain(a, &['c'])))
+        }
+    }
+}
+
+/// The file a heredoc's command writes its body to: `cat > f <<EOF`, `cat <<EOF >> f`, `tee [-a] f <<EOF`.
+fn heredoc_target(command: &str) -> Option<String> {
+    let tokens = shlex::split_lines(command).ok()?;
+    let seg = raw_segments(&tokens).into_iter().next()?;
+    if pyfs::basename(&seg[0]) == "tee" {
+        let args = strip_redirs(&seg[1..]);
+        return args.get(wrappers::skip_opts(&args, "", &[])).cloned();
+    }
+    let i = seg
+        .iter()
+        .position(|w| w == ">" || w == ">>" || w == ">|")?;
+    seg.get(i + 1).cloned()
 }
 
 /// Split into simple commands: [verb, args...], skipping prefixes like `env`, `xargs`, keywords, VAR=value; each
@@ -530,7 +692,56 @@ fn stdin_shell_at(seg: &[String]) -> Option<usize> {
 
 /// True if the simple command runs its standard input as a script: `bash`, `sh -s`, `bash -x /dev/stdin`,
 /// `source /dev/stdin`, `. /dev/fd/0`. Not with `-c` (stdin is then data) or a script file.
+/// True if a simple command runs its stdin as commands: a shell with no script (or `-s`, `/dev/stdin`), `source` or
+/// `.` of `/dev/stdin`, also behind wrappers (`timeout 9 bash`, `ssh HOST`, `docker exec -i C sh`). Redirections
+/// (`< file`, `> out`, `<<<`, `<<EOF`) are left out first.
 fn runs_stdin(seg: &[String]) -> bool {
+    let seg = strip_redirs(seg);
+    !seg.is_empty() && (shell_runs_stdin(&seg) || wrappers::runs_stdin_through(&seg))
+}
+
+/// Redirection operators (`<`, `>`, `>>`, `<<<`, `<<`, `>&`, `&>`) and the word each takes.
+fn strip_redirs(seg: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for w in seg {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if !w.is_empty() && w.chars().all(|c| "<>&".contains(c)) {
+            skip = true;
+            continue;
+        }
+        out.push(w.clone());
+    }
+    out
+}
+
+/// Simple commands as written: split at separators and newlines, leading keywords and assignments dropped, but
+/// wrappers (`env`, `nice`, `xargs`) kept with their options, unlike `segments_with_seps`.
+fn raw_segments(tokens: &[String]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for t in tokens.iter().chain(std::iter::once(&";".to_string())) {
+        if contains(SEPARATORS, t) || t == "\n" {
+            let skip = cur
+                .iter()
+                .take_while(|w| contains(KEYWORDS, w) || is_assignment(w))
+                .count();
+            cur.drain(..skip);
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+        } else {
+            cur.push(t.clone());
+        }
+    }
+    out
+}
+
+fn shell_runs_stdin(seg: &[String]) -> bool {
     let Some(at) = stdin_shell_at(seg) else {
         return false;
     };
@@ -801,6 +1012,14 @@ fn nested_commands(seg: &[String]) -> Vec<String> {
         return out;
     }
     let Some(shell) = stdin_shell_at(seg) else {
+        // A here-string fed through a wrapper that hands stdin to a shell (`ssh HOST <<< STRING`).
+        if runs_stdin(seg) {
+            for w in seg.windows(2) {
+                if w[0] == "<<<" {
+                    out.push(w[1].clone());
+                }
+            }
+        }
         return out;
     };
     let rest = &seg[shell + 1..];
@@ -840,20 +1059,39 @@ fn nested_commands(seg: &[String]) -> Vec<String> {
 /// True if a string `nested_commands` finds in `command`, at any depth, holds a `pip install` (block-pip's rule
 /// only read the command's own lines).
 fn pip_in_nested(command: &str, depth: usize) -> bool {
+    pip_in_nested_mode(command, depth, true)
+}
+
+fn pip_in_nested_mode(command: &str, depth: usize, expand: bool) -> bool {
     if depth > MAX_DEPTH {
         return false; // check() already crashed (blocked) at this depth
     }
-    let (command, bodies) = split_heredocs(command, true);
+    let (command, bodies, mut written) = split_heredocs(command, true);
     if bodies.iter().any(|b| pip_in_nested(b, depth + 1)) {
         return true;
     }
     let Ok(raw) = shlex::split_lines(&command) else {
         return false;
     };
+    // Variables set in the command, once (as check_mode does).
+    if expand {
+        if let Some(x) = expand_vars(&command, &raw) {
+            if PIP.is_match(&x) || pip_in_nested_mode(&x, depth + 1, false) {
+                return true;
+            }
+        }
+    }
+    let raw_segs = raw_segments(&raw);
+    let mut more: Vec<String> = raw_segs
+        .iter()
+        .flat_map(|s| wrappers::wrapped_commands(s))
+        .collect();
+    more.extend(scripts_run(&raw_segs, &mut written));
     let segs = segments_with_seps(raw);
     segs.iter()
         .flat_map(|(s, _)| nested_commands(s))
         .chain(piped_scripts(&segs))
+        .chain(more)
         .any(|inner| PIP.is_match(&inner) || pip_in_nested(&inner, depth + 1))
 }
 
@@ -896,16 +1134,142 @@ fn rust_anything_reason(seg: &[String]) -> Option<String> {
     ))
 }
 
+/// `echo ... > FILE` / `printf ... >> FILE`: (FILE, the lines written).
+fn printed_to_file(seg: &[String]) -> Option<(String, String)> {
+    let i = seg
+        .iter()
+        .position(|w| w == ">" || w == ">>" || w == ">|")?;
+    let file = seg.get(i + 1)?.clone();
+    let words = strip_redirs(seg);
+    if words.is_empty() {
+        return None; // only a redirection: `> file`
+    }
+    let text = printed_lines(&words)?.join("\n");
+    Some((file, text))
+}
+
+/// The script file a simple command runs: `bash FILE`, `sh -x FILE`, `source FILE`, `. FILE`, `./FILE` or
+/// `/path/FILE` as the verb, also behind argv wrappers (`timeout 9 bash FILE`).
+fn runs_file(seg: &[String]) -> Option<String> {
+    let mut seg = seg.to_vec();
+    while let Some(inner) = wrappers::argv_wrapper_inner(&seg) {
+        seg = inner;
+    }
+    let seg = strip_redirs(&seg);
+    let verb = pyfs::basename(seg.first()?);
+    if contains(C_SHELLS, verb) {
+        let args = &seg[1..];
+        if args
+            .iter()
+            .any(|a| !a.starts_with("--") && dash_letters_contain(a, &['c']))
+        {
+            return None;
+        }
+        return args.iter().find(|a| !a.starts_with('-')).cloned();
+    }
+    if verb == "source" || verb == "." {
+        return seg.get(1).cloned();
+    }
+    seg[0].contains('/').then(|| seg[0].clone())
+}
+
+/// Bodies of scripts written in this command (heredocs in `written`, plus `echo`/`printf` to a file) that a later
+/// simple command runs.
+fn scripts_run(raw_segs: &[Vec<String>], written: &mut Vec<(String, String)>) -> Vec<String> {
+    for rs in raw_segs {
+        if let Some(w) = printed_to_file(rs) {
+            written.push(w);
+        }
+    }
+    let mut out = Vec::new();
+    for rs in raw_segs {
+        if let Some(f) = runs_file(rs) {
+            for (w, body) in written.iter() {
+                if same_path(w, &f) {
+                    out.push(body.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    a.trim_start_matches("./") == b.trim_start_matches("./")
+}
+
+/// The command with the values of variables it assigns (`NAME=value` in command position, also after export,
+/// local, declare, readonly, typeset) put in for `$NAME` and `${NAME}`; None if nothing changes.
+fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
+    const DECLARE: &[&str] = &["export", "local", "declare", "readonly", "typeset"];
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut at_cmd = true;
+    let mut after_declare = false;
+    for t in tokens {
+        if contains(SEPARATORS, t) || t == "\n" {
+            at_cmd = true;
+            after_declare = false;
+            continue;
+        }
+        if at_cmd && (contains(KEYWORDS, t) || contains(DECLARE, t)) {
+            after_declare = contains(DECLARE, t);
+            continue;
+        }
+        if at_cmd && after_declare && t.starts_with('-') {
+            continue;
+        }
+        if at_cmd && is_assignment(t) {
+            if let Some((name, value)) = t.split_once('=') {
+                vars.retain(|(k, _)| k != name);
+                vars.push((name.to_string(), value.to_string()));
+            }
+            continue;
+        }
+        at_cmd = false;
+    }
+    if vars.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            let (name, end) = if chars.get(i + 1) == Some(&'{') {
+                let close = (i + 2..chars.len()).find(|&k| chars[k] == '}');
+                match close {
+                    Some(c) => (chars[i + 2..c].iter().collect::<String>(), c + 1),
+                    None => (String::new(), i + 1),
+                }
+            } else {
+                let e = (i + 1..chars.len())
+                    .find(|&k| !ident(chars[k]))
+                    .unwrap_or(chars.len());
+                (chars[i + 1..e].iter().collect::<String>(), e)
+            };
+            if let Some((_, v)) = vars.iter().find(|(k, _)| *k == name) {
+                out.push_str(v);
+                i = end;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    (out != command).then_some(out)
+}
+
 /// The reason to block `command`, if any. Err is a crash (blocks).
 ///
 /// Two passes over the whole command: first reading a newline as a space, as the Python guard did, so a command it
 /// blocked keeps its reason; then, if that passed, with newlines as separators. Each pass recurses in its own mode,
 /// so nesting never multiplies the work.
 pub fn check(command: &str, cwd: &Cwd, depth: usize) -> Result<Option<String>, Crash> {
-    if let Some(r) = check_mode(command, cwd, depth, false)? {
+    if let Some(r) = check_mode(command, cwd, depth, false, true)? {
         return Ok(Some(r));
     }
-    check_mode(command, cwd, depth, true)
+    check_mode(command, cwd, depth, true, true)
 }
 
 fn check_mode(
@@ -913,15 +1277,16 @@ fn check_mode(
     cwd: &Cwd,
     depth: usize,
     lines: bool,
+    expand: bool,
 ) -> Result<Option<String>, Crash> {
     if depth > MAX_DEPTH {
         return Err(Crash(
             "RecursionError: maximum recursion depth exceeded".into(),
         ));
     }
-    let (command, shell_bodies) = split_heredocs(command, lines);
+    let (command, shell_bodies, mut written) = split_heredocs(command, lines);
     for body in shell_bodies {
-        if let Some(r) = check_mode(&body, cwd, depth + 1, lines)? {
+        if let Some(r) = check_mode(&body, cwd, depth + 1, lines, true)? {
             return Ok(Some(r));
         }
     }
@@ -936,8 +1301,25 @@ fn check_mode(
     // Strings run as commands (`bash -c`, eval, here-strings, `source <(echo ...)`, `echo ... | bash`), checked
     // with every rule once the whole command has passed: a command the Python guard blocked keeps its verdict and
     // reason.
+    let raw_segs = raw_segments(&raw);
+    // Variables set in the command (`c='sudo ls'; bash -c "$c"`): the command once more with their values in,
+    // checked without expanding again (newline pass).
+    let expanded = if lines && expand {
+        expand_vars(&command, &raw)
+    } else {
+        None
+    };
     let segs = segments_with_seps(raw);
     let mut nested: Vec<String> = piped_scripts(&segs);
+    // What wrappers run: `timeout 9 CMD`, `ssh HOST CMD`, `docker exec C CMD`, `su -c STRING`, `find -exec CMD`.
+    for rs in &raw_segs {
+        nested.extend(wrappers::wrapped_commands(rs));
+    }
+    // Scripts written and run in the same command (newline pass): `cat > run.sh <<EOF ...; bash run.sh`,
+    // `echo '...' > run.sh && ./run.sh`.
+    if lines {
+        nested.extend(scripts_run(&raw_segs, &mut written));
+    }
     for (seg, _) in segs {
         nested.extend(nested_commands(&seg));
         let verb = pyfs::basename(&seg[0]).to_string();
@@ -1062,7 +1444,12 @@ fn check_mode(
     }
     // A string that doesn't parse is allowed, as the whole command is.
     for inner in nested {
-        if let Some(r) = check_mode(&inner, cwd, depth + 1, lines)? {
+        if let Some(r) = check_mode(&inner, cwd, depth + 1, lines, true)? {
+            return Ok(Some(r));
+        }
+    }
+    if let Some(x) = expanded {
+        if let Some(r) = check_mode(&x, cwd, depth + 1, lines, false)? {
             return Ok(Some(r));
         }
     }

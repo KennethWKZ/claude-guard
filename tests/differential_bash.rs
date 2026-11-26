@@ -81,6 +81,40 @@ fn fixture_dir() -> String {
     d.to_string_lossy().into_owned()
 }
 
+const WRAPPED_TEMPLATES: &[&str] = &[
+    "timeout 9 @@",
+    "timeout -s KILL 9 @@",
+    "nice -n 5 @@",
+    "env -i X=1 @@",
+    "caffeinate -i @@",
+    "xargs -I{} @@",
+    "setsid @@",
+    "ssh host '@@'",
+    "ssh -p 22 host @@",
+    "ssh host <<EOF\n@@\nEOF\n",
+    "echo '@@' | ssh host",
+    "find . -exec @@ {} +",
+    r"find . -exec sh -c '@@' \;",
+    "su -c '@@'",
+    "runuser -u app -- @@",
+    "sg docker -c '@@'",
+    "docker exec -it web sh -c '@@'",
+    "docker run --rm -e A=1 img @@",
+    "kubectl exec pod -- @@",
+    "docker compose exec app @@",
+    "watch -n 1 '@@'",
+    "script -q /dev/null @@",
+    "flock /tmp/l -c '@@'",
+    "env -S '@@'",
+    "eval \"$(cat <<EOF\n@@\nEOF\n)\"",
+    "bash <(cat <<EOF\n@@\nEOF\n)",
+    "c='@@'; bash -c \"$c\"",
+    "c='@@'; $c",
+    "cat > run.sh <<EOF\n@@\nEOF\nbash run.sh",
+    "echo '@@' > run.sh; sh run.sh",
+    "x=\"$(case $y in a) bash <<EOF;; esac\n@@\nEOF\n)\"",
+];
+
 fn generate(rng: &mut Rng, dir: &str) -> String {
     let p = "pip";
     let verbs = sv(&[
@@ -338,6 +372,14 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
         if s > 0 {
             out.push_str(rng.pick(&seps));
         }
+        // Commands run by wrappers, remote and container commands, user switches, find -exec, string runners,
+        // heredoc output, variables, scripts written and run, case patterns: `@@` is a rule's command.
+        if rng.chance(8) {
+            let t = WRAPPED_TEMPLATES[rng.below(WRAPPED_TEMPLATES.len())];
+            let body = heredoc_bodies[rng.below(heredoc_bodies.len())].replace("PIP", p);
+            out.push_str(&t.replace("@@", &body));
+            continue;
+        }
         if rng.chance(15) {
             out.push_str(rng.pick(&prefixes));
             out.push(' ');
@@ -574,6 +616,81 @@ fn nested_kind(input: &str) -> Option<&'static str> {
     }
 }
 
+/// Which Rust-only reading of a wrapped command the hook input's command holds, if any (all after the Python
+/// reading passed): case patterns in `$(...)`, heredoc output run, variables, scripts written and run, ssh,
+/// find -exec, user switches, containers, string runners, argv wrappers with options.
+fn wrapped_kind(input: &str) -> Option<&'static str> {
+    let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+    let cmd = v["tool_input"]["command"].as_str().unwrap_or("");
+    let words: Vec<&str> = cmd
+        .split(|c: char| c.is_whitespace() || ";&|()\"'`".contains(c))
+        .filter(|w| !w.is_empty())
+        .map(unquoted_base)
+        .collect();
+    let has = |names: &[&str]| words.iter().any(|w| names.contains(w));
+    let assigned = words
+        .iter()
+        .filter_map(|w| w.split_once('='))
+        .any(|(n, _)| {
+            !n.is_empty()
+                && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && (cmd.contains(&format!("${n}")) || cmd.contains(&format!("${{{n}}}")))
+        });
+    if cmd.contains("$(case") {
+        Some("case-in-substitution")
+    } else if (cmd.contains("$(") || cmd.contains("<(")) && cmd.contains("<<") {
+        Some("heredoc-output-run")
+    } else if assigned {
+        Some("variable-expansion")
+    } else if cmd.contains(".sh") && (cmd.contains('>') || cmd.contains("tee")) {
+        Some("script-file")
+    } else if has(&["ssh"]) {
+        Some("ssh-command")
+    } else if has(&["-exec", "-execdir", "-ok", "-okdir"]) {
+        Some("find-exec")
+    } else if has(&["su", "runuser", "sg"]) {
+        Some("user-switch")
+    } else if has(&[
+        "docker",
+        "podman",
+        "nerdctl",
+        "docker-compose",
+        "kubectl",
+        "oc",
+    ]) {
+        Some("container-command")
+    } else if has(&["watch", "script", "flock"]) || cmd.contains("env -S") {
+        Some("string-runner")
+    } else if has(&[
+        "timeout",
+        "gtimeout",
+        "caffeinate",
+        "stdbuf",
+        "arch",
+        "nice",
+        "env",
+        "xargs",
+        "setsid",
+        "ionice",
+        "chroot",
+        "taskset",
+        "chrt",
+        "unbuffer",
+        "sandbox-exec",
+        "doas",
+        "pkexec",
+        "exec",
+        "time",
+        "command",
+        "nohup",
+        "builtin",
+    ]) {
+        Some("argv-wrapper")
+    } else {
+        None
+    }
+}
+
 /// True if a line of the hook input's command has a `<<WORD` followed by a pipe into a shell, `source` or `.`, on
 /// that line or, when the line ends in `|`, as the first word of a later line.
 fn heredoc_piped_to_shell(input: &str) -> bool {
@@ -640,7 +757,9 @@ fn piped_into_shell(cmd: &str) -> bool {
             .split(|c: char| c.is_whitespace() || "();&".contains(c))
             .find(|x| !x.is_empty() && !x.contains('='))
             .unwrap_or("");
-        let first = unquoted_base(first);
+        // A backslash inside a word only quotes the next letter (`z\\sh` is zsh).
+        let first = unquoted_base(first).replace('\\', "");
+        let first = first.as_str();
         printer
             && [
                 "bash", "sh", "zsh", "dash", "ksh", "source", ".", "env", "timeout",
@@ -913,6 +1032,9 @@ fn known_difference(
     if reference.stdout.is_empty() && rust_blocks {
         // A `<<WORD` inside quotes or a comment is no heredoc in Rust's newline pass (a heredoc in a quoted `-c`
         // string stays in the string, checked on its own); the Python guard cut its "body" out of the string.
+        if let Some(kind) = wrapped_kind(input) {
+            return Some(kind);
+        }
         // A cat or tee heredoc piped into a shell runs its body in Rust's newline pass; the Python guard read the
         // body as data.
         if heredoc_piped_to_shell(input) {

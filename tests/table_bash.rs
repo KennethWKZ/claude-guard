@@ -1311,6 +1311,345 @@ fn heredoc_through_filters_and_next_line_pipes_every_rule() {
     );
 }
 
+/// Each rule's command and the words its deny reason holds.
+const EVERY_RULE: &[(&str, &str)] = &[
+    ("sudo ls", "sudo is blocked"),
+    ("rm -rf /srv/app", "recursive force delete"),
+    ("cat .env", ".env"),
+    ("grep -r token .", "recursive grep"),
+    ("rg --hidden token", "rg with --hidden"),
+    ("git push -f", "git push --force"),
+    ("rust-anything build rust/util", "rust-anything build"),
+];
+
+/// Runs every template (`C` = a rule's command, `⏎` = newline) with every rule's command (deny with its reason) and
+/// with a pip install (exit 2), and each allow case; fails listing every miss.
+fn every_rule_table(templates: &[&str], allow: &[&str]) {
+    let pip = format!("{} install y", "pip"); // kept apart so this file's text doesn't trip the live pip hook
+    let mut fails = Vec::new();
+    let mut checked = 0;
+    for t in templates {
+        for (c, want) in EVERY_RULE {
+            let cmd = t.replace('C', c).replace('⏎', "\n");
+            let o = run(&["bash"], &bash_input(&cmd));
+            checked += 1;
+            if !(o.code == 0
+                && o.stdout.contains("\"permissionDecision\": \"deny\"")
+                && o.stdout.contains(want))
+            {
+                fails.push(format!(
+                    "want deny ({want}) :: {cmd:?} -> {}",
+                    o.stdout.trim()
+                ));
+            }
+        }
+        let cmd = t.replace('C', &pip).replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&cmd));
+        if (o.code, o.stdout.as_str()) != (2, "") {
+            fails.push(format!(
+                "want pip :: {cmd:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in allow {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(checked > 0);
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+#[test]
+fn case_patterns_in_substitutions_every_rule() {
+    every_rule_table(
+        &[
+            // A case pattern's `)` doesn't end the `$(...)`, so the heredoc in the arm is still code.
+            "x=\"$(case $y in a) bash <<EOF;; esac⏎C⏎EOF⏎)\"",
+            "x=\"$(case $y in (a) sh <<EOF;; esac⏎C⏎EOF⏎)\"",
+            "x=\"$(case $y in a) ;; b) bash <<EOF;; esac⏎C⏎EOF⏎)\"",
+            // A heredoc behind `then` or an assignment.
+            "if true; then bash <<EOF⏎C⏎EOF⏎fi",
+            "X=1 bash <<EOF⏎C⏎EOF",
+            // In "..." a `<<WORD` is text (bash reads no heredoc there): the lines after it are commands.
+            "echo \"see <<EOF\"⏎C",
+            "echo \"$(echo esac) <<EOF\"⏎C",
+            // A "..." string run as a command is checked with its heredoc.
+            "bash -c \"bash <<EOF⏎C⏎EOF\"",
+            "eval \"cat <<EOF | sh⏎C⏎EOF\"",
+        ],
+        &[
+            "git commit -m \"$(case $x in a) ;; esac; cat <<'EOF'⏎Fix \"odd⏎sudo ls⏎EOF⏎)\"",
+            "x=\"$(case $y in a) cat <<EOF;; esac⏎sudo ls⏎EOF⏎)\"",
+            "echo \"case <<EOF\"⏎ls",
+            "echo case; x=\"$(echo a)\"⏎ls",
+        ],
+    );
+}
+
+#[test]
+fn argv_wrappers_every_rule() {
+    every_rule_table(
+        &[
+            "timeout 9 C",
+            "timeout -s KILL 9 C",
+            "timeout --signal=KILL -k 5 9 C",
+            "gtimeout 9 C",
+            "caffeinate -i C",
+            "caffeinate -t 60 C",
+            "stdbuf -oL C",
+            "nice -n 5 C",
+            "nice -5 C",
+            "env -i C",
+            "env -u HOME FOO=1 C",
+            "xargs -I{} C",
+            "xargs -n 1 -P 4 C",
+            "setsid C",
+            "ionice -c3 C",
+            "ionice -c 2 -n 7 C",
+            "arch -arm64 C",
+            "arch -arch x86_64 C",
+            "chroot /x C",
+            "taskset 0x1 C",
+            "chrt 10 C",
+            "unbuffer C",
+            "sandbox-exec -p '(version 1)' C",
+            "doas C",
+            "pkexec C",
+            "exec -a name C",
+            "time -p C",
+            "timeout 9 nice -n 5 env -i C",
+            "cd x && timeout 9 C",
+        ],
+        &[
+            "command -v sudo",
+            "timeout 9 ls -la",
+            "nice -n 5 cargo build",
+            "env -i PATH=/usr/bin ls",
+            "xargs -I{} echo {}",
+            "caffeinate -i cargo test",
+        ],
+    );
+}
+
+#[test]
+fn ssh_strings_every_rule() {
+    every_rule_table(
+        &[
+            "ssh host C",
+            "ssh host 'C'",
+            "ssh -p 22 -i key.pem host 'C'",
+            "ssh -o BatchMode=yes host 'C'",
+            "ssh -tt -- user@host 'C'",
+            "ssh -J bastion host \"cd /app && C\"",
+            "ssh host bash -c \"'C'\"",
+            // stdin to a remote shell
+            "ssh host <<EOF⏎C⏎EOF",
+            "ssh host 'bash -s' <<'EOF'⏎C⏎EOF",
+            "ssh host <<< 'C'",
+            "echo 'C' | ssh host",
+            "cat <<EOF | ssh host⏎C⏎EOF",
+        ],
+        &[
+            "ssh host uptime",
+            "ssh host 'cat /tmp/x' <<< 'sudo ls'",
+            "ssh -p 22 host 'ls -la /srv'",
+            "ssh host",
+            "scp a host:/tmp/a",
+        ],
+    );
+}
+
+#[test]
+fn find_exec_every_rule() {
+    every_rule_table(
+        &[
+            "find . -exec C {} +",
+            "find . -name x -exec C {} \\;",
+            "find . -execdir C \\;",
+            "find . -ok C {} \\;",
+            "find . -type f -exec sh -c 'C' \\;",
+            "find . -exec bash -c 'C' _ {} +",
+        ],
+        &[
+            "find . -name '*.tmp' -exec rm -rf {} +",
+            "find /tmp/x -exec rm -rf {} +",
+            "find . -exec ls -la {} +",
+            "find . -name x -print",
+        ],
+    );
+    // `{}` is each start path.
+    let o = run(
+        &["bash"],
+        &bash_input("find /srv/old -mtime +7 -exec rm -rf {} +"),
+    );
+    assert!(o.stdout.contains("recursive force delete"), "{}", o.stdout);
+}
+
+#[test]
+fn user_switch_strings_every_rule() {
+    every_rule_table(
+        &[
+            "su -c 'C'",
+            "su root -c 'C'",
+            "su - app -c 'C'",
+            "su --command='C' app",
+            "su -l app --command 'C'",
+            "runuser -c 'C' app",
+            "runuser -u app -- C",
+            "runuser -u app C",
+            "sg docker -c 'C'",
+            "sg docker 'C'",
+        ],
+        &[
+            "su -c 'ls -la' app",
+            "runuser -u app -- ls",
+            "sg docker -c 'docker ps'",
+        ],
+    );
+}
+
+#[test]
+fn container_commands_every_rule() {
+    every_rule_table(
+        &[
+            "docker exec web C",
+            "docker exec -it web sh -c 'C'",
+            "docker exec -u root -w /app web bash -c 'C'",
+            "docker exec -e A=1 --env-file e web C",
+            "docker container exec web C",
+            "docker --context prod exec web C",
+            "docker run --rm node:22 C",
+            "docker run --rm -v a:/b -e X=1 -p 80:80 --name n node:22 sh -c 'C'",
+            "docker run --entrypoint sh img -c 'C'",
+            "podman exec web C",
+            "nerdctl run img C",
+            "docker compose exec app C",
+            "docker compose -f dc.yml run --rm app sh -c 'C'",
+            "docker-compose exec app bash -c 'C'",
+            "kubectl exec pod -- C",
+            "kubectl -n prod exec -it pod -c app -- sh -c 'C'",
+            "oc exec pod -- C",
+            // stdin into a shell in the container
+            "docker exec -i web sh <<EOF⏎C⏎EOF",
+            "docker exec -i web sh <<< 'C'",
+            "echo 'C' | kubectl exec -i pod -- bash",
+        ],
+        &[
+            "docker ps",
+            "docker run --rm node:22 node -v",
+            "docker exec web ls -la",
+            "docker compose up -d",
+            "kubectl get pods",
+            "kubectl exec pod -- ls",
+            "docker logs web",
+        ],
+    );
+}
+
+#[test]
+fn string_runners_every_rule() {
+    every_rule_table(
+        &[
+            "watch 'C'",
+            "watch -n 1 'C'",
+            "watch --interval 5 -d C",
+            "script -q /dev/null C",
+            "script -c 'C' /tmp/log",
+            "flock /tmp/l -c 'C'",
+            "flock -w 5 /tmp/l C",
+            "env -S 'C'",
+            "env -S'C'",
+        ],
+        &[
+            "watch -n 1 'ls -la'",
+            "script -q /dev/null ls",
+            "flock /tmp/l -c 'ls'",
+            "env -S 'ls -la'",
+        ],
+    );
+}
+
+#[test]
+fn heredoc_output_run_every_rule() {
+    every_rule_table(
+        &[
+            "eval \"$(cat <<EOF⏎C⏎EOF⏎)\"",
+            "eval \"$(cat <<'EOF'⏎C⏎EOF⏎)\"",
+            "bash -c \"$(cat <<EOF⏎C⏎EOF⏎)\"",
+            "$(cat <<EOF⏎C⏎EOF⏎)",
+            "bash <(cat <<EOF⏎C⏎EOF⏎)",
+            "source <(cat <<EOF⏎C⏎EOF⏎)",
+            ". <(sed s/a/b/ <<EOF⏎C⏎EOF⏎)",
+            "timeout 9 bash <<EOF⏎C⏎EOF",
+            "env bash <<EOF⏎C⏎EOF",
+        ],
+        &[
+            "x=\"$(cat <<EOF⏎sudo ls⏎EOF⏎)\"",
+            "echo \"$(cat <<EOF⏎sudo ls⏎EOF⏎)\"",
+            "git commit -m \"$(cat <<'EOF'⏎sudo ls⏎EOF⏎)\"",
+            "diff <(cat <<EOF⏎sudo ls⏎EOF⏎) b.txt",
+        ],
+    );
+}
+
+#[test]
+fn variables_every_rule() {
+    every_rule_table(
+        &[
+            "c='C'; bash -c \"$c\"",
+            "c='C'⏎eval \"$c\"",
+            "export c='C'; sh -c \"${c}\"",
+            "local c='C'; $c",
+            "c='C'; $c",
+            "c=\"C\" && ssh host \"$c\"",
+            "declare -r c='C'; echo \"$c\" | bash",
+        ],
+        &[
+            "msg='sudo ls is blocked'; echo \"$msg\"",
+            "d=$(mktemp -d); rm -rf \"$d\"",
+            "d=/tmp/x; rm -rf \"$d\"",
+            "PATH=$PATH:/x; ls",
+            "c='git status'; $c",
+        ],
+    );
+    let o = run(&["bash"], &bash_input("d=/srv/app; rm -rf \"$d\""));
+    assert!(o.stdout.contains("recursive force delete"), "{}", o.stdout);
+}
+
+#[test]
+fn scripts_written_and_run_every_rule() {
+    every_rule_table(
+        &[
+            "cat > run.sh <<EOF⏎C⏎EOF⏎bash run.sh",
+            "cat <<'EOF' > run.sh⏎C⏎EOF⏎chmod +x run.sh && ./run.sh",
+            "cat >> /tmp/run.sh <<EOF⏎C⏎EOF⏎sh /tmp/run.sh",
+            "tee run.sh <<EOF >/dev/null⏎C⏎EOF⏎source ./run.sh",
+            "echo 'C' > run.sh; sh ./run.sh",
+            "printf '%s\\n' 'C' > run.sh && . run.sh",
+            "cat > run.sh <<EOF⏎C⏎EOF⏎timeout 9 bash -x run.sh",
+        ],
+        &[
+            "cat > notes.md <<EOF⏎sudo ls⏎EOF⏎cat notes.md",
+            "echo 'sudo ls' > notes.txt; wc -l notes.txt",
+            "cat > run.sh <<EOF⏎ls -la⏎EOF⏎bash run.sh",
+            "cat > a.sh <<EOF⏎sudo ls⏎EOF⏎bash b.sh",
+            // A segment that is only a redirection (crashed once).
+            "> run.sh",
+            "gojq$( > head",
+        ],
+    );
+}
+
 #[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).

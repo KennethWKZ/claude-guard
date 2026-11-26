@@ -153,7 +153,29 @@ blocked keeps its reason. A heredoc is read only where bash reads one: outside q
 longer hides the lines after it. A heredoc whose command's output is piped into a shell that runs its input (`cat <<EOF | bash`,
 `| sh -s`, `| source /dev/stdin`, through filters such as `sed <<EOF | bash` or `cat <<EOF | sed … | bash`, and
 `cat <<EOF |` with the shell on the first command line after the body) has its body checked as commands, as written:
-what a filter changes isn't known, so a filter that adds a blocked command isn't caught. A quoting error in the command allows it, so a typo never locks
+what a filter changes isn't known, so a filter that adds a blocked command isn't caught. Heredocs fed through a
+wrapper (`timeout 9 bash <<EOF`, `ssh host <<EOF`) or whose output is run (`eval "$(cat <<EOF …)"`, `$(cat <<EOF …)` as
+a command, `bash <(cat <<EOF …)`) count as fed to a shell, and a `case` pattern's `)` doesn't end a `$(…)`.
+
+The rules also hold for what a wrapper runs (Rust only):
+
+- argv wrappers with their options: `timeout -s KILL 9`, `nice -n 5`, `env -i X=1`, `xargs -I{}`, `caffeinate -i`,
+  `stdbuf -oL`, `setsid`, `ionice -c3`, `arch -arm64`, `chroot DIR`, `taskset`, `chrt`, `unbuffer`, `sandbox-exec`,
+  `doas`, `pkexec`;
+- `ssh [options] HOST CMD…` (the remote command, joined as ssh sends it), and `ssh HOST` reading a heredoc, a
+  here-string or a pipe;
+- containers: `docker|podman|nerdctl exec|run` (with `--entrypoint`), `docker compose exec|run`, `docker-compose`,
+  `kubectl|oc exec … -- CMD`, and `-i` with a heredoc, here-string or pipe into a shell in the container;
+- user switches: `su -c '…'`, `runuser -c '…'`, `runuser -u USER -- CMD`, `sg GROUP -c '…'`;
+- `find … -exec|-execdir|-ok|-okdir CMD {} +|;`, with `{}` read as each start path (`find /srv/old -exec rm -rf {} +`);
+- string runners: `watch '…'`, `script -c '…'` and macOS `script FILE CMD`, `flock FILE -c '…'`, `env -S '…'`;
+- variables set in the same command: `c='sudo ls'; bash -c "$c"`, `$c` as the command, `rm -rf "$d"` after
+  `d=/srv/app` (the command is checked once more with the values put in);
+- scripts written and run in the same command: `cat > run.sh <<EOF … EOF` or `echo … > run.sh`, then `bash run.sh`,
+  `source run.sh` or `./run.sh`.
+
+A script file that already exists (`bash scripts/x.sh`, `cat file | bash`) isn't read: the guard sees only the
+command text. A quoting error in the command allows it, so a typo never locks
 the shell; any other failure blocks it and is logged. Input nested too deep to check blocks.
 
 ### `claude-guard read`
