@@ -2,6 +2,8 @@
 //! localhost ports with temp logs. Every generated datagram goes to both in lock-step, followed by a sentinel
 //! query, so "no reply" is seen without timeouts; replies must match byte for byte, and the web.log lines (time
 //! left out) must match in order, which also covers the once-a-minute log limit and its 5,000-name reset.
+//! The sentinel's own lines are left out of that comparison: each server first logs it at its own start, so once
+//! a run passes 60 s (a loaded Mac) the two log it again at different packets. Both must still have logged it.
 //! Reference: dns-nxdomain.py (default ~/.local/share/claude-guard/dns-nxdomain.py). Names are made up.
 //! Env (test only): CLAUDE_GUARD_REF_DNS, CLAUDE_GUARD_DIFF_CASES (default 3000), CLAUDE_GUARD_DIFF_SEED.
 
@@ -224,17 +226,24 @@ fn differential_dns() {
         }
     }
     std::thread::sleep(Duration::from_millis(200));
-    let read = |p: &str| -> Vec<String> {
-        std::fs::read_to_string(p)
+    // (log lines without their time, sentinel lines dropped; how many sentinel lines there were)
+    let read = |p: &str| -> (Vec<String>, usize) {
+        let lines: Vec<String> = std::fs::read_to_string(p)
             .unwrap_or_default()
             .lines()
             .map(|l| {
                 l.find(", \"mode\"")
                     .map_or(l.to_string(), |i| l[i..].to_string())
             })
-            .collect()
+            .collect();
+        let is_sentinel = |l: &String| l.contains("\"name\": \"sentinel.test\",");
+        let sentinels = lines.iter().filter(|l| is_sentinel(l)).count();
+        (
+            lines.into_iter().filter(|l| !is_sentinel(l)).collect(),
+            sentinels,
+        )
     };
-    let (pl, rl) = (read(&py_log), read(&rs_log));
+    let ((pl, py_sentinels), (rl, rs_sentinels)) = (read(&py_log), read(&rs_log));
     use std::os::unix::fs::PermissionsExt;
     let modes = [&py_log, &rs_log].map(|p| {
         std::fs::metadata(p)
@@ -255,6 +264,10 @@ fn differential_dns() {
         "{} different (first 8):\n{}",
         bad.len(),
         bad.iter().take(8).cloned().collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        py_sentinels > 0 && rs_sentinels > 0,
+        "sentinel logged: python {py_sentinels}, rust {rs_sentinels}"
     );
     assert_eq!(pl.len(), rl.len(), "log line counts");
     let diff: Vec<_> = pl
