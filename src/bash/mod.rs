@@ -26,8 +26,8 @@
 //! and backticks. A heredoc inside a quoted `bash -c '...'` string stays in the string and is checked with it; the
 //! Python guard's reading cut the "body" out of the string, which then failed to parse and was allowed.
 //! A heredoc whose command's output is piped into a shell that runs its stdin (`cat <<EOF | bash`, `sed ... <<EOF |
-//! sh`, `cat <<EOF |` with `bash` on the line after the body) has its body checked as written too; the Python guard
-//! read it as data. Heredocs behind a wrapper (`timeout 9 bash <<EOF`, `ssh host <<EOF`) or whose output is run
+//! sh`, `cat <<EOF |` with `bash` on the line after the body) has its body checked too, as written and as sed, awk
+//! or `perl -pe` filters on the way would turn it (`filters`); the Python guard read it as data. Heredocs behind a wrapper (`timeout 9 bash <<EOF`, `ssh host <<EOF`) or whose output is run
 //! (`eval "$(cat <<EOF`, `bash <(cat <<EOF`) count as fed to a shell; a `case` pattern's `)` doesn't end `$(...)`.
 //!
 //! The rules also hold for what a wrapper runs (`wrappers`: argv wrappers with options, ssh, containers, su/runuser/
@@ -44,6 +44,7 @@
 //! shell); any other failure blocks it (fail closed) and is logged. Besides the command text, it reads only the
 //! script files the command runs (see `scripts`).
 
+mod filters;
 mod scripts;
 mod wrappers;
 
@@ -454,9 +455,11 @@ fn code_mask(line: &[char], stack: &mut Vec<Ctx>) -> (Vec<bool>, bool) {
 /// known because the line ends in `|` and the pipeline goes on after the heredoc bodies.
 #[derive(PartialEq)]
 enum Pipe {
-    Shell,
+    /// Reaches a shell, through these filters.
+    Shell(Vec<Vec<String>>),
     Data,
-    NextLine,
+    /// Goes on after the bodies, through these filters so far.
+    NextLine(Vec<Vec<String>>),
 }
 
 /// Follows a pipeline through its segments: any filter on the way (`sed`, `grep`, `tr`) passes the body on.
@@ -466,16 +469,20 @@ fn pipe_walk(text: &str, from_first: bool) -> Pipe {
         return Pipe::Data;
     };
     let segs = segments_with_seps(tokens);
+    let mut chain: Vec<Vec<String>> = Vec::new();
     for (k, (seg, sep)) in segs.iter().enumerate() {
         if (k > 0 || from_first) && runs_stdin(seg) {
-            return Pipe::Shell;
+            return Pipe::Shell(chain);
+        }
+        if k > 0 || from_first {
+            chain.push(seg.clone());
         }
         if sep != "|" {
             return Pipe::Data;
         }
     }
     // Ended in `|`, or a blank or comment-only line: the pipeline goes on.
-    Pipe::NextLine
+    Pipe::NextLine(chain)
 }
 
 /// Remove heredoc bodies (data for the command that reads them); bodies a shell reads come back to be checked.
@@ -494,8 +501,11 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
     let mut stack = vec![CODE];
     // Bodies written to a file (`cat > run.sh <<EOF`): (file, body), for a later `bash run.sh` in the command.
     let mut written: Vec<(String, String)> = Vec::new();
-    // (strip leading tabs, delimiter, body fed to a shell, pipeline goes on after the bodies, file written)
-    let mut pending: Vec<(bool, String, bool, bool, Option<String>)> = Vec::new();
+    // (strip leading tabs, delimiter, fed to a shell through these filters, pipeline goes on after the bodies
+    // through these filters, file written)
+    type Chain = Vec<Vec<String>>;
+    type Pending = (bool, String, Option<Chain>, Option<Chain>, Option<String>);
+    let mut pending: Vec<Pending> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -527,14 +537,22 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
             }
             let mut shell_reads = first_word.is_some_and(|w| contains(SHELLS, pyfs::basename(w)));
             let mut target = None;
+            // The command reading the heredoc, a filter itself when its output goes on (`sed ... <<EOF | bash`).
+            let mut producer: Vec<String> = Vec::new();
             if quoted {
                 let piece = before
                     .rsplit([';', '&', '|', '(', ')'])
                     .next()
                     .unwrap_or("");
                 // Behind a wrapper: `timeout 9 bash <<EOF`, `ssh host <<EOF`, `docker exec -i c sh <<EOF`.
-                if let Ok(tokens) = shlex::split_lines(piece) {
-                    shell_reads |= raw_segments(&tokens).last().is_some_and(|s| runs_stdin(s));
+                // Lexed whole first, so quoted `;`, `&` or `(` in its arguments (`sed 's/.*/x &/'`) stay in them;
+                // the split piece when the line doesn't lex alone (`x="$(cat <<EOF`).
+                let tokens = shlex::split_lines(&before).or_else(|_| shlex::split_lines(piece));
+                if let Ok(tokens) = tokens {
+                    if let Some(seg) = raw_segments(&tokens).pop() {
+                        shell_reads |= runs_stdin(&seg);
+                        producer = seg;
+                    }
                 }
                 // Its output run as commands: `eval "$(cat <<EOF`, `bash <(cat <<EOF`.
                 shell_reads |= output_runs(&before);
@@ -549,21 +567,27 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
             } else {
                 Pipe::Data
             };
-            pending.push((
-                tabs,
-                delim,
-                shell_reads || pipe == Pipe::Shell,
-                pipe == Pipe::NextLine,
-                target,
-            ));
+            let with_producer = |mut filters: Chain| {
+                if !producer.is_empty() {
+                    filters.insert(0, producer.clone());
+                }
+                filters
+            };
+            let (feed, next) = match pipe {
+                _ if shell_reads => (Some(Vec::new()), None),
+                Pipe::Shell(filters) => (Some(with_producer(filters)), None),
+                Pipe::NextLine(filters) => (None, Some(with_producer(filters))),
+                Pipe::Data => (None, None),
+            };
+            pending.push((tabs, delim, feed, next, target));
         }
         let ready = !quoted
             || (!continued && matches!(stack.last(), Some(Ctx::Code { .. } | Ctx::Backtick)));
         if !ready {
             continue;
         }
-        let mut pipe_next: Vec<String> = Vec::new();
-        for (tabs, delim, to_shell, next, target) in pending.drain(..) {
+        let mut pipe_next: Vec<(String, Chain)> = Vec::new();
+        for (tabs, delim, feed, next, target) in pending.drain(..) {
             let mut body: Vec<&str> = Vec::new();
             while i < lines.len() {
                 let body_line = lines[i];
@@ -581,22 +605,30 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>, Vec<(Str
             if let Some(f) = target {
                 written.push((f, body.join("\n")));
             }
-            if to_shell {
-                run_as_shell.push(body.join("\n"));
-            } else if next {
-                pipe_next.push(body.join("\n"));
+            let body = body.join("\n");
+            if let Some(chain) = feed {
+                run_as_shell.extend(filters::outputs(&chain, &body));
+            } else if let Some(chain) = next {
+                pipe_next.push((body, chain));
             }
         }
         // `cat <<EOF |`: the pipeline goes on at the first command line after the bodies.
         if !pipe_next.is_empty() {
             for later in &lines[i..] {
                 match pipe_walk(later, true) {
-                    Pipe::Shell => {
-                        run_as_shell.append(&mut pipe_next);
+                    Pipe::Shell(more) => {
+                        for (body, mut chain) in pipe_next.drain(..) {
+                            chain.extend(more.iter().cloned());
+                            run_as_shell.extend(filters::outputs(&chain, &body));
+                        }
                         break;
                     }
                     Pipe::Data => break,
-                    Pipe::NextLine => {}
+                    Pipe::NextLine(more) => {
+                        for (_, chain) in pipe_next.iter_mut() {
+                            chain.extend(more.iter().cloned());
+                        }
+                    }
                 }
             }
         }
@@ -842,11 +874,35 @@ fn printed_lines(seg: &[String]) -> Option<Vec<String>> {
 
 /// Scripts piped into something that runs stdin: `echo 'sudo ls' | bash`, `printf ... | source /dev/stdin`.
 fn piped_scripts(segs: &[(Vec<String>, String)]) -> Vec<String> {
-    segs.windows(2)
-        .filter(|w| w[0].1 == "|" && runs_stdin(&w[1].0))
-        .filter_map(|w| printed_lines(&w[0].0))
-        .flatten()
-        .collect()
+    let mut out = Vec::new();
+    for (i, (seg, sep)) in segs.iter().enumerate() {
+        if sep != "|" {
+            continue;
+        }
+        let Some(lines) = printed_lines(seg) else {
+            continue;
+        };
+        // Through filters (`echo ls | sed 's/^/sudo /' | bash`) to a shell that runs its stdin.
+        let mut chain: Vec<Vec<String>> = Vec::new();
+        for (next, next_sep) in &segs[i + 1..] {
+            if runs_stdin(next) {
+                for text in filters::outputs(&chain, &lines.join("\n")) {
+                    out.extend(
+                        text.split('\n')
+                            .filter(|l| !l.trim().is_empty())
+                            .map(str::to_string),
+                    );
+                }
+                break;
+            }
+            if next_sep != "|" {
+                break;
+            }
+            chain.push(next.clone());
+        }
+    }
+    out.dedup();
+    out
 }
 
 fn is_secret_env(token: &str) -> bool {
@@ -1130,7 +1186,7 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
     {
         return true;
     }
-    disk.iter().any(|(file, explicit)| {
+    disk.iter().any(|(file, explicit, chain)| {
         let scripts::Script::Text(text, canon) =
             scripts::read_script(file, cwd_str(cwd), *explicit)
         else {
@@ -1139,7 +1195,9 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
         if !scripts::enter(&canon) {
             return false;
         }
-        let hit = PIP.is_match(&text) || pip_in_nested(&text, cwd, depth + 1);
+        let hit = filters::outputs(chain, &text)
+            .iter()
+            .any(|t| PIP.is_match(t) || pip_in_nested(t, cwd, depth + 1));
         scripts::leave(&canon);
         hit
     })
@@ -1251,32 +1309,51 @@ fn scripts_run(raw_segs: &[Vec<String>], written: &mut Vec<(String, String)>) ->
 /// Script files on disk a command runs: (path as written, fed to a shell explicitly). `bash FILE`, `source FILE`,
 /// `./FILE` (`runs_file`), `cat FILE... | bash`, `bash < FILE`; files written in the same command are left to
 /// `scripts_run`.
+/// (path as written, fed to a shell explicitly, filters on the way: `cat x | sed ... | bash`)
+type FileRun = (String, bool, Vec<Vec<String>>);
+
 fn files_run(
     raw_segs: &[Vec<String>],
     segs: &[(Vec<String>, String)],
     written: &[(String, String)],
-) -> Vec<(String, bool)> {
-    let mut out: Vec<(String, bool)> = raw_segs.iter().filter_map(|s| runs_file(s)).collect();
-    for w in segs.windows(2) {
-        if w[0].1 == "|" && pyfs::basename(&w[0].0[0]) == "cat" && runs_stdin(&w[1].0) {
-            out.extend(
-                strip_redirs(&w[0].0[1..])
-                    .into_iter()
-                    .filter(|a| !a.starts_with('-'))
-                    .map(|a| (a, true)),
-            );
+) -> Vec<FileRun> {
+    let mut out: Vec<FileRun> = raw_segs
+        .iter()
+        .filter_map(|s| runs_file(s))
+        .map(|(f, e)| (f, e, Vec::new()))
+        .collect();
+    // `cat FILE | [filters |] bash`.
+    for (i, (seg, sep)) in segs.iter().enumerate() {
+        if sep != "|" || pyfs::basename(&seg[0]) != "cat" {
+            continue;
+        }
+        let mut chain: Vec<Vec<String>> = Vec::new();
+        for (next, next_sep) in &segs[i + 1..] {
+            if runs_stdin(next) {
+                out.extend(
+                    strip_redirs(&seg[1..])
+                        .into_iter()
+                        .filter(|a| !a.starts_with('-'))
+                        .map(|a| (a, true, chain.clone())),
+                );
+                break;
+            }
+            if next_sep != "|" {
+                break;
+            }
+            chain.push(next.clone());
         }
     }
     for rs in raw_segs {
         if let Some(i) = rs.iter().position(|w| w == "<") {
             if runs_stdin(rs) {
                 if let Some(f) = rs.get(i + 1) {
-                    out.push((f.clone(), true));
+                    out.push((f.clone(), true, Vec::new()));
                 }
             }
         }
     }
-    out.retain(|(f, _)| !written.iter().any(|(w, _)| same_path(w, f)));
+    out.retain(|(f, _, _)| !written.iter().any(|(w, _)| same_path(w, f)));
     out
 }
 
@@ -1510,7 +1587,7 @@ fn check_mode(
     }
     // Scripts written and run in the same command (newline pass): `cat > run.sh <<EOF ...; bash run.sh`,
     // `echo '...' > run.sh && ./run.sh`.
-    let mut disk: Vec<(String, bool)> = Vec::new();
+    let mut disk: Vec<FileRun> = Vec::new();
     if lines {
         nested.extend(scripts_run(&raw_segs, &mut written));
         // Script files on disk it runs (`bash scripts/x.sh`, `cat x | bash`), checked last.
@@ -1649,13 +1726,19 @@ fn check_mode(
             return Ok(Some(r));
         }
     }
-    for (file, explicit) in disk {
+    for (file, explicit, chain) in disk {
         match scripts::read_script(&file, cwd_str(cwd), explicit) {
             scripts::Script::Text(text, canon) => {
                 if !scripts::enter(&canon) {
                     continue; // already being checked
                 }
-                let r = check_mode(&text, cwd, depth + 1, lines, true);
+                let mut r = Ok(None);
+                for t in filters::outputs(&chain, &text) {
+                    r = check_mode(&t, cwd, depth + 1, lines, true);
+                    if !matches!(r, Ok(None)) {
+                        break;
+                    }
+                }
                 scripts::leave(&canon);
                 if let Some(r) = r? {
                     return Ok(Some(r));

@@ -106,6 +106,7 @@ const SCRIPT_RUNS: &[&str] = &[
     "bash run/ok.sh",
     "bash -n run/sudo.sh",
     "cat run/sudo.sh",
+    "cat run/ok.sh | sed 's/^/sudo /' | bash",
 ];
 
 const WRAPPED_TEMPLATES: &[&str] = &[
@@ -148,6 +149,13 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "[ ! -f .env ] && touch .env",
     "test ! -e .envrc",
     "if true; then @@; fi",
+    "sed 's#^#@@ #' <<EOF | bash\nx\nEOF\n",
+    "sed -E 's#(.*)#@@#' <<'EOF' | sh\nls\nEOF\n",
+    "sed '1i @@' <<EOF | bash\nls\nEOF\n",
+    "cat <<EOF | sed 's#^#@@ #' | bash\nx\nEOF\n",
+    "echo x | sed 's#^#@@ #' | bash",
+    "awk '{print \"@@ \" $0}' <<EOF | sh\nx\nEOF\n",
+    "perl -pe 's#^#@@ #' <<EOF | bash\nx\nEOF\n",
     "{ @@; }",
 ];
 
@@ -662,12 +670,13 @@ fn nested_kind(input: &str) -> Option<&'static str> {
 fn wrapped_kind(input: &str) -> Option<&'static str> {
     let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let cmd = v["tool_input"]["command"].as_str().unwrap_or("");
-    let words: Vec<&str> = cmd
+    // A backslash inside a word only quotes the next letter (`do\\cker` is docker).
+    let words: Vec<String> = cmd
         .split(|c: char| c.is_whitespace() || ";&|()\"'`".contains(c))
         .filter(|w| !w.is_empty())
-        .map(unquoted_base)
+        .map(|w| unquoted_base(w).replace('\\', ""))
         .collect();
-    let has = |names: &[&str]| words.iter().any(|w| names.contains(w));
+    let has = |names: &[&str]| words.iter().any(|w| names.contains(&w.as_str()));
     let assigned = words
         .iter()
         .filter_map(|w| w.split_once('='))
@@ -679,6 +688,9 @@ fn wrapped_kind(input: &str) -> Option<&'static str> {
     // `./ru\\n/x.sh` is ./run/x.sh to bash: a backslash quotes the next letter.
     if cmd.replace('\\', "").contains("run/") {
         Some("script-on-disk")
+    } else if ["sed ", "awk ", "perl "].iter().any(|f| cmd.contains(f)) && cmd.contains('|') {
+        // A filter on the way to a shell builds the command (`sed 's/^/sudo /' <<EOF | bash`).
+        Some("filter-built")
     } else if cmd.contains("$(case") {
         Some("case-in-substitution")
     } else if (cmd.contains("$(") || cmd.contains("<(")) && cmd.contains("<<") {
@@ -769,7 +781,7 @@ fn test_bracket(input: &str) -> bool {
             .split(|c: char| c.is_whitespace() || ";&|(){}".contains(c))
             .any(|w| w == "[" || w == "test" || w.starts_with("[!"));
     has_test
-        && ["!", "(", ")", "&&", "||", "|"]
+        && ["!", "(", ")", "&", "|", "`"]
             .iter()
             .any(|op| cmd.contains(op))
 }
@@ -1109,7 +1121,8 @@ fn known_difference(
     // The rust-anything rule is Rust only (added after the port); Python allows those commands, or blocks them for
     // a later rule when Rust's check reaches the rust-anything run first (a heredoc body fed to a shell is checked
     // before the rest of the command). Same decision then; only the reason differs.
-    if reference.code == 0
+    // Also when Python only reached block-pip (exit 2) and Rust's check reached the rust-anything run first.
+    if (reference.code == 0 || (reference.code == 2 && reference.stdout.is_empty()))
         && rust.code == 0
         && rule(&rust.stdout).starts_with("rust-anything ")
         && (reference.stdout.is_empty() || reference.stdout.contains("\"deny\""))

@@ -1767,6 +1767,22 @@ fn script_files_on_disk_every_rule() {
             ));
         }
     }
+    // A harmless script turned into a blocked one by a filter on the way to the shell.
+    for cmd in [
+        "cat scripts/ok.sh | sed 's/^/sudo /' | bash",
+        "cat scripts/ok.sh | awk '{print \"sudo \" $0}' | sh",
+    ] {
+        let input =
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": dir})
+                .to_string();
+        let o = run(&["bash"], &input);
+        if !o.stdout.contains("sudo is blocked") {
+            fails.push(format!(
+                "want deny (sudo, filtered script) :: {cmd:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
     // Outside the project and temp folders (a tool or dotfile): not read.
     let outside = format!(
         "{}/claude-guard-outside-{}.sh",
@@ -1880,6 +1896,49 @@ fn substitutions_in_double_quotes_and_backticks_every_rule() {
     );
     let o = run(&["bash"], &bash_input("x=\"$(<.env)\""));
     assert!(o.stdout.contains("reading a secrets file"), "{}", o.stdout);
+}
+
+#[test]
+fn filters_that_build_commands_every_rule() {
+    // A filter on the way to a shell builds the command from a harmless body (`C` = the rule's command).
+    every_rule_table(
+        &[
+            "sed 's#^#C #' <<EOF | bash⏎x⏎EOF",
+            "sed 's#.*#C#' <<EOF | sh⏎ls⏎EOF",
+            "sed -e 's#x#C#' <<'EOF' | bash⏎x⏎EOF",
+            "sed -E 's#(.*)#C#' <<EOF | bash⏎ls⏎EOF",
+            "sed 's#\\(.*\\)#C#g' <<EOF | bash⏎ls⏎EOF",
+            "sed '1i C' <<EOF | bash⏎ls⏎EOF",
+            "sed '$a C' <<EOF | bash⏎ls⏎EOF",
+            "sed 's#a#b#;s#^#C #' <<EOF | bash⏎ls⏎EOF",
+            "gsed -n -e 's#^#C #' <<EOF | bash⏎x⏎EOF",
+            "cat <<EOF | sed 's#^#C #' | bash⏎x⏎EOF",
+            "cat <<EOF | grep -v '^$' | sed 's#^#C #' | sh -s⏎x⏎EOF",
+            "cat <<EOF |⏎x⏎EOF⏎sed 's#^#C #' | bash",
+            "awk '{print \"C \" $0}' <<EOF | bash⏎x⏎EOF",
+            "awk 'BEGIN{print \"C\"}' <<EOF | sh⏎ls⏎EOF",
+            "perl -pe 's#^#C #' <<EOF | bash⏎x⏎EOF",
+            "echo x | sed 's#^#C #' | bash",
+            "printf 'x\\n' | awk '{print \"C \" $0}' | sh",
+            "bash -c \"sed 's#^#C #' <<EOF | bash⏎x⏎EOF\"",
+            "x=\"$(sed 's#^#C #' <<EOF | bash⏎x⏎EOF⏎)\"",
+        ],
+        &[
+            "sed 's/^/# /' <<EOF | bash⏎ls⏎EOF",
+            "sed 's/^/sudo /' <<EOF⏎ls⏎EOF",
+            "sed 's/^/sudo /' <<EOF | grep x⏎ls⏎EOF",
+            "sed 's/x/y/' <<EOF | bash⏎ls -la⏎EOF",
+            "awk '{print $1}' <<EOF | bash⏎ls -la⏎EOF",
+            "echo ls | sed 's/^/echo /' | bash",
+            "git commit -m \"$(cat <<'EOF'⏎a & b; c (d) sudo⏎EOF⏎)\"",
+        ],
+    );
+    // The body as written is still checked: a filter that removes a line fails closed.
+    let o = run(
+        &["bash"],
+        &bash_input("sed 's/sudo //' <<EOF | bash\nsudo ls\nEOF"),
+    );
+    assert!(o.stdout.contains("sudo is blocked"), "{}", o.stdout);
 }
 
 #[test]

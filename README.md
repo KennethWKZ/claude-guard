@@ -154,8 +154,11 @@ blocked keeps its reason. A heredoc is read only where bash reads one: outside q
 (its body when a shell reads it, and the lines after its end marker), and a `<<WORD` inside quotes or a comment no
 longer hides the lines after it. A heredoc whose command's output is piped into a shell that runs its input (`cat <<EOF | bash`,
 `| sh -s`, `| source /dev/stdin`, through filters such as `sed <<EOF | bash` or `cat <<EOF | sed … | bash`, and
-`cat <<EOF |` with the shell on the first command line after the body) has its body checked as commands, as written:
-what a filter changes isn't known, so a filter that adds a blocked command isn't caught. Heredocs fed through a
+`cat <<EOF |` with the shell on the first command line after the body) has its body checked as commands: as written
+(so a filter that drops a line still fails closed) and as the filters would turn it. sed `s///` (basic and `-E`
+regexes, `&`, `\1`, `g`) and `i`/`a`/`c` text, awk `print` lists of literals and fields, and `perl -pe 's///'` are
+followed, so `sed 's/^/sudo /' <<EOF | bash` is caught; the same holds for `echo … | sed … | bash` and
+`cat FILE | sed … | bash`. A filter built some other way (`tr`, `rev`, variables, a sed script file) isn't followed. Heredocs fed through a
 wrapper (`timeout 9 bash <<EOF`, `ssh host <<EOF`) or whose output is run (`eval "$(cat <<EOF …)"`, `$(cat <<EOF …)` as
 a command, `bash <(cat <<EOF …)`) count as fed to a shell, and a `case` pattern's `)` doesn't end a `$(…)`. Command
 substitutions are checked inside double quotes and backticks too (`echo "$(cat .env)"`, ``x=`sudo ls` ``; Rust only:
