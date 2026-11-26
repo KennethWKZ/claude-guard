@@ -272,6 +272,696 @@ fn rust_anything_rule() {
     );
 }
 
+/// Every rule also holds inside `bash -c STRING` (and sh, zsh, dash, ksh; `-lc`, `-ec`, options before `-c`),
+/// nested or not. Rust only: the Python guard read the string as one word, so these cases stay out of
+/// guard_bash_cases.tsv (the differential test lists them as a known difference).
+#[test]
+fn shell_c_strings_every_rule() {
+    let p = "pip"; // kept apart so this file's text doesn't trip the live pip hook
+    // (command, words the deny reason must hold)
+    let deny = [
+        ("bash -c 'sudo ls'".to_string(), "sudo is blocked"),
+        (
+            "sh -c 'rm -rf /srv/app'".to_string(),
+            "recursive force delete",
+        ),
+        (
+            "bash -lc 'rm -fr ~/work'".to_string(),
+            "recursive force delete",
+        ),
+        ("zsh -c 'cat .env'".to_string(), "reading a secrets file"),
+        (
+            "bash -c \"head -5 config/.env.production\"".to_string(),
+            "reading a secrets file",
+        ),
+        (
+            "dash -c 'cat ./prod.env'".to_string(),
+            "reading a secrets file",
+        ),
+        (
+            "ksh -c 'base64 .envrc'".to_string(),
+            "reading a secrets file",
+        ),
+        ("bash -c 'grep -r token .'".to_string(), "recursive grep"),
+        ("sh -c 'rg --hidden token'".to_string(), "rg with --hidden"),
+        (
+            "bash -c 'git push -f origin main'".to_string(),
+            "git push --force",
+        ),
+        (
+            "bash -c 'rust-anything build rust/util'".to_string(),
+            "rust-anything build",
+        ),
+        // Option spellings and positions.
+        ("bash -ec 'sudo ls'".to_string(), "sudo is blocked"),
+        ("bash -xc 'sudo ls'".to_string(), "sudo is blocked"),
+        (
+            "bash -o pipefail -c 'sudo ls'".to_string(),
+            "sudo is blocked",
+        ),
+        ("/bin/bash -c 'sudo ls'".to_string(), "sudo is blocked"),
+        (
+            "/usr/bin/env bash -c 'sudo ls'".to_string(),
+            "sudo is blocked",
+        ),
+        ("env FOO=1 sh -c 'sudo ls'".to_string(), "sudo is blocked"),
+        (
+            "timeout 60 bash -c 'sudo ls'".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "nice -n 5 sh -c 'git push -f'".to_string(),
+            "git push --force",
+        ),
+        // Inside lists, pipes, subshells; nested -c; a shell heredoc around it.
+        (
+            "cd /tmp && bash -c 'cd x; sudo ls'".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "echo hi | bash -c 'cat .env'".to_string(),
+            "reading a secrets file",
+        ),
+        (
+            "(bash -c 'git push --force')".to_string(),
+            "git push --force",
+        ),
+        ("bash -c \"sh -c 'sudo ls'\"".to_string(), "sudo is blocked"),
+        (
+            "bash <<'EOF'⏎bash -c 'cat .env'⏎EOF".to_string(),
+            "reading a secrets file",
+        ),
+        // A guard rule outside the string still wins over pip and keeps the Python guard's reason.
+        (
+            format!("bash -c '{p} install x'; sudo ls"),
+            "sudo is blocked",
+        ),
+        (
+            format!("bash -c 'cat .env'; {p} install x"),
+            "reading a secrets file",
+        ),
+    ];
+    let pip = [
+        format!("bash -c '{p} install requests'"),
+        format!("sh -c 'cd app && python3 -m {p} install -r r.txt'"),
+        format!("bash -c \"sh -c '{p}3 install x'\""),
+    ];
+    let allow = [
+        "bash -c 'ls -la'",
+        "bash -c 'cat .env.example'",
+        "bash -c 'echo hello'",
+        "bash -c 'rm -rf /tmp/claude-scratch'",
+        "bash -c 'git push --force-with-lease'",
+        "bash -c 'rg -g \"!.env*\" --hidden token'",
+        "bash -c 'rust-anything analyze .'",
+        "bash -c",
+        "bash script.sh",
+        "bash -n script.sh",
+        "bash --rcfile x.rc",
+        // A string that doesn't parse is allowed, as a whole command is.
+        "bash -c 'echo \"unterminated'",
+        // Text that only mentions a blocked command.
+        "echo 'bash -c sudo ls'",
+        "git commit -m \"bash -c 'sudo ls' is blocked now\"",
+        "python3 -c 'print(1)'",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in &deny {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains(want);
+        if !ok {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &pip {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str(), o.stderr.trim())
+            != (
+                2,
+                "",
+                "Do not use pip. Use uv instead. Example: uv add <packages>",
+            )
+        {
+            fails.push(format!(
+                "want pip :: {c:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+/// Every rule also holds inside `eval ARG...`: its arguments joined with spaces, as eval runs them, nested or not.
+/// Rust only, like the -c strings (the differential test lists them as a known difference).
+#[test]
+fn eval_strings_every_rule() {
+    let p = "pip"; // kept apart so this file's text doesn't trip the live pip hook
+    // (command, words the deny reason must hold)
+    let deny = [
+        ("eval sudo ls".to_string(), "sudo is blocked"),
+        ("eval 'sudo ls'".to_string(), "sudo is blocked"),
+        (
+            "eval \"rm -rf /srv/app\"".to_string(),
+            "recursive force delete",
+        ),
+        ("eval rm -fr ~/work".to_string(), "recursive force delete"),
+        ("eval 'head -3 .env'".to_string(), "reading a secrets file"),
+        ("eval grep -r token .".to_string(), "recursive grep"),
+        (
+            "eval 'rg --no-ignore token'".to_string(),
+            "rg with --hidden",
+        ),
+        (
+            "eval git push -f origin main".to_string(),
+            "git push --force",
+        ),
+        (
+            "eval 'rust-anything build rust/util'".to_string(),
+            "rust-anything build",
+        ),
+        // Words split across arguments are joined first, as eval does.
+        ("eval 'git' 'push' '-f'".to_string(), "git push --force"),
+        ("eval 'sudo' ls".to_string(), "sudo is blocked"),
+        // `--`, prefixes, lists and nesting with -c strings and other evals.
+        ("eval -- sudo ls".to_string(), "sudo is blocked"),
+        ("command eval sudo ls".to_string(), "sudo is blocked"),
+        ("builtin eval 'sudo ls'".to_string(), "sudo is blocked"),
+        ("cd x && eval 'sudo ls'".to_string(), "sudo is blocked"),
+        (
+            "if true; then eval 'git push --force'; fi".to_string(),
+            "git push --force",
+        ),
+        ("eval \"bash -c 'sudo ls'\"".to_string(), "sudo is blocked"),
+        ("bash -c \"eval 'sudo ls'\"".to_string(), "sudo is blocked"),
+        ("eval 'eval sudo ls'".to_string(), "sudo is blocked"),
+        // A guard rule outside the eval still wins and keeps the Python guard's reason.
+        ("eval 'git push -f'; sudo ls".to_string(), "sudo is blocked"),
+        (format!("eval 'sudo ls'; {p} install x"), "sudo is blocked"),
+    ];
+    let pip = [
+        format!("eval {p} install requests"),
+        format!("eval 'cd app && python3 -m {p} install -r r.txt'"),
+        format!("bash -c \"eval '{p}3 install x'\""),
+        format!("eval \"sh -c '{p} install x'\""),
+    ];
+    let allow = [
+        "eval \"$(ssh-agent -s)\"",
+        "eval \"$(/opt/homebrew/bin/brew shellenv)\"",
+        "eval ls -la",
+        "eval 'echo hi'",
+        "eval 'rm -rf /tmp/claude-scratch'",
+        "eval 'git push --force-with-lease'",
+        "eval 'rust-anything map'",
+        "eval",
+        "eval --",
+        // A string that doesn't parse is allowed, as a whole command is.
+        "eval 'echo \"unterminated'",
+        // Text that only mentions a blocked command.
+        "echo eval sudo ls",
+        "git commit -m 'eval sudo ls is blocked now'",
+        "rg -n 'eval sudo' src",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in &deny {
+        let o = run(&["bash"], &bash_input(c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains(want);
+        if !ok {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &pip {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str(), o.stderr.trim())
+            != (
+                2,
+                "",
+                "Do not use pip. Use uv instead. Example: uv add <packages>",
+            )
+        {
+            fails.push(format!(
+                "want pip :: {c:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+/// source and `.`: heredocs (checked since the Python guard), here-strings and `source <(echo ...)` (Rust only);
+/// here-strings and process substitution fed to a shell too; and `xargs ... sh -c`. Every rule holds inside them.
+#[test]
+fn source_here_strings_and_xargs_every_rule() {
+    let p = "pip"; // kept apart so this file's text doesn't trip the live pip hook
+    // (command, words the deny reason must hold)
+    let deny = [
+        // Heredocs to source and `.` (the Python guard already checked these; pinned here).
+        (
+            "source /dev/stdin <<EOF⏎sudo ls⏎EOF".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            ". /dev/stdin <<'EOF'⏎cat .env⏎EOF".to_string(),
+            "reading a secrets file",
+        ),
+        (
+            "source <<-EOF⏎\tgit push -f⏎\tEOF".to_string(),
+            "git push --force",
+        ),
+        // Here-strings fed to source, `.` or a shell.
+        (
+            "source /dev/stdin <<< 'sudo ls'".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            ". /dev/stdin <<< \"rm -rf /srv/app\"".to_string(),
+            "recursive force delete",
+        ),
+        ("bash <<< 'grep -r token .'".to_string(), "recursive grep"),
+        (
+            "sh -s <<< 'rg --hidden token'".to_string(),
+            "rg with --hidden",
+        ),
+        ("zsh<<<'git push --force'".to_string(), "git push --force"),
+        (
+            "bash <<< 'rust-anything build rust/util'".to_string(),
+            "rust-anything build",
+        ),
+        (
+            "timeout 9 bash <<< 'sudo ls'".to_string(),
+            "sudo is blocked",
+        ),
+        // echo or printf output through process substitution.
+        ("source <(echo 'sudo ls')".to_string(), "sudo is blocked"),
+        (
+            ". <(echo -n 'rm -rf /srv/app')".to_string(),
+            "recursive force delete",
+        ),
+        (
+            "source <(printf 'git push -f')".to_string(),
+            "git push --force",
+        ),
+        (
+            "bash <(echo 'cat .env')".to_string(),
+            "reading a secrets file",
+        ),
+        // xargs in front of sh -c, with and without its own options.
+        ("ls | xargs sh -c 'sudo ls'".to_string(), "sudo is blocked"),
+        (
+            "find . -name '*.md' | xargs -I{} sh -c 'git push -f'".to_string(),
+            "git push --force",
+        ),
+        (
+            "ls | xargs -n1 bash -c 'rm -rf /srv/app'".to_string(),
+            "recursive force delete",
+        ),
+        (
+            "ls | xargs -0 -P 4 bash -lc 'grep -r token .'".to_string(),
+            "recursive grep",
+        ),
+        (
+            "ls | xargs -I % sh -c 'rust-anything build %'".to_string(),
+            "rust-anything build",
+        ),
+        // Nesting across the forms.
+        (
+            "source <(echo \"bash -c 'sudo ls'\")".to_string(),
+            "sudo is blocked",
+        ),
+        ("bash <<< \"eval 'sudo ls'\"".to_string(), "sudo is blocked"),
+        (
+            "ls | xargs sh -c \"bash <<< 'sudo ls'\"".to_string(),
+            "sudo is blocked",
+        ),
+        // A guard rule outside still wins and keeps the Python guard's reason.
+        (
+            "bash <<< 'git push -f'; sudo ls".to_string(),
+            "sudo is blocked",
+        ),
+    ];
+    let pip = [
+        format!("source /dev/stdin <<< '{p} install x'"),
+        format!("bash <<< 'python3 -m {p} install y'"),
+        format!("source <(echo '{p} install x')"),
+        format!("ls | xargs sh -c '{p}3 install x'"),
+    ];
+    let allow = [
+        "source ~/.zshrc",
+        ". ./venv/bin/activate",
+        "source <(kubectl completion zsh)",
+        "source <(echo 'export A=1')",
+        "bash <<< 'ls -la'",
+        "source /dev/stdin <<< 'echo hi'",
+        "cat <<< 'sudo ls'",
+        "grep x <<< 'git push -f'",
+        "ls | xargs -I{} sh -c 'echo {}'",
+        "ls | xargs rm -f",
+        "ls | xargs sh -c 'git push --force-with-lease'",
+        "source <(echo)",
+        // A string that doesn't parse is allowed, as a whole command is.
+        "bash <<< 'echo \"unterminated'",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in &deny {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains(want);
+        if !ok {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &pip {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str(), o.stderr.trim())
+            != (
+                2,
+                "",
+                "Do not use pip. Use uv instead. Example: uv add <packages>",
+            )
+        {
+            fails.push(format!(
+                "want pip :: {c:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+/// echo or printf output piped into something that runs stdin as a script (bash, sh -s, zsh, `source /dev/stdin`,
+/// `. /dev/fd/0`), checked line by line with every rule. Rust only (the differential test lists it as a known
+/// difference).
+#[test]
+fn piped_scripts_every_rule() {
+    let p = "pip"; // kept apart so this file's text doesn't trip the live pip hook
+    // (command, words the deny reason must hold)
+    let deny = [
+        ("echo 'sudo ls' | bash".to_string(), "sudo is blocked"),
+        ("echo sudo ls | sh".to_string(), "sudo is blocked"),
+        (
+            "echo 'rm -rf /srv/app' | sh -s".to_string(),
+            "recursive force delete",
+        ),
+        (
+            "echo 'head .env' | zsh".to_string(),
+            "reading a secrets file",
+        ),
+        (
+            "echo 'grep -r token .' | bash -x".to_string(),
+            "recursive grep",
+        ),
+        (
+            "echo 'rg --hidden token' | dash".to_string(),
+            "rg with --hidden",
+        ),
+        ("echo 'git push -f' | ksh".to_string(), "git push --force"),
+        (
+            "echo 'rust-anything build x' | bash".to_string(),
+            "rust-anything build",
+        ),
+        // source and `.` reading stdin.
+        (
+            "echo 'sudo ls' | source /dev/stdin".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "echo 'git push -f' | . /dev/stdin".to_string(),
+            "git push --force",
+        ),
+        (
+            "echo 'sudo ls' | source /dev/fd/0".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "echo 'sudo ls' | bash /dev/stdin".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "echo 'sudo ls' | bash -s -- arg".to_string(),
+            "sudo is blocked",
+        ),
+        // printf: the format dropped when arguments follow it; \n read as a new line, each line checked.
+        ("printf 'sudo ls\\n' | sh".to_string(), "sudo is blocked"),
+        (
+            "printf '%s\\n' 'git push -f' | bash".to_string(),
+            "git push --force",
+        ),
+        (
+            "printf -- 'cd x\\nsudo ls\\n' | sh".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "echo -e 'cd x\\nrm -rf /srv/app' | bash".to_string(),
+            "recursive force delete",
+        ),
+        ("echo -n 'sudo ls' | bash".to_string(), "sudo is blocked"),
+        // Prefixes and wrappers on either side; inside lists and subshells.
+        (
+            "env A=1 echo 'sudo ls' | env bash".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "echo 'sudo ls' | timeout 9 bash".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "cd x && echo 'sudo ls' | bash && ls".to_string(),
+            "sudo is blocked",
+        ),
+        ("echo 'sudo ls' | (bash)".to_string(), "sudo is blocked"),
+        (
+            "/bin/echo 'sudo ls' | /bin/bash".to_string(),
+            "sudo is blocked",
+        ),
+        // Nesting with the other forms.
+        (
+            "echo \"bash -c 'sudo ls'\" | sh".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "bash -c \"echo 'sudo ls' | sh\"".to_string(),
+            "sudo is blocked",
+        ),
+        (
+            "eval \"echo 'git push -f' | bash\"".to_string(),
+            "git push --force",
+        ),
+        // A guard rule outside still wins and keeps the Python guard's reason.
+        (
+            "echo 'git push -f' | bash; sudo ls".to_string(),
+            "sudo is blocked",
+        ),
+    ];
+    let pip = [
+        format!("echo '{p} install x' | bash"),
+        format!("printf 'cd app\\npython3 -m {p} install y\\n' | sh"),
+        format!("echo '{p}3 install x' | source /dev/stdin"),
+        format!("bash -c \"echo '{p} install x' | sh\""),
+    ];
+    let allow = [
+        "echo 'ls -la' | bash",
+        "echo 'sudo ls' | cat",
+        "echo 'sudo ls' | grep sudo",
+        "echo 'sudo ls' | bash -c 'cat'",
+        "echo 'sudo ls' | bash script.sh",
+        "echo 'sudo ls' | source ./env.sh",
+        "echo 'sudo ls' > notes.txt",
+        "echo 'git push --force-with-lease' | sh",
+        "echo 'rm -rf /tmp/claude-scratch' | bash",
+        "printf '%s\\n' a b | sh -c 'xargs echo'",
+        "echo | bash",
+        "cat script.sh | bash",
+        "echo \"$CMD\" | bash",
+        // A line that doesn't parse is allowed, as a whole command is.
+        "echo 'echo \"unterminated' | bash",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in &deny {
+        let o = run(&["bash"], &bash_input(c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains(want);
+        if !ok {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &pip {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str(), o.stderr.trim())
+            != (
+                2,
+                "",
+                "Do not use pip. Use uv instead. Example: uv add <packages>",
+            )
+        {
+            fails.push(format!(
+                "want pip :: {c:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+/// A newline outside quotes and heredoc bodies ends a command, as `;` does, for every rule; backslash-newline
+/// continues the line. Rust only: the Python guard read a newline as a space (the differential test lists it as a
+/// known difference). ⏎ marks a newline.
+#[test]
+fn newline_separates_commands_every_rule() {
+    let p = "pip"; // kept apart so this file's text doesn't trip the live pip hook
+    // (command, words the deny reason must hold)
+    let deny = [
+        ("cd x⏎sudo ls", "sudo is blocked"),
+        ("cd x⏎rm -rf /srv/app", "recursive force delete"),
+        ("cd x⏎grep -r token .", "recursive grep"),
+        ("cd x⏎rg --hidden token", "rg with --hidden"),
+        ("cd x⏎git push -f", "git push --force"),
+        ("cd x⏎rust-anything build rust/util", "rust-anything build"),
+        ("ls⏎⏎⏎sudo ls", "sudo is blocked"),
+        ("ls⏎  \tsudo ls", "sudo is blocked"),
+        // A comment ends at its newline; the next line is still a command.
+        ("ls # note⏎sudo ls", "sudo is blocked"),
+        ("echo a#b⏎git push --force", "git push --force"),
+        // A continued line, then a new command after the continuation.
+        ("cd x \\⏎  && sudo ls", "sudo is blocked"),
+        ("ls \\⏎  -la⏎sudo ls", "sudo is blocked"),
+        // Blocks written over several lines.
+        ("for f in *.md⏎do⏎  sudo ls⏎done", "sudo is blocked"),
+        ("if true⏎then⏎  git push -f⏎fi", "git push --force"),
+        ("{⏎  cd x⏎  sudo ls⏎}", "sudo is blocked"),
+        // A heredoc's body is still data, and the line after its delimiter is a command.
+        ("cat <<EOF⏎sudo ls⏎EOF⏎sudo ls", "sudo is blocked"),
+        // Newlines inside strings run as commands.
+        ("bash -c 'cd x⏎sudo ls'", "sudo is blocked"),
+        ("eval 'cd x⏎git push -f'", "git push --force"),
+        ("bash <<< 'cd x⏎sudo ls'", "sudo is blocked"),
+        // A pipe continued on the next line still pipes.
+        ("echo 'sudo ls' |⏎  bash", "sudo is blocked"),
+        // A guard rule on the first line keeps the Python guard's reason.
+        ("git push -f⏎sudo ls", "git push --force"),
+    ];
+    let allow = [
+        "cd x⏎ls -la⏎pwd",
+        "ls # sudo ls⏎pwd",
+        "echo 'a⏎sudo b'",
+        "git commit -m \"subject⏎⏎sudo ls is blocked now\"",
+        "cat <<EOF⏎sudo ls⏎EOF",
+        "cat <<'EOF' > notes.md⏎git push -f⏎EOF⏎ls",
+        "cd x \\⏎  && ls",
+        "printf 'a\\nb'⏎ls",
+        "ls⏎",
+        "⏎",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in &deny {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains(want);
+        if !ok {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    // block-pip already read the command line by line; a newline in a nested string now counts too.
+    for c in [
+        format!("cd x⏎{p} install y"),
+        format!("bash -c 'cd x⏎{p} install y'"),
+    ] {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (2, "") {
+            fails.push(format!(
+                "want pip :: {c:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &allow {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
 #[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).

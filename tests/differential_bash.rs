@@ -298,6 +298,28 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
         " <<'Q\nsudo x\nQ\n",
     ]);
     let noise = sv(&["\"", "'", "\\", "#", "`", "$(", "\r"]);
+    let c_opts = sv(&[" -c ", " -lc ", " -ec ", " -o pipefail -c ", " -x -c "]);
+    let c_strings: Vec<String> = [
+        "'ls -la'",
+        "'sudo ls'",
+        "'rm -rf /srv/x'",
+        "'rm -rf /tmp/x'",
+        "'cat .env'",
+        "'cat .env.example'",
+        "'grep -r x .'",
+        "'rg --hidden x'",
+        "'git push -f'",
+        "'git push --force-with-lease'",
+        "'rust-anything build x'",
+        "'rust-anything map'",
+        "\"sh -c 'sudo ls'\"",
+        "'echo \"unterminated'",
+        "'PIP install x'",
+        "'cd x && python3 -m PIP install y'",
+    ]
+    .iter()
+    .map(|c| c.replace("PIP", p))
+    .collect();
     let mut out = String::new();
     let segs = 1 + rng.below(4);
     for s in 0..segs {
@@ -319,6 +341,46 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
             } else {
                 " list"
             });
+        }
+        // Strings run as commands: checked with every rule in Rust, one word to the Python guard (known_difference).
+        if (verb == "bash" || verb == "sh") && rng.chance(30) {
+            if rng.chance(70) {
+                out.push_str(rng.pick(&c_opts));
+            } else {
+                out.push_str(" <<< ");
+            }
+            out.push_str(rng.pick(&c_strings));
+            continue;
+        }
+        if (verb == "echo" || verb == "printf") && rng.chance(25) {
+            let to = [
+                "bash",
+                "sh",
+                "sh -s",
+                "zsh",
+                "source /dev/stdin",
+                ". /dev/stdin",
+                "bash -c cat",
+            ];
+            out.push(' ');
+            out.push_str(rng.pick(&c_strings));
+            out.push_str(" | ");
+            out.push_str(to[rng.below(to.len())]);
+            continue;
+        }
+        if verb == "eval" && rng.chance(40) {
+            out.push(' ');
+            out.push_str(rng.pick(&c_strings));
+            continue;
+        }
+        if (verb == "source" || verb == ".") && rng.chance(40) {
+            let c = rng.pick(&c_strings).to_string();
+            if rng.chance(50) {
+                out.push_str(&format!(" /dev/stdin <<< {c}"));
+            } else {
+                out.push_str(&format!(" <(echo {c})"));
+            }
+            continue;
         }
         if (verb == "bash" || verb == "sh") && rng.chance(40) {
             out.push_str(rng.pick(&tails));
@@ -398,6 +460,74 @@ fn parallel<T: Send + Sync, R: Send>(
         .into_iter()
         .map(Option::unwrap)
         .collect()
+}
+
+/// Which string-run-as-command form the hook input's command holds, if any: `bash -c`, eval, a here-string fed
+/// to a shell, `source` or `.`, or process substitution.
+fn nested_kind(input: &str) -> Option<&'static str> {
+    let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+    let cmd = v["tool_input"]["command"].as_str().unwrap_or("");
+    let words: Vec<&str> = cmd
+        .split(|c: char| c.is_whitespace() || ";&|()".contains(c))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let base = |w: &str| unquoted_base(w).to_string();
+    let shells = ["bash", "sh", "zsh", "dash", "ksh"];
+    let shell_c = words.iter().enumerate().any(|(i, w)| {
+        shells.contains(&base(w).as_str())
+            && words[i + 1..].iter().any(|a| {
+                a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a[1..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphabetic())
+                        .any(|c| c == 'c')
+            })
+    });
+    let stdin_shell = words.iter().any(|w| {
+        let b = base(w);
+        shells.contains(&b.as_str()) || b == "source" || b == "."
+    });
+    if shell_c {
+        Some("shell-c-string")
+    } else if words.iter().any(|w| unquoted_base(w) == "eval") {
+        Some("eval-string")
+    } else if stdin_shell && cmd.contains("<<<") {
+        Some("here-string")
+    } else if stdin_shell && cmd.contains("<(") {
+        Some("process-substitution")
+    } else if piped_into_shell(cmd) {
+        Some("piped-script")
+    } else {
+        None
+    }
+}
+
+/// A word's command name as the shell sees it: leading quotes and backslashes dropped (`\\eval`, `"bash"`), then
+/// the folder (`/bin/bash`).
+fn unquoted_base(w: &str) -> &str {
+    let w = w.trim_start_matches(['\'', '"', '\\']);
+    w.rsplit('/').next().unwrap_or(w)
+}
+
+/// True if an echo or printf segment is piped straight into a shell, `source` or `.`.
+fn piped_into_shell(cmd: &str) -> bool {
+    let pieces: Vec<&str> = cmd.split('|').collect();
+    pieces.windows(2).any(|w| {
+        let printer = w[0]
+            .split(|c: char| c.is_whitespace() || ";&()".contains(c))
+            .any(|x| ["echo", "printf"].contains(&unquoted_base(x)));
+        let first = w[1]
+            .split(|c: char| c.is_whitespace() || "();&".contains(c))
+            .find(|x| !x.is_empty() && !x.contains('='))
+            .unwrap_or("");
+        let first = unquoted_base(first);
+        printer
+            && [
+                "bash", "sh", "zsh", "dash", "ksh", "source", ".", "env", "timeout",
+            ]
+            .contains(&first)
+    })
 }
 
 fn rule(stdout: &str) -> String {
@@ -650,6 +780,28 @@ fn known_difference(
         && rule(&rust.stdout).starts_with("rust-anything ")
     {
         return Some("rust-anything-rule");
+    }
+    // Strings run as commands (`bash -c`, eval, here-strings, `source <(echo ...)`, `echo ... | bash`) are checked
+    // with every rule in Rust (pip included); Python read each as one word. Rust checks them only after the rest
+    // of the command passed, so the difference is always Python letting through (allow, or block-pip's exit 2)
+    // what Rust blocks.
+    // A crash blocks too (fail closed): a line or string checked on its own can reach a check that raises in both
+    // guards (a glob with a cwd that isn't text), which the Python guard's reading never reached.
+    let rust_blocks =
+        (rust.code == 0 && !rust.stdout.is_empty()) || (rust.code == 2 && rust.stdout.is_empty());
+    if reference.stdout.is_empty() && rust_blocks {
+        if let Some(kind) = nested_kind(input) {
+            return Some(kind);
+        }
+        // A newline outside quotes ends a command in Rust (second pass, after the Python reading passed); Python
+        // read it as a space.
+        let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+        if v["tool_input"]["command"]
+            .as_str()
+            .is_some_and(|c| c.contains('\n'))
+        {
+            return Some("newline-separator");
+        }
     }
     None
 }

@@ -10,7 +10,17 @@
 //!   5. `pip install` (from block-pip.sh): exit 2 with a message on stderr, after the rules above.
 //!   6. rust-anything subcommands other than the read-only ones (analyze, map, doctor, help): the rest build or
 //!      run the code being ported, or edit its sources, and its MCP tools for them are denied, so the CLI must not
-//!      be the way round. Rust only (the Python guard never had it); also through wrappers and `sh -c`.
+//!      be the way round. Rust only (the Python guard never had it); also through wrappers.
+//!
+//! Every rule also holds inside strings run as commands, nested or not: `bash -c STRING` (sh, zsh, dash, ksh; `-lc`,
+//! `-ec` too; after env, timeout or xargs options), `eval ARG...`, here-strings fed to a shell, `source` or `.`, and
+//! `source <(echo STRING)`, and echo or printf output piped into a shell or `source /dev/stdin` (line by line). Rust only: the Python guard read the string as one word. Those strings are checked
+//! after the rest of the command passed, so a command the Python guard blocked gets the same reason. Heredocs fed
+//! to a shell, `source`, `.` or eval were already checked by the Python guard.
+//!
+//! A newline outside quotes and heredoc bodies ends a command, as `;` does (`cd x⏎sudo ls`); backslash-newline
+//! continues the line. Rust only: the Python guard's shlex read a newline as a space, so a verb on a later line was
+//! an argument of the first line's command.
 //!
 //! Same contract as the Python guard: a parse error allows the command (a quoting mistake never locks the
 //! shell); any other failure blocks it (fail closed) and is logged. It only sees what is written in the command.
@@ -65,7 +75,7 @@ const ENV_EXCLUDES: &[&str] = &["!.env*", "!*.env*", "!**/.env*", "!**/*.env*"];
 /// rust-anything subcommands that only read (the MCP tools left allowed are analyze and map). Anything else,
 /// including subcommands added later, is blocked.
 const RUST_ANYTHING_READ_ONLY: &[&str] = &["analyze", "map", "doctor", "help"];
-/// Commands that run the command after their own options. `segments` already drops a leading
+/// Commands that run the command after their own options. `segments_with_seps` already drops a leading
 /// env/xargs/nice/nohup/time/command/builtin/exec, but their options (`nice -n 5`) stay behind as the verb.
 const RUN_WRAPPERS: &[&str] = &[
     "timeout",
@@ -84,6 +94,8 @@ const RUN_WRAPPERS: &[&str] = &[
 ];
 /// Shells whose `-c` string is a command to check.
 const C_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
+/// What runs a here-string or process substitution fed to it as commands.
+const STDIN_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "source", "."];
 
 // Python's `$` (no MULTILINE) also matches just before a final newline: `\n?\z` here.
 static ENV_FILE: LazyLock<Regex> =
@@ -298,19 +310,21 @@ fn split_heredocs(command: &str) -> (String, Vec<String>) {
     (out.join("\n"), run_as_shell)
 }
 
-/// Split into simple commands: [verb, args...], skipping prefixes like `env`, `xargs`, keywords, VAR=value.
-fn segments(tokens: Vec<String>) -> Vec<Vec<String>> {
+/// Split into simple commands: [verb, args...], skipping prefixes like `env`, `xargs`, keywords, VAR=value; each
+/// with the separator that ended it (`;` for the last).
+fn segments_with_seps(tokens: Vec<String>) -> Vec<(Vec<String>, String)> {
     let mut out = Vec::new();
     let mut cur: Vec<String> = Vec::new();
     for t in tokens.into_iter().chain(std::iter::once(";".to_string())) {
-        if contains(SEPARATORS, &t) {
+        // "\n": an unquoted newline (`shlex::split_lines`) ends a command as `;` does.
+        if contains(SEPARATORS, &t) || t == "\n" {
             let skip = cur
                 .iter()
                 .take_while(|w| contains(PREFIXES, w) || contains(KEYWORDS, w) || is_assignment(w))
                 .count();
             cur.drain(..skip);
             if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
+                out.push((std::mem::take(&mut cur), t));
             }
             cur.clear();
         } else {
@@ -318,6 +332,103 @@ fn segments(tokens: Vec<String>) -> Vec<Vec<String>> {
         }
     }
     out
+}
+
+/// Where a shell, `source` or `.` sits in a simple command: the verb, or after a wrapper and its options.
+fn stdin_shell_at(seg: &[String]) -> Option<usize> {
+    let verb = pyfs::basename(&seg[0]);
+    if contains(STDIN_SHELLS, verb) {
+        Some(0)
+    } else if contains(RUN_WRAPPERS, verb) || verb.starts_with('-') {
+        seg.iter()
+            .position(|a| contains(STDIN_SHELLS, pyfs::basename(a)))
+    } else {
+        None
+    }
+}
+
+/// True if the simple command runs its standard input as a script: `bash`, `sh -s`, `bash -x /dev/stdin`,
+/// `source /dev/stdin`, `. /dev/fd/0`. Not with `-c` (stdin is then data) or a script file.
+fn runs_stdin(seg: &[String]) -> bool {
+    let Some(at) = stdin_shell_at(seg) else {
+        return false;
+    };
+    let rest = &seg[at + 1..];
+    let stdin_file = |a: &String| a == "/dev/stdin" || a == "/dev/fd/0";
+    if !contains(C_SHELLS, pyfs::basename(&seg[at])) {
+        return rest.first().is_some_and(stdin_file); // source, .
+    }
+    let short = |a: &&String| !a.starts_with("--") && a.starts_with('-');
+    if rest
+        .iter()
+        .filter(short)
+        .any(|a| dash_letters_contain(a, &['c']))
+    {
+        return false;
+    }
+    if rest
+        .iter()
+        .filter(short)
+        .any(|a| dash_letters_contain(a, &['s']))
+    {
+        return true;
+    }
+    match rest.iter().find(|a| !a.starts_with('-')) {
+        None => true,
+        Some(a) => stdin_file(a),
+    }
+}
+
+/// The script echo or printf writes, line by line: its arguments joined with spaces (echo's -n/-e/-E dropped, a
+/// printf format with `%` dropped when arguments follow it), with `\n` read as a newline for printf and echo -e.
+/// Lines, because the guard reads a newline as a space, and a script's lines are separate commands.
+fn printed_lines(seg: &[String]) -> Option<Vec<String>> {
+    let verb = pyfs::basename(&seg[0]);
+    let args = &seg[1..];
+    let (text, escapes) = match verb {
+        "echo" => {
+            let flags = args
+                .iter()
+                .take_while(|a| {
+                    a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "neE".contains(c))
+                })
+                .count();
+            let escapes = args[..flags].iter().any(|a| a.contains('e'));
+            (args[flags..].join(" "), escapes)
+        }
+        "printf" => {
+            let args = match args.first() {
+                Some(a) if a == "--" => &args[1..],
+                _ => args,
+            };
+            let args = match args.first() {
+                Some(f) if f.contains('%') && args.len() > 1 => &args[1..],
+                _ => args,
+            };
+            (args.join(" "), true)
+        }
+        _ => return None,
+    };
+    let text = if escapes {
+        text.replace("\\n", "\n")
+    } else {
+        text
+    };
+    Some(
+        text.split('\n')
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Scripts piped into something that runs stdin: `echo 'sudo ls' | bash`, `printf ... | source /dev/stdin`.
+fn piped_scripts(segs: &[(Vec<String>, String)]) -> Vec<String> {
+    segs.windows(2)
+        .filter(|w| w[0].1 == "|" && runs_stdin(&w[1].0))
+        .filter_map(|w| printed_lines(&w[0].0))
+        .flatten()
+        .collect()
 }
 
 fn is_secret_env(token: &str) -> bool {
@@ -485,51 +596,102 @@ fn is_rust_anything(token: &str) -> bool {
     pyfs::basename(token.trim_start_matches('`')) == "rust-anything"
 }
 
-/// The reason to block the rust-anything run in one simple command, if it runs one that isn't read-only.
-/// Finds it as the verb, after a wrapper (`timeout 60 rust-anything go`), and inside `bash -c '...'`.
-fn rust_anything_reason(seg: &[String], depth: usize) -> Result<Option<String>, Crash> {
-    if depth > MAX_DEPTH {
-        return Err(Crash(
-            "RecursionError: maximum recursion depth exceeded".into(),
-        ));
+/// The command lines a simple command runs from strings:
+/// - `bash -c STRING` (also `sh -lc`, `zsh -ec`, `bash -o pipefail -c`): the argument after the first short option
+///   that holds a `c`.
+/// - A here-string fed to a shell, `source` or `.`: `bash <<< STRING`, `source /dev/stdin <<< STRING`.
+/// - echo or printf output fed to one through process substitution: `source <(echo STRING)`, `bash <(printf ...)`:
+///   the arguments joined with spaces (echo's -n/-e/-E dropped; printf's format is taken as text).
+/// - `eval ARG...`: its arguments joined with spaces, as eval joins them (a leading `--` dropped). eval is a shell
+///   builtin, so it only counts as the verb (`command eval` and `builtin eval` reach it through `segments_with_seps`).
+///
+/// The shell may sit after a wrapper (`/usr/bin/env bash -c`, `timeout 9 sh -c`, `xargs -I{} sh -c`: `segments_with_seps`
+/// drops a leading xargs and leaves its options as the verb). Heredocs fed to these are `split_heredocs`' job.
+fn nested_commands(seg: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    if seg[0] == "eval" {
+        let args = match seg.get(1) {
+            Some(a) if a == "--" => &seg[2..],
+            _ => &seg[1..],
+        };
+        if !args.is_empty() {
+            out.push(args.join(" "));
+        }
+        return out;
     }
+    let Some(shell) = stdin_shell_at(seg) else {
+        return out;
+    };
+    let rest = &seg[shell + 1..];
+    if contains(C_SHELLS, pyfs::basename(&seg[shell])) {
+        if let Some(i) = rest
+            .iter()
+            .position(|a| !a.starts_with("--") && dash_letters_contain(a, &['c']))
+        {
+            out.extend(rest.get(i + 1).cloned());
+        }
+    }
+    for w in rest.windows(2) {
+        if w[0] == "<<<" {
+            out.push(w[1].clone());
+        }
+    }
+    if let Some(i) = rest.iter().position(|a| a == "<(") {
+        if let Some(producer) = rest.get(i + 1) {
+            let producer = pyfs::basename(producer);
+            if producer == "echo" || producer == "printf" {
+                let args: Vec<&str> = rest[i + 2..]
+                    .iter()
+                    .map(String::as_str)
+                    .skip_while(|a| {
+                        producer == "echo" && ["-n", "-e", "-E", "-ne", "-en"].contains(a)
+                    })
+                    .collect();
+                if !args.is_empty() {
+                    out.push(args.join(" "));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True if a string `nested_commands` finds in `command`, at any depth, holds a `pip install` (block-pip's rule
+/// only read the command's own lines).
+fn pip_in_nested(command: &str, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false; // check() already crashed (blocked) at this depth
+    }
+    let (command, bodies) = split_heredocs(command);
+    if bodies.iter().any(|b| pip_in_nested(b, depth + 1)) {
+        return true;
+    }
+    let Ok(raw) = shlex::split_lines(&command) else {
+        return false;
+    };
+    let segs = segments_with_seps(raw);
+    segs.iter()
+        .flat_map(|(s, _)| nested_commands(s))
+        .chain(piped_scripts(&segs))
+        .any(|inner| PIP.is_match(&inner) || pip_in_nested(&inner, depth + 1))
+}
+
+/// The reason to block the rust-anything run in one simple command, if it runs one that isn't read-only.
+/// Finds it as the verb and after a wrapper (`timeout 60 rust-anything go`); `bash -c '...'` strings go
+/// through `check` like every other rule.
+fn rust_anything_reason(seg: &[String]) -> Option<String> {
     let verb = pyfs::basename(&seg[0]);
     let args: &[String] = if is_rust_anything(&seg[0]) {
         &seg[1..]
-    } else if contains(C_SHELLS, verb) {
-        // `bash -c STRING`, `sh -lc STRING`: STRING is a command line of its own.
-        let Some(i) = seg[1..]
-            .iter()
-            .position(|a| !a.starts_with("--") && dash_letters_contain(a, &['c']))
-        else {
-            return Ok(None);
-        };
-        let Some(inner) = seg.get(i + 2) else {
-            return Ok(None);
-        };
-        // Same contract as the whole command: a string that doesn't parse is allowed.
-        let Ok(raw) = shlex::split(inner) else {
-            return Ok(None);
-        };
-        for s in segments(raw) {
-            if let Some(r) = rust_anything_reason(&s, depth + 1)? {
-                return Ok(Some(r));
-            }
-        }
-        return Ok(None);
     } else if contains(RUN_WRAPPERS, verb) || verb.starts_with('-') {
-        match seg.iter().position(|a| is_rust_anything(a)) {
-            Some(i) => &seg[i + 1..],
-            None => return Ok(None),
-        }
-    } else if let Some(i) = seg
-        .iter()
-        .position(|a| a.starts_with('`') && is_rust_anything(a))
-    {
-        // Backtick substitution: `echo `rust-anything build x``.
+        let i = seg.iter().position(|a| is_rust_anything(a))?;
         &seg[i + 1..]
     } else {
-        return Ok(None);
+        // Backtick substitution: `echo `rust-anything build x``.
+        let i = seg
+            .iter()
+            .position(|a| a.starts_with('`') && is_rust_anything(a))?;
+        &seg[i + 1..]
     };
     // `rust-anything build --help` only prints help; a --help after `--` belongs to the workload instead.
     if args
@@ -537,24 +699,40 @@ fn rust_anything_reason(seg: &[String], depth: usize) -> Result<Option<String>, 
         .take_while(|a| a.as_str() != "--")
         .any(|a| a == "-h" || a == "--help")
     {
-        return Ok(None);
+        return None;
     }
     let sub = args.iter().find(|a| !a.starts_with('-'));
     let what = match sub {
-        Some(s) if contains(RUST_ANYTHING_READ_ONLY, s) => return Ok(None),
+        Some(s) if contains(RUST_ANYTHING_READ_ONLY, s) => return None,
         Some(s) => format!("rust-anything {s}"),
         // The version flag stops before any subcommand. Without it, the subcommand may come from elsewhere
         // (`... | xargs rust-anything`), so a bare run is blocked too.
-        None if args.iter().any(|a| a == "-V" || a == "--version") => return Ok(None),
+        None if args.iter().any(|a| a == "-V" || a == "--version") => return None,
         None => "rust-anything without a subcommand".to_string(),
     };
-    Ok(Some(format!(
+    Some(format!(
         "{what} can build, run or edit the code being ported, and its MCP tool is denied. Claude may run only rust-anything analyze, map, doctor and help; run the rest yourself with !."
-    )))
+    ))
 }
 
 /// The reason to block `command`, if any. Err is a crash (blocks).
+///
+/// Two passes over the whole command: first reading a newline as a space, as the Python guard did, so a command it
+/// blocked keeps its reason; then, if that passed, with newlines as separators. Each pass recurses in its own mode,
+/// so nesting never multiplies the work.
 pub fn check(command: &str, cwd: &Cwd, depth: usize) -> Result<Option<String>, Crash> {
+    if let Some(r) = check_mode(command, cwd, depth, false)? {
+        return Ok(Some(r));
+    }
+    check_mode(command, cwd, depth, true)
+}
+
+fn check_mode(
+    command: &str,
+    cwd: &Cwd,
+    depth: usize,
+    lines: bool,
+) -> Result<Option<String>, Crash> {
     if depth > MAX_DEPTH {
         return Err(Crash(
             "RecursionError: maximum recursion depth exceeded".into(),
@@ -562,14 +740,25 @@ pub fn check(command: &str, cwd: &Cwd, depth: usize) -> Result<Option<String>, C
     }
     let (command, shell_bodies) = split_heredocs(command);
     for body in shell_bodies {
-        if let Some(r) = check(&body, cwd, depth + 1)? {
+        if let Some(r) = check_mode(&body, cwd, depth + 1, lines)? {
             return Ok(Some(r));
         }
     }
-    let Ok(raw) = shlex::split(&command) else {
+    let lexed = if lines {
+        shlex::split_lines(&command)
+    } else {
+        shlex::split_python(&command)
+    };
+    let Ok(raw) = lexed else {
         return Ok(None);
     };
-    for seg in segments(raw) {
+    // Strings run as commands (`bash -c`, eval, here-strings, `source <(echo ...)`, `echo ... | bash`), checked
+    // with every rule once the whole command has passed: a command the Python guard blocked keeps its verdict and
+    // reason.
+    let segs = segments_with_seps(raw);
+    let mut nested: Vec<String> = piped_scripts(&segs);
+    for (seg, _) in segs {
+        nested.extend(nested_commands(&seg));
         let verb = pyfs::basename(&seg[0]).to_string();
         let args = &seg[1..];
         if verb == "sudo" {
@@ -578,7 +767,7 @@ pub fn check(command: &str, cwd: &Cwd, depth: usize) -> Result<Option<String>, C
                     .into(),
             ));
         }
-        if let Some(r) = rust_anything_reason(&seg, depth + 1)? {
+        if let Some(r) = rust_anything_reason(&seg) {
             return Ok(Some(r));
         }
         if verb == "rm" {
@@ -688,6 +877,12 @@ pub fn check(command: &str, cwd: &Cwd, depth: usize) -> Result<Option<String>, C
                     secret.join(", ")
                 )));
             }
+        }
+    }
+    // A string that doesn't parse is allowed, as the whole command is.
+    for inner in nested {
+        if let Some(r) = check_mode(&inner, cwd, depth + 1, lines)? {
+            return Ok(Some(r));
         }
     }
     Ok(None)
@@ -845,7 +1040,7 @@ pub fn decide(input: &[u8], crash_log: &str) -> Verdict {
     }
     // block-pip.sh read `.tool_input.command` with jq -r; only a string can match.
     if let Value::String(c) = &command {
-        if PIP.is_match(c) {
+        if PIP.is_match(c) || pip_in_nested(c, 0) {
             return Verdict::Pip;
         }
     }

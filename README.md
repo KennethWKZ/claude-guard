@@ -138,7 +138,15 @@ Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `ba
    listed. Found by path, behind wrappers (`timeout`, `nice -n`, `env -i`, `xargs`), in `$(…)` and backticks, and
    inside `bash -c '…'`.
 
-The rules hold inside loops, `if` blocks and `{ … }`. A quoting error in the command allows it, so a typo never locks
+A newline outside quotes and heredoc bodies ends a command, as `;` does (`cd x⏎sudo ls` is caught; the Python guard
+read a newline as a space), and backslash-newline continues the line. The rules hold inside loops, `if` blocks and
+`{ … }`, in heredocs fed to a shell, `source`, `.` or `eval`, and inside
+strings run as commands, nested, the pip rule included: `bash -c '…'` (also `sh`, `zsh`, `dash`, `ksh`; `-lc`, `-ec`,
+options before `-c`; after `env`, `timeout` or `xargs` options), `eval …` (its arguments joined, as eval does),
+here-strings fed to a shell, `source` or `.` (`bash <<< '…'`), `source <(echo '…')` or `printf`, and `echo` or
+`printf` output piped into a shell or `source /dev/stdin` (`echo '…' | bash`, each line on its own). The Python guard
+read such a string as one word; the strings are checked after the rest of the command passed, so a command it
+blocked keeps its reason. A quoting error in the command allows it, so a typo never locks
 the shell; any other failure blocks it and is logged. Input nested too deep to check blocks.
 
 ### `claude-guard read`
