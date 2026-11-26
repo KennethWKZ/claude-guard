@@ -694,3 +694,237 @@ fn the_entity_command_follows_the_schema() {
         "a schema that is not UTF-8 raises"
     );
 }
+
+// ------------------------------------------------------------------------------------------------ shadow mode
+
+/// A stand-in for the repo's Python hook: the two functions the shadow shim needs. Its live records would go to
+/// LIVE/, which the shadow must never reach. `fake` in the input picks what it does.
+const FAKE_REFERENCE: &str = r#"import json, os, re, sys
+def record_path(repo, session_id):
+    s = re.sub(r"[^A-Za-z0-9_-]", "_", str(session_id or ""))[:80]
+    return os.path.join(repo, "LIVE", s + ".json") if s else None
+def main():
+    data = json.load(sys.stdin)
+    mode = data.get("fake", "")
+    path = record_path(os.environ["CLAUDE_PROJECT_DIR"], data.get("session_id"))
+    if mode == "notice":
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "OTHER: a. STALE."}}))
+    if mode == "record":
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write("{}")
+"#;
+
+impl Repo {
+    /// `repo post-read --shadow-compare` (the detached half, run in the foreground): the log line it wrote.
+    fn shadow(&self, reference: &str, records: Option<&str>, input: &str) -> Value {
+        let log = self.p("out/shadow.log");
+        let mut args = vec![
+            BIN,
+            "repo",
+            "post-read",
+            "--shadow-compare",
+            "--reference",
+            reference,
+            "--log",
+            &log,
+        ];
+        if let Some(r) = records {
+            args.extend(["--records", r]);
+        }
+        let o = run_in(
+            &args,
+            input,
+            &[("CLAUDE_PROJECT_DIR", &self.d)],
+            Some(&self.d),
+        );
+        assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+        let text = fs::read_to_string(&log).unwrap();
+        serde_json::from_str(text.lines().last().unwrap()).unwrap()
+    }
+}
+
+fn verdict(l: &Value) -> (&str, &str, bool, bool, bool) {
+    (
+        l["rust"].as_str().unwrap(),
+        l["reference"].as_str().unwrap(),
+        l["same"].as_bool().unwrap(),
+        l["same_reason"].as_bool().unwrap(),
+        l["records_same"].as_bool().unwrap(),
+    )
+}
+
+#[test]
+fn shadow_compares_in_its_own_records() {
+    let r = Repo::new("shadow");
+    let fake = r.p("hooks/fake.py");
+    fs::create_dir_all(r.p("hooks")).unwrap();
+    fs::write(&fake, FAKE_REFERENCE).unwrap();
+    let sh = r.p("sh");
+    let call = |sid: &str, fake_mode: &str| {
+        json!({"session_id": sid, "tool_name": "Bash", "tool_input": {"command": "true"}, "fake": fake_mode})
+            .to_string()
+    };
+    let l = r.shadow(&fake, Some(&sh), &call("s1", ""));
+    assert_eq!(verdict(&l), ("none", "none", true, true, true));
+    assert_eq!(
+        (l["hook"].as_str(), l["session_id"].as_str()),
+        (Some("repo-post-read"), Some("s1"))
+    );
+    let l = r.shadow(&fake, Some(&sh), &call("s1", "notice"));
+    assert_eq!(verdict(&l), ("none", "elsewhere", false, false, true));
+    // Input that isn't an object: both raise, and neither writes the repo's error log.
+    let l = r.shadow(&fake, Some(&sh), "[]");
+    assert_eq!(verdict(&l), ("crash", "crash", true, true, true));
+    assert!(!std::path::Path::new(&r.p("out/errors.log")).exists());
+    // The reference writes a record Rust doesn't: logged once, then rs/ is a copy of py/.
+    let l = r.shadow(&fake, Some(&sh), &call("s2", "record"));
+    assert_eq!(verdict(&l), ("none", "none", false, false, false));
+    assert_eq!(
+        fs::read_to_string(format!("{sh}/rs/s2.json")).unwrap(),
+        "{}"
+    );
+    let l = r.shadow(&fake, Some(&sh), &call("s2", ""));
+    assert_eq!(verdict(&l), ("none", "none", true, true, true));
+    // Rust's record for a read; the stand-in writes none.
+    let read = json!({"session_id": "s3", "tool_name": "Read", "tool_input": {"file_path": r.p("records/people/ana.md")}});
+    let l = r.shadow(&fake, Some(&sh), &read.to_string());
+    assert_eq!(verdict(&l), ("none", "none", false, false, false));
+    assert!(
+        !std::path::Path::new(&format!("{sh}/rs/s3.json")).exists(),
+        "resynced to py/: none"
+    );
+    for live in ["LIVE", "state/reads", "hooks/__pycache__"] {
+        assert!(
+            !std::path::Path::new(&r.p(live)).exists(),
+            "{live}: the shadow never writes the live records or bytecode"
+        );
+    }
+    // Default folder: <record_dir>-shadow.
+    r.shadow(&fake, None, &call("s4", "record"));
+    assert!(std::path::Path::new(&r.p("state/reads-shadow/py/s4.json")).exists());
+    assert!(std::path::Path::new(&r.p("state/reads-shadow/rs/s4.json")).exists());
+    // No config: the hook is off, nothing to compare.
+    fs::remove_file(r.p(".claude/repo-guard.json")).unwrap();
+    let before = fs::read_to_string(r.p("out/shadow.log")).unwrap();
+    r.shadow(&fake, Some(&sh), &call("s1", "notice"));
+    assert_eq!(fs::read_to_string(r.p("out/shadow.log")).unwrap(), before);
+}
+
+#[test]
+fn shadow_returns_at_once_and_logs_in_the_background() {
+    let r = Repo::new("shadow-bg");
+    let fake = r.p("hooks/fake.py");
+    fs::create_dir_all(r.p("hooks")).unwrap();
+    fs::write(&fake, FAKE_REFERENCE).unwrap();
+    let log = r.p("out/shadow.log");
+    let input = json!({"session_id": "b1", "tool_name": "Bash", "tool_input": {"command": "cat records/people/ana.md"}, "cwd": r.d})
+        .to_string();
+    let o = run_in(
+        &[
+            BIN,
+            "repo",
+            "post-read",
+            "--shadow",
+            "--reference",
+            &fake,
+            "--log",
+            &log,
+        ],
+        &input,
+        &[("CLAUDE_PROJECT_DIR", &r.d)],
+        Some(&r.d),
+    );
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    for _ in 0..200 {
+        if let Ok(t) = fs::read_to_string(&log) {
+            let l: Value = serde_json::from_str(t.lines().next().unwrap()).unwrap();
+            assert_eq!(l["hook"], "repo-post-read");
+            assert!(!t.contains("ana"), "no command or path in the log");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("no shadow line");
+}
+
+#[test]
+fn shadow_usage() {
+    let r = Repo::new("shadow-usage");
+    for args in [
+        vec!["repo", "post-read", "--shadow"],
+        vec![
+            "repo",
+            "post-read",
+            "--shadow",
+            "--reference",
+            "a",
+            "--reference",
+            "b",
+        ],
+        vec![
+            "repo",
+            "pre-bash",
+            "--shadow",
+            "--reference",
+            "a",
+            "--records",
+            "x",
+        ],
+        vec!["repo", "post-read", "--shadow", "--reference"],
+    ] {
+        let mut a = vec![BIN];
+        a.extend(args.iter());
+        assert_eq!(run_in(&a, "{}", &[], Some(&r.d)).code, 64, "{args:?}");
+    }
+}
+
+/// The real hook through the shim, when the differential test's env names it: every call agrees.
+#[test]
+fn shadow_agrees_with_the_real_reference() {
+    let (Ok(hook), Ok(config)) = (
+        std::env::var("CLAUDE_GUARD_REF_REPO_READ"),
+        std::env::var("CLAUDE_GUARD_REF_REPO_CONFIG"),
+    ) else {
+        eprintln!(
+            "shadow real reference: skipped (CLAUDE_GUARD_REF_REPO_READ / CLAUDE_GUARD_REF_REPO_CONFIG unset)"
+        );
+        return;
+    };
+    let r = Repo::new("shadow-real");
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    fs::write(r.p(".claude/repo-guard.json"), cfg.to_string()).unwrap();
+    let dir = cfg["post_read"]["tracked_dirs"][0].as_str().unwrap();
+    let (x, y) = (format!("{dir}/shadow/x.md"), format!("{dir}/shadow/y.md"));
+    r.write(&x, "x\n");
+    r.write(&y, "y\n");
+    let read = |sid: &str, rel: &str| {
+        json!({"session_id": sid, "tool_name": "Read", "tool_input": {"file_path": r.p(rel)}})
+            .to_string()
+    };
+    let bash = |sid: &str, cmd: &str| {
+        json!({"session_id": sid, "tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": r.d})
+            .to_string()
+    };
+    let mut kinds = Vec::new();
+    let mut step = |input: String| {
+        let l = r.shadow(&hook, None, &input);
+        assert!(
+            l["same"].as_bool().unwrap() && l["same_reason"].as_bool().unwrap(),
+            "{l}"
+        );
+        kinds.push(l["rust"].as_str().unwrap().to_string());
+    };
+    step(read("a", &x));
+    step(bash("a", &format!("cat {y}")));
+    r.change(&x);
+    step(bash("a", "ls"));
+    r.change(&y);
+    step(bash("a", "touch nothing"));
+    step(read("b", &y));
+    r.change(&y);
+    step(read("b", &x));
+    step(bash("b", "git status"));
+    for k in ["elsewhere", "during", "none"] {
+        assert!(kinds.iter().any(|x| x == k), "{k} in {kinds:?}");
+    }
+}

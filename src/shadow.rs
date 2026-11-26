@@ -10,6 +10,14 @@
 //!   Python Bash hooks, in its settings' order) side by side, as Claude Code does; the reference verdict is the
 //!   first block among them, else an allow. A reference that crashes logs to the repo's own error log, as it does
 //!   when it runs as the hook, so a crash shows there twice during the shadow week.
+//! - repo post-read writes a record per session, so neither side may touch the live one. Each side keeps its own
+//!   records under the shadow folder (`--records`, default `<record_dir>-shadow` in the repo): `py/` for the
+//!   reference, `rs/` for Rust. One lock around each pair of runs feeds both the same calls in the same order, so
+//!   the two folders must stay byte-identical. The reference is the repo's Python hook, loaded by a small shim
+//!   (`POST_READ_SHIM`) that points its `record_path` at `py/` and reports a crash by exit code instead of writing
+//!   the repo's error log; Rust's crash isn't logged either. When the records differ, `rs/` gets a copy of `py/`,
+//!   so one difference is logged once, not again on every later call. This session's own Edits (which the repo's
+//!   Edit hook records in the live folder) reach neither side, so both report them alike.
 //! - husky copies files, so its reference can't be run a second time. The hook itself works out what it would
 //!   copy (dry run) before detaching, which is before the Python hook (40 ms of start-up) copies anything; the
 //!   detached copy waits for the Python hook and checks that it copied exactly those items. A worktree the
@@ -19,7 +27,7 @@
 //! transcript, never a command, a path or file contents.
 
 use crate::hookio::{self, py_str};
-use crate::{bash, husky, prompt, read, repo, session_name, web};
+use crate::{bash, husky, prompt, pyfs, read, repo, repo_read, session_name, web};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -36,11 +44,28 @@ pub struct Options {
     pub policy: Option<String>,
     /// web: pre or post.
     pub web_mode: Option<String>,
+    /// repo post-read: the shadow records folder (default `<record_dir>-shadow` in the repo).
+    pub records: Option<String>,
     pub log: String,
 }
 
 impl Options {
     fn args(&self) -> Vec<String> {
+        if self.hook == "repo-post-read" {
+            let mut a: Vec<String> = vec![
+                "repo".into(),
+                "post-read".into(),
+                "--shadow-compare".into(),
+                "--reference".into(),
+                self.reference.clone(),
+                "--log".into(),
+                self.log.clone(),
+            ];
+            if let Some(r) = &self.records {
+                a.extend(["--records".into(), r.clone()]);
+            }
+            return a;
+        }
         if self.hook == "repo" {
             let mut a: Vec<String> =
                 vec!["repo".into(), "pre-bash".into(), "--shadow-compare".into()];
@@ -148,7 +173,11 @@ struct Line<'a> {
 }
 
 fn write_line(log: &str, l: Line) {
-    let line = format!(
+    append(log, &line_text(l));
+}
+
+fn line_text(l: Line) -> String {
+    format!(
         "{{\"time\": {}, \"hook\": {}, \"session_id\": {}, \"tool_use_id\": {}, \"rust\": {}, \"reference\": {}, \"same\": {}, \"same_reason\": {}, \"rust_ms\": {:.1}, \"reference_ms\": {:.1}}}",
         py_str(&crate::now_utc()),
         py_str(l.hook),
@@ -160,8 +189,7 @@ fn write_line(log: &str, l: Line) {
         l.same_reason,
         l.rust_ms,
         l.reference_ms
-    );
-    append(log, &line);
+    )
 }
 
 fn append(path: &str, line: &str) {
@@ -231,6 +259,7 @@ pub fn compare(opts: &Options) {
         "web" => compare_web(opts, &payload),
         "session-name" => compare_session_name(opts, &payload),
         "repo" => compare_repo(opts, &payload),
+        "repo-post-read" => compare_post_read(opts, &payload),
         _ => {}
     }
 }
@@ -673,4 +702,176 @@ fn compare_husky(opts: &Options, payload: &[u8]) {
             reference_ms: ms(t),
         },
     );
+}
+
+/// Runs a stale-read hook's `main()` with its records in another folder: `python3 -I -c SHIM <hook> <folder>`.
+/// The hook must define `record_path(repo, session_id)` and `main()`. Exit 3: `main()` raised (the hook itself
+/// would have logged it and let the call through). No bytecode is written next to the hook.
+pub const POST_READ_SHIM: &str = r#"import importlib.util, os, sys
+sys.dont_write_bytecode = True
+hook, folder = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("stale_read_shadow", hook)
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+live = g.record_path
+def record_path(repo, session_id):
+    p = live(repo, session_id)
+    return os.path.join(folder, os.path.basename(p)) if p else None
+g.record_path = record_path
+try:
+    g.main()
+except Exception:
+    sys.stdout.flush()
+    sys.exit(3)
+"#;
+
+/// What a post-read output says: none, elsewhere, during, elsewhere+during, crash, warn (a systemMessage), or
+/// notice (some other text). Kinds come from the config's message templates (their text before `{files}`).
+fn post_read_rule(out: &str, crashed: bool, cfg: &repo_read::ReadConfig) -> String {
+    if crashed {
+        return "crash".into();
+    }
+    let out = out.trim();
+    if out.is_empty() {
+        return "none".into();
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(out) else {
+        return "bad-output".into();
+    };
+    let Some(text) = v["hookSpecificOutput"]["additionalContext"].as_str() else {
+        return if v.get("systemMessage").is_some() {
+            "warn".into()
+        } else {
+            "bad-output".into()
+        };
+    };
+    let has = |tpl: &str| {
+        let head = tpl.split("{files}").next().unwrap_or("");
+        !head.is_empty() && text.contains(head)
+    };
+    match (has(&cfg.msg_elsewhere), has(&cfg.msg_during)) {
+        (true, true) => "elsewhere+during",
+        (true, false) => "elsewhere",
+        (false, true) => "during",
+        (false, false) => "notice",
+    }
+    .into()
+}
+
+/// Make `rs` a copy of `py` (or remove it when `py` is gone), so one difference is logged once.
+fn resync(py: &str, rs: &str) {
+    match std::fs::read(py) {
+        Ok(bytes) => {
+            let tmp = format!("{rs}.{}.sync", std::process::id());
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, rs);
+            }
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(rs);
+        }
+    }
+}
+
+fn compare_post_read(opts: &Options, input: &[u8]) {
+    let project = std::env::var("CLAUDE_PROJECT_DIR").unwrap_or_default();
+    if project.is_empty() {
+        return;
+    }
+    let Ok((_, cfg)) = repo_read::load_config(&project) else {
+        // No usable config: the hook is off for this repo (the live hook says so), nothing to compare.
+        return;
+    };
+    let records = opts
+        .records
+        .clone()
+        .unwrap_or_else(|| format!("{}-shadow", pyfs::join(&project, &cfg.record_dir)));
+    let (py_dir, rs_dir) = (format!("{records}/py"), format!("{records}/rs"));
+    let fail = |why: String| {
+        append(
+            &opts.log,
+            &format!(
+                "{{\"time\": {}, \"hook\": \"repo-post-read\", \"error\": {}}}",
+                py_str(&crate::now_utc()),
+                py_str(&why)
+            ),
+        )
+    };
+    for d in [&py_dir, &rs_dir] {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            return fail(format!("shadow records folder: {e}"));
+        }
+    }
+    // One pair at a time, so both folders see the calls in the same order.
+    let _order = match repo_read::lock(&format!("{records}/order")) {
+        Ok(l) => l,
+        Err(e) => return fail(format!("shadow lock: {e}")),
+    };
+    let mut rcfg = cfg.clone();
+    rcfg.record_dir = rs_dir.clone();
+    let t = Instant::now();
+    let rust = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        repo_read::run(input, &project, &rcfg)
+    }))
+    .unwrap_or_else(|_| Err("panic".into()));
+    let rust_ms = ms(t);
+    let t = Instant::now();
+    let py = run(
+        &[
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            POST_READ_SHIM,
+            &opts.reference,
+            &py_dir,
+        ],
+        input,
+        Duration::from_secs(8),
+    );
+    let reference_ms = ms(t);
+    let rust_out = match &rust {
+        Ok(Some(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let rust_rule = post_read_rule(&rust_out, rust.is_err(), &cfg);
+    let (ref_rule, ref_out) = match &py {
+        None => ("reference-not-run".to_string(), String::new()),
+        Some(r) if r.timed_out => ("reference-timeout".to_string(), String::new()),
+        Some(r) => {
+            let out = String::from_utf8_lossy(&r.stdout).into_owned();
+            let out = out.strip_suffix('\n').unwrap_or(&out).to_string();
+            match r.code {
+                Some(0) => (post_read_rule(&out, false, &cfg), out),
+                Some(3) => ("crash".to_string(), out),
+                _ => ("reference-error".to_string(), String::new()),
+            }
+        }
+    };
+    let records_same = match repo_read::record_file(input, &project, &rcfg) {
+        None => true,
+        Some(rs) => {
+            let py_rec = format!("{py_dir}/{}", pyfs::basename(&rs));
+            let same = std::fs::read(&py_rec).ok() == std::fs::read(&rs).ok();
+            if !same {
+                resync(&py_rec, &rs);
+            }
+            same
+        }
+    };
+    let same = ref_rule == rust_rule && records_same;
+    let text = line_text(Line {
+        hook: "repo-post-read",
+        input,
+        same,
+        same_reason: same && ref_out == rust_out,
+        rust: rust_rule,
+        reference: ref_rule,
+        rust_ms,
+        reference_ms,
+    });
+    let text = format!(
+        "{}, \"records_same\": {records_same}}}",
+        text.strip_suffix('}').unwrap_or(&text)
+    );
+    append(&opts.log, &text);
 }

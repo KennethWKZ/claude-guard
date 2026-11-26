@@ -981,11 +981,11 @@ fn bash_reads(
 
 /// The record file, locked (`flock`, exclusive) while it is read and written back: a session's tool calls run in
 /// parallel. The folder is made first, as Python made it.
-struct Locked(
+pub(crate) struct Locked(
     #[expect(dead_code, reason = "held for its lock; closing it releases the lock")] fs::File,
 );
 
-fn lock(path: &str) -> Res<Locked> {
+pub(crate) fn lock(path: &str) -> Res<Locked> {
     fs::create_dir_all(pyfs::dirname(path)).map_err(|e| format!("OSError: {e}"))?;
     let f = fs::OpenOptions::new()
         .read(true)
@@ -1086,6 +1086,16 @@ impl Tool {
 }
 
 /// What one call did: the notice to print (if any). Err is an internal error (logged; the tool result passes).
+/// The record file a hook input maps to, or None (no session id, input that isn't a JSON object). Shadow mode
+/// compares the two sides' copies of it.
+pub fn record_file(input: &[u8], repo: &str, cfg: &ReadConfig) -> Option<String> {
+    let Ok(Value::Object(data)) = hookio::parse_py(input) else {
+        return None;
+    };
+    let repo = pyfs::realpath(repo).ok()?;
+    record_path(cfg, &repo, data.get("session_id"))
+}
+
 pub fn run(input: &[u8], repo: &str, cfg: &ReadConfig) -> Res<Option<String>> {
     let data = match hookio::parse_py(input) {
         Ok(Value::Object(d)) => d,

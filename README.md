@@ -246,6 +246,16 @@ never a block: an internal error prints nothing and logs one line to `error_log`
 from a Python hook and checked against it by `tests/differential_repo_read.rs`, which runs when
 `CLAUDE_GUARD_REF_REPO_READ` and `CLAUDE_GUARD_REF_REPO_CONFIG` point at the reference hook and its config.
 
+`repo post-read --shadow --reference <hook> [--records DIR]` runs next to the Python hook during a shadow week. It
+prints nothing and returns at once; a detached copy runs both sides, each with its own records under `DIR` (default
+`<record_dir>-shadow`: `py/` and `rs/`), never the live ones. One lock around each pair feeds both the same calls in
+order, so their records must stay byte-identical. The Python hook runs through a small shim that points its
+`record_path` at `py/`, so the hook needs `record_path(repo, session_id)` and `main()`. Each line in the shadow log
+gives the notice kind on each side (`none`, `elsewhere`, `during`, `elsewhere+during`, `crash`), `same`,
+`same_reason` (identical output) and `records_same`. After a records difference, `rs/` is reset to a copy of `py/`,
+so the difference is logged once. This session's own edits reach neither side's records, so both report them the
+same way.
+
 ### `claude-guard dns-nxdomain`
 
 The guards only see what Claude's tools do. A script Claude runs (Playwright, a Node script) fetches on its own. For

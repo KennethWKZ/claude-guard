@@ -14,6 +14,8 @@
 //!                         shadow mode against the repo's Python hooks, given in its settings' order
 //!   claude-guard repo post-read [--crash-log F]
 //!                         PostToolUse Read|Bash: tells a session a file it read was changed by someone else since
+//!   claude-guard repo post-read --shadow --reference F [--records DIR] [--log F]
+//!                         shadow mode against the repo's Python hook, each side with its own records under DIR
 //!   claude-guard dns-nxdomain [--port N] [--log F]
 //!                         launchd daemon: NXDOMAIN for every DNS query on 127.0.0.1:10053 (was dns-nxdomain.py)
 //!   claude-guard <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F]
@@ -77,7 +79,7 @@ fn home() -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | repo pre-bash --shadow --reference F [--reference F ...] [--log F] | repo post-read [--crash-log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
+        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | repo pre-bash --shadow --reference F [--reference F ...] [--log F] | repo post-read [--crash-log F] | repo post-read --shadow --reference F [--records DIR] [--log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
     );
     std::process::exit(64);
 }
@@ -104,30 +106,35 @@ fn main() {
             Some("--shadow" | "--shadow-compare")
         )
     {
-        // `repo pre-bash --shadow --reference <hook> [--reference <hook> ...] [--log F]`.
-        if args[1] != "pre-bash" {
+        // `repo pre-bash --shadow --reference <hook> [--reference <hook> ...] [--log F]`, or
+        // `repo post-read --shadow --reference <hook> [--records DIR] [--log F]`.
+        let post = args[1] == "post-read";
+        if args[1] != "pre-bash" && !post {
             usage();
         }
         let mut opts = shadow::Options {
-            hook: "repo".into(),
+            hook: if post { "repo-post-read" } else { "repo" }.into(),
             reference: String::new(),
             references: Vec::new(),
             pip_reference: String::new(),
             terms: None,
             policy: None,
             web_mode: None,
+            records: None,
             log: format!("{}/.local/state/claude-guard/shadow.log", home()),
         };
         let mut it = args[3..].iter();
         while let Some(a) = it.next() {
             let v = it.next().cloned().unwrap_or_else(|| usage());
             match a.as_str() {
-                "--reference" => opts.references.push(v),
+                "--reference" if post && opts.reference.is_empty() => opts.reference = v,
+                "--reference" if !post => opts.references.push(v),
+                "--records" if post => opts.records = Some(v),
                 "--log" => opts.log = v,
                 _ => usage(),
             }
         }
-        if opts.references.is_empty() {
+        if opts.references.is_empty() && opts.reference.is_empty() {
             usage();
         }
         let compare = args[2] == "--shadow-compare";
@@ -186,6 +193,7 @@ fn main() {
             terms: None,
             policy: None,
             web_mode: None,
+            records: None,
             log: format!("{h}/.local/state/claude-guard/shadow.log"),
         };
         let mut flags = &rest[1..];
