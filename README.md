@@ -129,10 +129,12 @@ Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `ba
    every spelling (`-fr`, `-r -f`, `--recursive --force`, `..` tricks).
 2. Commands that name a secrets env file (`.env`, `.env.local`, `prod.env`, `.envrc`, ...) directly, through a glob
    or through brace expansion; recursive `grep`; `rg --hidden`/`--no-ignore` without `-g '!.env*'`. Templates
-   (`.env.example`, ...) stay readable, and jq/yq filters such as `'.env.FOO'` are not files.
+   (`.env.example`, ...) stay readable, and jq/yq filters such as `'.env.FOO'` are not files. File tests only test:
+   `[ -f .env ]`, `test -f .env`, and (Rust only) `[[ -f .env && -s .env ]]`, `[ ! -f .env ]`, `test ! -e .envrc`.
 3. `git push --force` / `-f` (`--force-with-lease` is allowed).
 4. `sudo`.
-5. `pip install` (tells Claude to use `uv` instead).
+5. `pip install` (tells Claude to use `uv` instead), also after a keyword, wrapper or assignment (`then pip install`,
+   `X=1 pip install`; Rust only).
 6. [rust-anything](https://crates.io/crates/rust-anything) subcommands other than `analyze`, `map`, `doctor` and
    `help` (and `--help` / `--version`). The rest build, run or edit the code being ported; deny their MCP tools
    (`mcp__rust-anything__*`) too, so the CLI isn't the way round. A subcommand added later is blocked until it's
@@ -155,7 +157,9 @@ longer hides the lines after it. A heredoc whose command's output is piped into 
 `cat <<EOF |` with the shell on the first command line after the body) has its body checked as commands, as written:
 what a filter changes isn't known, so a filter that adds a blocked command isn't caught. Heredocs fed through a
 wrapper (`timeout 9 bash <<EOF`, `ssh host <<EOF`) or whose output is run (`eval "$(cat <<EOF …)"`, `$(cat <<EOF …)` as
-a command, `bash <(cat <<EOF …)`) count as fed to a shell, and a `case` pattern's `)` doesn't end a `$(…)`.
+a command, `bash <(cat <<EOF …)`) count as fed to a shell, and a `case` pattern's `)` doesn't end a `$(…)`. Command
+substitutions are checked inside double quotes and backticks too (`echo "$(cat .env)"`, ``x=`sudo ls` ``; Rust only:
+the Python guard read `"$(…)"` as one word and never looked inside backticks).
 
 The rules also hold for what a wrapper runs (Rust only):
 

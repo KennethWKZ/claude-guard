@@ -110,13 +110,20 @@ fn pip_rule() {
         format!("ls &{p} install x"),
         format!("echo hi\n{p} install x"),
         format!("cd /tmp && python3 -m {p} install -r r.txt"),
+        // block-pip's pattern missed these (leading blanks, a keyword or an assignment first); each simple command
+        // is now checked too.
+        format!("  {p} install x"),
+        format!("ls;\n  {p} install x"),
+        format!("if true; then {p} install x; fi"),
+        format!("for a in b; do {p} install x; done"),
+        format!("{{ {p} install x; }}"),
+        format!("X=1 {p} install x"),
     ];
     let allow = [
         format!("uv {p} install x"),
         format!("{p}x install x"),
         format!("echo {p} install"),
-        format!("  {p} install x"),
-        format!("ls;\n  {p} install x"),
+        format!("echo \"{p} install x\""),
         format!("{p} list"),
         "npm install".to_string(),
     ];
@@ -1800,6 +1807,79 @@ fn script_files_on_disk_every_rule() {
         fails.len(),
         fails.join("\n")
     );
+}
+
+#[test]
+fn test_brackets_are_existence_tests() {
+    // `[[ ... ]]`, `[ ! ... ]` and `test ! ...` only test a file; what follows them is still checked.
+    every_rule_table(
+        &[
+            "[[ -f .env ]] && C",
+            "[[ -f .env && -s .env ]] || C",
+            "[[ ! -e .env ]]; C",
+            "if [[ -r .envrc ]]; then C; fi",
+            "[ ! -f .env ] && C",
+            "test ! -f .env || C",
+            // A substitution inside the test is run.
+            "[[ \"$(C)\" == x ]]",
+            "[ -n \"$(C)\" ]",
+        ],
+        &[
+            "[[ -f .env ]]",
+            "[[ -e .env.local ]] && echo y",
+            "[[ -f .env && -s .env ]]",
+            "[[ ! -f .env ]] && cp .env.example .env",
+            "[[ -f .env || -f .env.local ]]",
+            "[[ -r .envrc ]]",
+            "if [[ -f .env.production ]]; then echo prod; fi",
+            "[[ -f prod.env ]] && echo y",
+            "[ ! -f .env ]",
+            "[ ! -e .env ] && touch .env",
+            "test ! -f .env",
+            "[ \\( -f .env \\) ]",
+            "[[ $x =~ ^(a|b)$ ]] && echo y",
+        ],
+    );
+    // Reading the file after the test is still blocked.
+    for c in [
+        "[[ -f .env ]] && source .env",
+        "[[ -f .env ]] && cat .env",
+        "[ -f .env ] && . ./.env",
+    ] {
+        let o = run(&["bash"], &bash_input(c));
+        assert!(
+            o.stdout.contains("reading a secrets file"),
+            "{c} -> {}",
+            o.stdout
+        );
+    }
+}
+
+#[test]
+fn substitutions_in_double_quotes_and_backticks_every_rule() {
+    every_rule_table(
+        &[
+            "echo \"$(C)\"",
+            "x=\"$(C)\"",
+            "echo \"a $(C) b\"",
+            "echo \"$(echo \"$(C)\")\"",
+            "echo `C`",
+            "echo \"`C`\"",
+            "x=`C`",
+            "printf '%s' \"$(cd x && C)\"",
+            "git commit -m \"fix `C`\"",
+        ],
+        &[
+            "echo \"$((1+2)) $(date) `date`\"",
+            "echo '$(sudo ls)' '`git push -f`'",
+            "git commit -m \"$(cat <<'EOF'⏎fix: sudo ls and git push -f are blocked⏎EOF⏎)\"",
+            "x=\"$(git rev-parse HEAD)\"",
+            "echo \"$HOME $(pwd)\"",
+            "# echo \"$(sudo ls)\"",
+        ],
+    );
+    let o = run(&["bash"], &bash_input("x=\"$(<.env)\""));
+    assert!(o.stdout.contains("reading a secrets file"), "{}", o.stdout);
 }
 
 #[test]

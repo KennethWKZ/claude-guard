@@ -140,6 +140,15 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "cat > run.sh <<EOF\n@@\nEOF\nbash run.sh",
     "echo '@@' > run.sh; sh run.sh",
     "x=\"$(case $y in a) bash <<EOF;; esac\n@@\nEOF\n)\"",
+    "echo \"$(@@)\"",
+    "x=`@@`",
+    "echo \"a `@@` b\"",
+    "[[ -f .env ]] && echo y",
+    "[[ -f .env && -s .env.local ]]",
+    "[ ! -f .env ] && touch .env",
+    "test ! -e .envrc",
+    "if true; then @@; fi",
+    "{ @@; }",
 ];
 
 fn generate(rng: &mut Rng, dir: &str) -> String {
@@ -725,6 +734,46 @@ fn wrapped_kind(input: &str) -> Option<&'static str> {
     }
 }
 
+fn input_command(input: &str) -> String {
+    let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+    v["tool_input"]["command"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// True if the command holds `$(` inside double quotes, or a backtick outside single quotes (roughly).
+fn quoted_substitution(input: &str) -> bool {
+    let cmd = input_command(input);
+    let (mut single, mut double) = (false, false);
+    let chars: Vec<char> = cmd.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        match c {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '`' if !single => return true,
+            '$' if double && chars.get(i + 1) == Some(&'(') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A test command (`[[`, `[`, `test`) holding `!`, `(`, `&&`, `||` or `|`: Rust keeps those words in the test (as
+/// bash does: `[[ -f .env && -s .env ]]`, `[ ! -f .env ]`, the glob `[!a].env`); the Python guard split the command
+/// there and checked the rest as commands of their own.
+fn test_bracket(input: &str) -> bool {
+    let cmd = input_command(input);
+    let has_test = cmd.contains("[[")
+        || cmd
+            .split(|c: char| c.is_whitespace() || ";&|(){}".contains(c))
+            .any(|w| w == "[" || w == "test" || w.starts_with("[!"));
+    has_test
+        && ["!", "(", ")", "&&", "||", "|"]
+            .iter()
+            .any(|op| cmd.contains(op))
+}
+
 /// True if a line of the hook input's command has a `<<WORD` followed by a pipe into a shell, `source` or `.`, on
 /// that line or, when the line ends in `|`, as the first word of a later line.
 fn heredoc_piped_to_shell(input: &str) -> bool {
@@ -1047,6 +1096,16 @@ fn known_difference(
     {
         return Some("lone-surrogate-text");
     }
+    // `[[ -f .env ]]`, `[ ! -f .env ]`: an existence test in Rust (allowed); the Python guard split the test and read
+    // `.env` as a file a command opens.
+    // Also when both block but name other files, and when the test swallows a stray `)` or a missing `]]` (a syntax
+    // error bash refuses, so nothing runs).
+    if reference.stdout.contains("\"deny\"")
+        && (reference.stdout != rust.stdout || reference.code != rust.code)
+        && test_bracket(input)
+    {
+        return Some("test-bracket");
+    }
     // The rust-anything rule is Rust only (added after the port); Python allows those commands, or blocks them for
     // a later rule when Rust's check reaches the rust-anything run first (a heredoc body fed to a shell is checked
     // before the rest of the command). Same decision then; only the reason differs.
@@ -1081,6 +1140,16 @@ fn known_difference(
         }
         if let Some(kind) = nested_kind(input) {
             return Some(kind);
+        }
+        // A command substitution in double quotes or backticks is checked in Rust; the Python guard's shlex read
+        // `"$(...)"` as one word and never looked inside backticks.
+        if quoted_substitution(input) {
+            return Some("quoted-substitution");
+        }
+        // pip run as a simple command after blanks, a keyword or an assignment (`then pip install`): block-pip's
+        // pattern only matched at a line start or after ; & |.
+        if rust.code == 2 && input_command(input).replace('\\', "").contains("install") {
+            return Some("pip-in-simple-command");
         }
         // A newline outside quotes ends a command in Rust (second pass, after the Python reading passed); Python
         // read it as a space.

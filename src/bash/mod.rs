@@ -36,6 +36,10 @@
 //! for script files on disk it runs inside the project or a temp folder (`scripts`: `bash scripts/x.sh`,
 //! `cat x | bash`, 256 KiB cap). Rust only, all checked after the rest of the command passed.
 //!
+//! Command substitutions inside double quotes and backticks are checked too (`substitutions`); `[[ ... ]]`,
+//! `[ ! ... ]` and `test ! ...` stay one test command (`test_word`), so naming a `.env` there only tests it; pip is
+//! also matched per simple command (`then pip install`). Rust only.
+//!
 //! Same contract as the Python guard: a parse error allows the command (a quoting mistake never locks the
 //! shell); any other failure blocks it (fail closed) and is logged. Besides the command text, it reads only the
 //! script files the command runs (see `scripts`).
@@ -58,7 +62,7 @@ const KEYWORDS: &[&str] = &[
     "do", "then", "else", "elif", "if", "while", "until", "{", "}",
 ];
 const ENV_SAFE_VERBS: &[&str] = &[
-    "ls", "test", "[", "stat", "touch", "rm", "chmod", "mkdir", "echo", "printf", "ln",
+    "ls", "test", "[", "[[", "stat", "touch", "rm", "chmod", "mkdir", "echo", "printf", "ln",
 ];
 const WRITE_REDIRECTS: &[&str] = &[">", ">>", ">|", "&>", "&>>"];
 const JQ_VERBS: &[&str] = &["jq", "gojq", "jaq", "yq"];
@@ -656,6 +660,25 @@ fn heredoc_target(command: &str) -> Option<String> {
     seg.get(i + 1).cloned()
 }
 
+/// True if separator token `t` is a word of the test command being collected in `cur`: inside `[[ ... ]]`,
+/// `&&`, `||`, `|`, `!`, `(` and `)` are its operators; in `[ ... ]` and `test ...`, `!`, `(` and `)` are (Rust only:
+/// the Python guard split `[[ -f .env && -s .env ]]` and `[ ! -f .env ]` there and read the rest as a command).
+fn test_word(cur: &[String], t: &str) -> bool {
+    let Some(at) = cur
+        .iter()
+        .position(|w| !(contains(PREFIXES, w) || contains(KEYWORDS, w) || is_assignment(w)))
+    else {
+        return false;
+    };
+    let rest = &cur[at + 1..];
+    match cur[at].as_str() {
+        "[[" => !rest.iter().any(|w| w == "]]") && ["&&", "||", "|", "!", "(", ")"].contains(&t),
+        "[" => !rest.iter().any(|w| w == "]") && ["!", "(", ")"].contains(&t),
+        "test" => ["!", "(", ")"].contains(&t),
+        _ => false,
+    }
+}
+
 /// Split into simple commands: [verb, args...], skipping prefixes like `env`, `xargs`, keywords, VAR=value; each
 /// with the separator that ended it (`;` for the last).
 fn segments_with_seps(tokens: Vec<String>) -> Vec<(Vec<String>, String)> {
@@ -663,7 +686,7 @@ fn segments_with_seps(tokens: Vec<String>) -> Vec<(Vec<String>, String)> {
     let mut cur: Vec<String> = Vec::new();
     for t in tokens.into_iter().chain(std::iter::once(";".to_string())) {
         // "\n": an unquoted newline (`shlex::split_lines`) ends a command as `;` does.
-        if contains(SEPARATORS, &t) || t == "\n" {
+        if (contains(SEPARATORS, &t) || t == "\n") && !test_word(&cur, &t) {
             let skip = cur
                 .iter()
                 .take_while(|w| contains(PREFIXES, w) || contains(KEYWORDS, w) || is_assignment(w))
@@ -727,7 +750,7 @@ fn raw_segments(tokens: &[String]) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut cur: Vec<String> = Vec::new();
     for t in tokens.iter().chain(std::iter::once(&";".to_string())) {
-        if contains(SEPARATORS, t) || t == "\n" {
+        if (contains(SEPARATORS, t) || t == "\n") && !test_word(&cur, t) {
             let skip = cur
                 .iter()
                 .take_while(|w| contains(KEYWORDS, w) || is_assignment(w))
@@ -1090,8 +1113,14 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
         .flat_map(|s| wrappers::wrapped_commands(s))
         .collect();
     more.extend(scripts_run(&raw_segs, &mut written));
+    more.extend(substitutions(&command));
     let segs = segments_with_seps(raw);
     let disk = files_run(&raw_segs, &segs, &written);
+    // Each simple command with its keywords, wrappers and assignments dropped (`then pip install`, `X=1 pip
+    // install`, `{ pip install`): block-pip's pattern only matched at a line start or after ; & |.
+    if segs.iter().any(|(s, _)| PIP.is_match(&s.join(" "))) {
+        return true;
+    }
     if segs
         .iter()
         .flat_map(|(s, _)| nested_commands(s))
@@ -1324,6 +1353,104 @@ fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
     (out != command).then_some(out)
 }
 
+/// The bodies of `$(...)` and backtick substitutions, also inside double quotes, where the lexer reads
+/// `"$(cat .env)"` as one word (the Python guard never checked them). Single quotes, `$'...'` and comments hold none.
+fn substitutions(command: &str) -> Vec<String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum F {
+        Code,
+        Sub(usize, u32),
+        Tick(usize),
+        Single,
+        Double,
+        AnsiC,
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let mut stack = vec![F::Code];
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match *stack.last().unwrap_or(&F::Code) {
+            F::Single => {
+                if c == '\'' {
+                    stack.pop();
+                }
+            }
+            F::AnsiC => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '\'' {
+                    stack.pop();
+                }
+            }
+            F::Double => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    stack.pop();
+                } else if c == '$' && next == Some('(') {
+                    stack.push(F::Sub(i + 2, 0));
+                    i += 1;
+                } else if c == '`' {
+                    stack.push(F::Tick(i + 1));
+                }
+            }
+            top => {
+                let word_start =
+                    i == 0 || chars[i - 1].is_whitespace() || ";&|()<>".contains(chars[i - 1]);
+                match c {
+                    '\\' => i += 1,
+                    '#' if word_start => {
+                        while i < chars.len() && chars[i] != '\n' {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    '\'' => stack.push(F::Single),
+                    '"' => stack.push(F::Double),
+                    '$' if next == Some('\'') => {
+                        stack.push(F::AnsiC);
+                        i += 1;
+                    }
+                    '$' if next == Some('(') => {
+                        stack.push(F::Sub(i + 2, 0));
+                        i += 1;
+                    }
+                    '`' => {
+                        if let F::Tick(start) = top {
+                            out.push(chars[start..i].iter().collect());
+                            stack.pop();
+                        } else {
+                            stack.push(F::Tick(i + 1));
+                        }
+                    }
+                    '(' => {
+                        if let Some(F::Sub(_, depth)) = stack.last_mut() {
+                            *depth += 1;
+                        }
+                    }
+                    ')' => match stack.last_mut() {
+                        Some(F::Sub(_, depth)) if *depth > 0 => *depth -= 1,
+                        Some(F::Sub(start, _)) => {
+                            let start = *start;
+                            out.push(chars[start..i].iter().collect());
+                            stack.pop();
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    out.retain(|b| !b.trim().is_empty());
+    out.dedup();
+    out
+}
+
 /// The reason to block `command`, if any. Err is a crash (blocks).
 ///
 /// Two passes over the whole command: first reading a newline as a space, as the Python guard did, so a command it
@@ -1375,6 +1502,8 @@ fn check_mode(
     };
     let segs = segments_with_seps(raw);
     let mut nested: Vec<String> = piped_scripts(&segs);
+    // `$(...)` and backticks, also inside double quotes (`echo "$(cat .env)"`).
+    nested.extend(substitutions(&command));
     // What wrappers run: `timeout 9 CMD`, `ssh HOST CMD`, `docker exec C CMD`, `su -c STRING`, `find -exec CMD`.
     for rs in &raw_segs {
         nested.extend(wrappers::wrapped_commands(rs));
