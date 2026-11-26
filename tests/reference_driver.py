@@ -14,6 +14,10 @@ Usage: /usr/bin/python3 -I reference_driver.py bash <guard-bash.py>
          in/out as prompt (web-guard.py's own fail-open warning)
        /usr/bin/python3 -I reference_driver.py repo-bash <a repo's PreToolUse Bash hook>
          out: {"code": <exit code>, "stdout": ..., "stderr": ..., "crash": <main() raised, which the hook logs and allows>}
+       /usr/bin/python3 -I reference_driver.py repo-read <a repo's PostToolUse Read|Bash stale-read hook>
+         in:  {"input": <raw stdin>, "project": <CLAUDE_PROJECT_DIR>, "cwd": <process folder>}
+              or {"own_write": [<repo>, <session id>, <file path>]} (its record_own_write, as the Edit hook calls it)
+         out: {"stdout": ..., "crash": <main() raised, which the hook logs and lets through>}
 """
 import importlib.util
 import io
@@ -40,7 +44,7 @@ def clean(text):
 real = (sys.stdin, sys.stdout, sys.stderr)
 for line in real[0]:
     request = json.loads(line)
-    raw = request["input"]
+    raw = request.get("input", "")
     out, err = io.StringIO(), io.StringIO()
     sys.stdin, sys.stdout, sys.stderr = io.StringIO(raw), out, err
     result = {}
@@ -61,6 +65,18 @@ for line in real[0]:
             except Exception:
                 crash = True
             result = {"code": code, "stdout": clean(out.getvalue()), "stderr": clean(err.getvalue()), "crash": crash}
+        elif mode == "repo-read":
+            crash = False
+            try:
+                if "own_write" in request:
+                    g.record_own_write(*request["own_write"])
+                else:
+                    os.environ["CLAUDE_PROJECT_DIR"] = request["project"]
+                    os.chdir(request["cwd"])
+                    g.main()
+            except Exception:
+                crash = True
+            result = {"stdout": clean(out.getvalue()), "crash": crash}
         elif mode in ("prompt", "web"):
             sys.argv = [ref] + request.get("args", [])
             name = "guard-prompt.py" if mode == "prompt" else "web-guard.py"
@@ -82,4 +98,5 @@ for line in real[0]:
     finally:
         sys.stdin, sys.stdout, sys.stderr = real
     real[1].write(json.dumps(result) + "\n")
+    real[1].flush()
 real[1].flush()

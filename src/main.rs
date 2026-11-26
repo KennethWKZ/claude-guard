@@ -12,6 +12,8 @@
 //!                         PreToolUse Bash guards a repo configures in .claude/repo-guard.json (was a repo's Python hooks)
 //!   claude-guard repo pre-bash --shadow --reference F [--reference F ...] [--log F]
 //!                         shadow mode against the repo's Python hooks, given in its settings' order
+//!   claude-guard repo post-read [--crash-log F]
+//!                         PostToolUse Read|Bash: tells a session a file it read was changed by someone else since
 //!   claude-guard dns-nxdomain [--port N] [--log F]
 //!                         launchd daemon: NXDOMAIN for every DNS query on 127.0.0.1:10053 (was dns-nxdomain.py)
 //!   claude-guard <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F]
@@ -34,6 +36,7 @@ mod pyfs;
 mod pyre;
 mod read;
 mod repo;
+mod repo_read;
 mod repo_tree;
 mod session_name;
 mod shadow;
@@ -74,7 +77,7 @@ fn home() -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | repo pre-bash --shadow --reference F [--reference F ...] [--log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
+        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | repo pre-bash --shadow --reference F [--reference F ...] [--log F] | repo post-read [--crash-log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
     );
     std::process::exit(64);
 }
@@ -136,6 +139,15 @@ fn main() {
             }
         });
         std::process::exit(0);
+    }
+    if cmd == "repo" && args.get(1).map(String::as_str) == Some("post-read") {
+        // `repo post-read [--crash-log <file>]`: the stale-read notice; always exits 0.
+        let crash_log = match &args[2..] {
+            [] => None,
+            [flag, path] if flag == "--crash-log" => Some(path.clone()),
+            _ => usage(),
+        };
+        std::process::exit(repo_read::main(crash_log.as_deref()));
     }
     if cmd == "repo" {
         // `repo pre-bash [--crash-log <file>]`: the log override is for tests; the default comes from the config.

@@ -111,13 +111,16 @@ fn hex4(s: &[u8]) -> Option<u32> {
 /// floats, so they stay truthy numbers, and `py_float_name` gives back Python's `str()` of them.
 const PY_INF: &str = "1.7976931348623157e308";
 const PY_NEG_INF: &str = "-1.7976931348623157e308";
-const PY_NAN: &str = "1.7976931348623155e308";
+/// Far enough below `PY_INF` that serde_json's default (lossy, up to 1 ulp) float parser can't read it as `PY_INF`:
+/// the 17-digit `1.7976931348623155e308` did, so NaN read as inf.
+const PY_NAN: &str = "1.79769313486231e308";
 
 /// Python's `str()` of a float that stood in for inf, -inf or nan; None for any other value.
 pub fn py_float_name(f: f64) -> Option<&'static str> {
+    // Parsed the way `parse_py` parsed the stand-in (serde_json), so the comparison is exact.
     [(PY_INF, "inf"), (PY_NEG_INF, "-inf"), (PY_NAN, "nan")]
         .into_iter()
-        .find(|(s, _)| s.parse::<f64>().ok() == Some(f))
+        .find(|(s, _)| serde_json::from_str::<f64>(s).ok() == Some(f))
         .map(|(_, name)| name)
 }
 
@@ -291,5 +294,36 @@ pub fn py_truthy(v: &Value) -> bool {
         Value::String(s) => !s.is_empty(),
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nan_and_infinities_keep_their_names() {
+        let v = parse_py(b"[NaN, Infinity, -Infinity, 1e400, -1e400, 1.5]").unwrap();
+        let names: Vec<_> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| py_float_name(x.as_f64().unwrap()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("nan"),
+                Some("inf"),
+                Some("-inf"),
+                Some("inf"),
+                Some("-inf"),
+                None
+            ]
+        );
+        assert!(
+            v.as_array().unwrap().iter().all(py_truthy),
+            "stand-ins stay truthy"
+        );
     }
 }
