@@ -1193,6 +1193,15 @@ fn home() -> String {
     if h.is_empty() { "/".into() } else { h }
 }
 
+/// True for a redirection operator token (`>`, `>>`, `>|`, `<`, `&>`, `&>>`, `>&`, `<&`): the next token is the file
+/// or descriptor it redirects to. `2>` lexes as `2` then `>`.
+fn is_redirect_op(t: &str) -> bool {
+    matches!(
+        t,
+        ">" | ">>" | ">|" | "<" | "&>" | "&>>" | ">&" | "<&" | "<>"
+    )
+}
+
 /// arg with a leading ~, $HOME or ${HOME} replaced by the home folder; other args unchanged.
 fn home_path(arg: &str) -> String {
     for start in ["~", "$HOME", "${HOME}"] {
@@ -1817,7 +1826,12 @@ fn check_mode(
             {
                 let mut seen = HashSet::new();
                 let mut bad = Vec::new();
-                for a in args {
+                for (i, a) in args.iter().enumerate() {
+                    // A redirect's target (`2>/dev/null`, `> out.log`) is a file the shell opens, not one rm
+                    // deletes (Rust only: the Python guard listed it as a path).
+                    if i > 0 && is_redirect_op(&args[i - 1]) {
+                        continue;
+                    }
                     if !seen.insert(a.clone()) {
                         continue;
                     }

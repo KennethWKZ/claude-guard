@@ -153,6 +153,9 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "echo $(echo $(echo $(echo $(@@))))",
     "echo \"$(case a in a) @@;; esac)\"",
     "echo `@@`",
+    "rm -rf build 2>/dev/null",
+    "rm -rf dist >/dev/null 2>&1",
+    "rm -rf /srv/x 2>/dev/null",
     "x=$(date); @@",
     "echo $(pwd)&& @@",
     "echo \"$(@@)\"",
@@ -1209,6 +1212,7 @@ const KNOWN_KINDS: &[&str] = &[
     "string-runner",
     "argv-wrapper",
     "work-budget",
+    "rm-redirect-target",
 ];
 
 /// Differences that are intended. Anything else fails the test.
@@ -1239,6 +1243,14 @@ fn known_difference(
         .contains("more nested commands, strings and scripts")
     {
         return Some("work-budget");
+    }
+    // A redirect's target (`rm -rf x 2>/dev/null`) isn't an rm path in Rust; the Python guard listed it, so it
+    // blocked (or named it) where Rust allows (or names only the real paths).
+    if reference.stdout.contains("recursive force delete")
+        && reference.stdout != rust.stdout
+        && input_command(input).contains('>')
+    {
+        return Some("rm-redirect-target");
     }
     // The rust-anything rule is Rust only (added after the port); Python allows those commands, or blocks them for
     // a later rule when Rust's check reaches the rust-anything run first (a heredoc body fed to a shell is checked

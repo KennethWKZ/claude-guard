@@ -2470,6 +2470,52 @@ fn nul_bytes_in_scripts_every_rule() {
 }
 
 #[test]
+fn rm_redirect_targets_are_not_paths() {
+    // A redirect's target is a file the shell opens, not one rm deletes; a real path outside temp is still blocked.
+    let allow = [
+        "rm -rf \"$tmp\" 2>/dev/null",
+        "rm -rf build >/dev/null 2>&1",
+        "rm -rf dist &>/dev/null",
+        "rm -rf node_modules > /var/log/clean.log",
+        "rm -rf x >| /srv/out.txt",
+        "rm -rf x >> /srv/out.log",
+        "rm -rf coverage 2> /srv/err.log",
+        "bash -c 'rm -rf \"$d\" 2>/dev/null'",
+        "if ! rm -rf \"$snap\" \"$lists\" 2>/dev/null; then echo failed; fi",
+    ];
+    let deny = [
+        "rm -rf /srv/x 2>/dev/null",
+        "rm -rf /srv/x >/dev/null",
+        "rm -rf ~/x 2>/dev/null",
+        "rm -rf / > /dev/null",
+        "rm -rf x 2>/dev/null; rm -rf /srv/y",
+        "rm -rf /srv/x 2>/dev/null /srv/y",
+    ];
+    let mut fails = Vec::new();
+    for c in allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    for c in deny {
+        let o = run(&["bash"], &bash_input(c));
+        if !o.stdout.contains("recursive force delete") || o.stdout.contains("/dev/null") {
+            fails.push(format!(
+                "want deny without /dev/null :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [

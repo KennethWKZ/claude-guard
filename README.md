@@ -126,7 +126,8 @@ Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `ba
 ### `claude-guard bash`
 
 1. `rm` with recursive and force flags on an absolute path (`~` and `$HOME` count) outside `$TMPDIR` and `/tmp`, in
-   every spelling (`-fr`, `-r -f`, `--recursive --force`, `..` tricks).
+   every spelling (`-fr`, `-r -f`, `--recursive --force`, `..` tricks). A redirect's target (`2>/dev/null`,
+   `> out.log`) is a file the shell opens, not an rm path (Rust only; the Python guard listed it).
 2. Commands that name a secrets env file (`.env`, `.env.local`, `prod.env`, `.envrc`, ...) directly, through a glob
    or through brace expansion; recursive `grep`; `rg --hidden`/`--no-ignore` without `-g '!.env*'`. Templates
    (`.env.example`, ...) stay readable, and jq/yq filters such as `'.env.FOO'` are not files. File tests only test:
