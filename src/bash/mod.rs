@@ -32,12 +32,15 @@
 //!
 //! The rules also hold for what a wrapper runs (`wrappers`: argv wrappers with options, ssh, containers, su/runuser/
 //! sg, find -exec, watch/script/flock/env -S), for the command again with the values of variables it sets put in
-//! (`c='sudo ls'; bash -c "$c"`), and for scripts it writes and then runs (`cat > run.sh <<EOF ...; bash run.sh`).
-//! Rust only, all checked after the rest of the command passed.
+//! (`c='sudo ls'; bash -c "$c"`), for scripts it writes and then runs (`cat > run.sh <<EOF ...; bash run.sh`), and
+//! for script files on disk it runs inside the project or a temp folder (`scripts`: `bash scripts/x.sh`,
+//! `cat x | bash`, 256 KiB cap). Rust only, all checked after the rest of the command passed.
 //!
 //! Same contract as the Python guard: a parse error allows the command (a quoting mistake never locks the
-//! shell); any other failure blocks it (fail closed) and is logged. It only sees what is written in the command.
+//! shell); any other failure blocks it (fail closed) and is logged. Besides the command text, it reads only the
+//! script files the command runs (see `scripts`).
 
+mod scripts;
 mod wrappers;
 
 use crate::hookio::{self, py_truthy, py_type_name};
@@ -1058,16 +1061,16 @@ fn nested_commands(seg: &[String]) -> Vec<String> {
 
 /// True if a string `nested_commands` finds in `command`, at any depth, holds a `pip install` (block-pip's rule
 /// only read the command's own lines).
-fn pip_in_nested(command: &str, depth: usize) -> bool {
-    pip_in_nested_mode(command, depth, true)
+fn pip_in_nested(command: &str, cwd: &Cwd, depth: usize) -> bool {
+    pip_in_nested_mode(command, cwd, depth, true)
 }
 
-fn pip_in_nested_mode(command: &str, depth: usize, expand: bool) -> bool {
+fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> bool {
     if depth > MAX_DEPTH {
         return false; // check() already crashed (blocked) at this depth
     }
     let (command, bodies, mut written) = split_heredocs(command, true);
-    if bodies.iter().any(|b| pip_in_nested(b, depth + 1)) {
+    if bodies.iter().any(|b| pip_in_nested(b, cwd, depth + 1)) {
         return true;
     }
     let Ok(raw) = shlex::split_lines(&command) else {
@@ -1076,7 +1079,7 @@ fn pip_in_nested_mode(command: &str, depth: usize, expand: bool) -> bool {
     // Variables set in the command, once (as check_mode does).
     if expand {
         if let Some(x) = expand_vars(&command, &raw) {
-            if PIP.is_match(&x) || pip_in_nested_mode(&x, depth + 1, false) {
+            if PIP.is_match(&x) || pip_in_nested_mode(&x, cwd, depth + 1, false) {
                 return true;
             }
         }
@@ -1088,11 +1091,29 @@ fn pip_in_nested_mode(command: &str, depth: usize, expand: bool) -> bool {
         .collect();
     more.extend(scripts_run(&raw_segs, &mut written));
     let segs = segments_with_seps(raw);
-    segs.iter()
+    let disk = files_run(&raw_segs, &segs, &written);
+    if segs
+        .iter()
         .flat_map(|(s, _)| nested_commands(s))
         .chain(piped_scripts(&segs))
         .chain(more)
-        .any(|inner| PIP.is_match(&inner) || pip_in_nested(&inner, depth + 1))
+        .any(|inner| PIP.is_match(&inner) || pip_in_nested(&inner, cwd, depth + 1))
+    {
+        return true;
+    }
+    disk.iter().any(|(file, explicit)| {
+        let scripts::Script::Text(text, canon) =
+            scripts::read_script(file, cwd_str(cwd), *explicit)
+        else {
+            return false;
+        };
+        if !scripts::enter(&canon) {
+            return false;
+        }
+        let hit = PIP.is_match(&text) || pip_in_nested(&text, cwd, depth + 1);
+        scripts::leave(&canon);
+        hit
+    })
 }
 
 /// The reason to block the rust-anything run in one simple command, if it runs one that isn't read-only.
@@ -1150,7 +1171,7 @@ fn printed_to_file(seg: &[String]) -> Option<(String, String)> {
 
 /// The script file a simple command runs: `bash FILE`, `sh -x FILE`, `source FILE`, `. FILE`, `./FILE` or
 /// `/path/FILE` as the verb, also behind argv wrappers (`timeout 9 bash FILE`).
-fn runs_file(seg: &[String]) -> Option<String> {
+fn runs_file(seg: &[String]) -> Option<(String, bool)> {
     let mut seg = seg.to_vec();
     while let Some(inner) = wrappers::argv_wrapper_inner(&seg) {
         seg = inner;
@@ -1159,18 +1180,22 @@ fn runs_file(seg: &[String]) -> Option<String> {
     let verb = pyfs::basename(seg.first()?);
     if contains(C_SHELLS, verb) {
         let args = &seg[1..];
+        // `-c` runs a string, not the file; `-n` only reads it for syntax errors.
         if args
             .iter()
-            .any(|a| !a.starts_with("--") && dash_letters_contain(a, &['c']))
+            .any(|a| !a.starts_with("--") && dash_letters_contain(a, &['c', 'n']))
         {
             return None;
         }
-        return args.iter().find(|a| !a.starts_with('-')).cloned();
+        return args
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .map(|a| (a.clone(), true));
     }
     if verb == "source" || verb == "." {
-        return seg.get(1).cloned();
+        return seg.get(1).map(|a| (a.clone(), true));
     }
-    seg[0].contains('/').then(|| seg[0].clone())
+    seg[0].contains('/').then(|| (seg[0].clone(), false))
 }
 
 /// Bodies of scripts written in this command (heredocs in `written`, plus `echo`/`printf` to a file) that a later
@@ -1183,7 +1208,7 @@ fn scripts_run(raw_segs: &[Vec<String>], written: &mut Vec<(String, String)>) ->
     }
     let mut out = Vec::new();
     for rs in raw_segs {
-        if let Some(f) = runs_file(rs) {
+        if let Some((f, _)) = runs_file(rs) {
             for (w, body) in written.iter() {
                 if same_path(w, &f) {
                     out.push(body.clone());
@@ -1192,6 +1217,45 @@ fn scripts_run(raw_segs: &[Vec<String>], written: &mut Vec<(String, String)>) ->
         }
     }
     out
+}
+
+/// Script files on disk a command runs: (path as written, fed to a shell explicitly). `bash FILE`, `source FILE`,
+/// `./FILE` (`runs_file`), `cat FILE... | bash`, `bash < FILE`; files written in the same command are left to
+/// `scripts_run`.
+fn files_run(
+    raw_segs: &[Vec<String>],
+    segs: &[(Vec<String>, String)],
+    written: &[(String, String)],
+) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = raw_segs.iter().filter_map(|s| runs_file(s)).collect();
+    for w in segs.windows(2) {
+        if w[0].1 == "|" && pyfs::basename(&w[0].0[0]) == "cat" && runs_stdin(&w[1].0) {
+            out.extend(
+                strip_redirs(&w[0].0[1..])
+                    .into_iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|a| (a, true)),
+            );
+        }
+    }
+    for rs in raw_segs {
+        if let Some(i) = rs.iter().position(|w| w == "<") {
+            if runs_stdin(rs) {
+                if let Some(f) = rs.get(i + 1) {
+                    out.push((f.clone(), true));
+                }
+            }
+        }
+    }
+    out.retain(|(f, _)| !written.iter().any(|(w, _)| same_path(w, f)));
+    out
+}
+
+fn cwd_str(cwd: &Cwd) -> Option<&str> {
+    match cwd {
+        Cwd::Path(c) => Some(c.as_str()),
+        _ => None,
+    }
 }
 
 fn same_path(a: &str, b: &str) -> bool {
@@ -1317,8 +1381,11 @@ fn check_mode(
     }
     // Scripts written and run in the same command (newline pass): `cat > run.sh <<EOF ...; bash run.sh`,
     // `echo '...' > run.sh && ./run.sh`.
+    let mut disk: Vec<(String, bool)> = Vec::new();
     if lines {
         nested.extend(scripts_run(&raw_segs, &mut written));
+        // Script files on disk it runs (`bash scripts/x.sh`, `cat x | bash`), checked last.
+        disk = files_run(&raw_segs, &segs, &written);
     }
     for (seg, _) in segs {
         nested.extend(nested_commands(&seg));
@@ -1451,6 +1518,22 @@ fn check_mode(
     if let Some(x) = expanded {
         if let Some(r) = check_mode(&x, cwd, depth + 1, lines, false)? {
             return Ok(Some(r));
+        }
+    }
+    for (file, explicit) in disk {
+        match scripts::read_script(&file, cwd_str(cwd), explicit) {
+            scripts::Script::Text(text, canon) => {
+                if !scripts::enter(&canon) {
+                    continue; // already being checked
+                }
+                let r = check_mode(&text, cwd, depth + 1, lines, true);
+                scripts::leave(&canon);
+                if let Some(r) = r? {
+                    return Ok(Some(r));
+                }
+            }
+            scripts::Script::TooBig(f) => return Ok(Some(scripts::too_big_reason(&f))),
+            scripts::Script::Skip => {}
         }
     }
     Ok(None)
@@ -1608,7 +1691,7 @@ pub fn decide(input: &[u8], crash_log: &str) -> Verdict {
     }
     // block-pip.sh read `.tool_input.command` with jq -r; only a string can match.
     if let Value::String(c) = &command {
-        if PIP.is_match(c) || pip_in_nested(c, 0) {
+        if PIP.is_match(c) || pip_in_nested(c, &cwd, 0) {
             return Verdict::Pip;
         }
     }

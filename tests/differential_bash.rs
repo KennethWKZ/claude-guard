@@ -76,10 +76,37 @@ fn fixture_dir() -> String {
     ] {
         std::fs::write(d.join(f), "x\n").unwrap();
     }
+    // Script files a command runs (read from disk by Rust only).
+    std::fs::create_dir_all(d.join("run")).unwrap();
+    for (f, text) in [
+        ("run/sudo.sh", "#!/bin/bash\nsudo ls\n"),
+        ("run/push.sh", "git push -f\n"),
+        ("run/env.sh", "#!/bin/sh\ncat .env\n"),
+        ("run/ok.sh", "#!/bin/sh\nls -la\n"),
+        ("run/pip.sh", "pip install x\n"),
+    ] {
+        std::fs::write(d.join(f), text).unwrap();
+    }
     let _ = std::os::unix::fs::symlink("/Users", d.join("link"));
     let _ = std::os::unix::fs::symlink(d.join("sub"), d.join("sublink"));
     d.to_string_lossy().into_owned()
 }
+
+/// Commands that run the fixture folder's script files (`run/`).
+const SCRIPT_RUNS: &[&str] = &[
+    "bash run/sudo.sh",
+    "source run/push.sh",
+    ". ./run/env.sh",
+    "./run/sudo.sh",
+    "./run/push.sh",
+    "cat run/push.sh | bash",
+    "sh < run/env.sh",
+    "timeout 9 bash run/sudo.sh",
+    "bash run/pip.sh",
+    "bash run/ok.sh",
+    "bash -n run/sudo.sh",
+    "cat run/sudo.sh",
+];
 
 const WRAPPED_TEMPLATES: &[&str] = &[
     "timeout 9 @@",
@@ -374,6 +401,10 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
         }
         // Commands run by wrappers, remote and container commands, user switches, find -exec, string runners,
         // heredoc output, variables, scripts written and run, case patterns: `@@` is a rule's command.
+        if rng.chance(3) {
+            out.push_str(SCRIPT_RUNS[rng.below(SCRIPT_RUNS.len())]);
+            continue;
+        }
         if rng.chance(8) {
             let t = WRAPPED_TEMPLATES[rng.below(WRAPPED_TEMPLATES.len())];
             let body = heredoc_bodies[rng.below(heredoc_bodies.len())].replace("PIP", p);
@@ -636,7 +667,10 @@ fn wrapped_kind(input: &str) -> Option<&'static str> {
                 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && (cmd.contains(&format!("${n}")) || cmd.contains(&format!("${{{n}}}")))
         });
-    if cmd.contains("$(case") {
+    // `./ru\\n/x.sh` is ./run/x.sh to bash: a backslash quotes the next letter.
+    if cmd.replace('\\', "").contains("run/") {
+        Some("script-on-disk")
+    } else if cmd.contains("$(case") {
         Some("case-in-substitution")
     } else if (cmd.contains("$(") || cmd.contains("<(")) && cmd.contains("<<") {
         Some("heredoc-output-run")
@@ -748,6 +782,8 @@ fn unquoted_base(w: &str) -> &str {
 
 /// True if an echo or printf segment is piped straight into a shell, `source` or `.`.
 fn piped_into_shell(cmd: &str) -> bool {
+    // `>|` is a redirection, not a pipe.
+    let cmd = cmd.replace(">|", ">");
     let pieces: Vec<&str> = cmd.split('|').collect();
     pieces.windows(2).any(|w| {
         let printer = w[0]

@@ -174,8 +174,13 @@ The rules also hold for what a wrapper runs (Rust only):
 - scripts written and run in the same command: `cat > run.sh <<EOF … EOF` or `echo … > run.sh`, then `bash run.sh`,
   `source run.sh` or `./run.sh`.
 
-A script file that already exists (`bash scripts/x.sh`, `cat file | bash`) isn't read: the guard sees only the
-command text. A quoting error in the command allows it, so a typo never locks
+Script files a command runs are read from disk and checked with every rule (Rust only): `bash|sh|zsh FILE`,
+`source FILE`, `. FILE`, `./FILE` or `/path/FILE` as the command (also behind wrappers), `cat FILE | bash` and
+`bash < FILE`. Only files Claude could have written count: inside the session's `cwd` (unless that is the home folder
+or `/`) or a temp folder, so tools and dotfiles elsewhere (`brew`, `~/.zshrc`) aren't read. Binaries, files with
+another interpreter's shebang run as the command (`#!/usr/bin/env node`), missing files and `bash -n FILE` aren't
+either. A script over 256 KiB is blocked rather than checked in part ("run it yourself with !"), and scripts that
+source each other are each read once. The file can change between the check and the run. A quoting error in the command allows it, so a typo never locks
 the shell; any other failure blocks it and is logged. Input nested too deep to check blocks.
 
 ### `claude-guard read`

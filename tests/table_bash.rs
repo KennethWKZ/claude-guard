@@ -1651,6 +1651,158 @@ fn scripts_written_and_run_every_rule() {
 }
 
 #[test]
+fn script_files_on_disk_every_rule() {
+    let dir = format!(
+        "{}/claude-guard-table-scripts-{}",
+        tmpdir(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(format!("{dir}/scripts/sub")).unwrap();
+    let write = |name: &str, text: &str| std::fs::write(format!("{dir}/{name}"), text).unwrap();
+    let pip = format!("{} install y", "pip"); // kept apart so this file's text doesn't trip the live pip hook
+    let mut bodies: Vec<(String, String)> = EVERY_RULE
+        .iter()
+        .map(|(c, want)| (c.to_string(), want.to_string()))
+        .collect();
+    bodies.push((pip.clone(), String::new()));
+    // Fed to a shell by name or on stdin, run as the command, behind a wrapper, through ssh.
+    let templates = [
+        "bash F",
+        "sh -x F",
+        "zsh F",
+        "source F",
+        ". ./F",
+        "./F",
+        "cat F | bash",
+        "cat -- F | sh -s",
+        "bash < F",
+        "timeout 9 bash F",
+        "ssh host < F",
+        "cd x; bash F",
+    ];
+    let mut fails = Vec::new();
+    let mut checked = 0;
+    for (i, (body, want)) in bodies.iter().enumerate() {
+        // A shell script with a shebang, one without, and one that sources another.
+        write(
+            &format!("scripts/r{i}.sh"),
+            &format!("#!/usr/bin/env bash\nset -euo pipefail\necho start\n{body}\n"),
+        );
+        write(&format!("scripts/plain{i}"), &format!("ls\n{body}\n"));
+        write(
+            &format!("scripts/outer{i}.sh"),
+            &format!("#!/bin/sh\n. scripts/sub/inner{i}.sh\n"),
+        );
+        write(&format!("scripts/sub/inner{i}.sh"), &format!("{body}\n"));
+        let mut cmds: Vec<String> = templates
+            .iter()
+            .map(|t| t.replace('F', &format!("scripts/r{i}.sh")))
+            .collect();
+        cmds.push(format!("./scripts/plain{i}"));
+        cmds.push(format!("bash scripts/outer{i}.sh"));
+        cmds.push(format!("bash {dir}/scripts/r{i}.sh"));
+        for cmd in cmds {
+            let input = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": dir}).to_string();
+            let o = run(&["bash"], &input);
+            checked += 1;
+            let ok = if want.is_empty() {
+                (o.code, o.stdout.as_str()) == (2, "")
+            } else {
+                o.code == 0 && o.stdout.contains("\"deny\"") && o.stdout.contains(want.as_str())
+            };
+            if !ok {
+                fails.push(format!(
+                    "want {} :: {cmd:?} -> {} {}",
+                    if want.is_empty() { "pip" } else { want },
+                    o.code,
+                    o.stdout.trim()
+                ));
+            }
+        }
+    }
+    // Not read, or nothing to block.
+    write("scripts/ok.sh", "#!/bin/sh\nls -la\ngit status\n");
+    write(
+        "scripts/tool.js",
+        "#!/usr/bin/env node\nconsole.log('x')\nsudo ls\n",
+    );
+    write("scripts/a.sh", ". scripts/b.sh\nls\n");
+    write("scripts/b.sh", ". scripts/a.sh\npwd\n");
+    std::fs::copy("/bin/ls", format!("{dir}/scripts/bin")).unwrap();
+    let mut bin = std::fs::read(format!("{dir}/scripts/bin")).unwrap();
+    bin.extend(b"\nsudo ls\n");
+    std::fs::write(format!("{dir}/scripts/bin"), bin).unwrap();
+    let allow = [
+        "bash scripts/ok.sh",
+        "./scripts/ok.sh",
+        "cat scripts/ok.sh | bash",
+        "./scripts/tool.js", // another interpreter's shebang, run as the command
+        "./scripts/bin",     // a binary
+        "bash scripts/a.sh", // scripts that source each other: each read once
+        "bash scripts/missing.sh",
+        "bash scripts",          // a directory
+        "cat scripts/r0.sh",     // reading isn't running
+        "bash -n scripts/r0.sh", // syntax check only
+        "bash -c 'echo hi' scripts/r0.sh",
+        "less scripts/r0.sh",
+    ];
+    for cmd in allow {
+        let input =
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": dir})
+                .to_string();
+        let o = run(&["bash"], &input);
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!(
+                "want allow :: {cmd:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    // Outside the project and temp folders (a tool or dotfile): not read.
+    let outside = format!(
+        "{}/claude-guard-outside-{}.sh",
+        env!("CARGO_TARGET_TMPDIR"),
+        std::process::id()
+    );
+    std::fs::write(&outside, "sudo ls\n").unwrap();
+    for cmd in [format!("bash {outside}"), format!("source {outside}")] {
+        let input =
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": dir})
+                .to_string();
+        let o = run(&["bash"], &input);
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!(
+                "want allow (outside) :: {cmd:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    let _ = std::fs::remove_file(&outside);
+    // Relative paths need a text cwd; without one the file isn't read.
+    let o = run(&["bash"], &bash_input("bash scripts/r0.sh"));
+    if (o.code, o.stdout.as_str()) != (0, "") {
+        fails.push(format!("want allow without cwd -> {}", o.stdout.trim()));
+    }
+    // Over the size cap: blocked, not checked in part.
+    write("scripts/big.sh", &"ls\n".repeat(100_000));
+    let input = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "bash scripts/big.sh"}, "cwd": dir}).to_string();
+    let o = run(&["bash"], &input);
+    if !o.stdout.contains("too big for the guard to check") {
+        fails.push(format!("want too big -> {}", o.stdout.trim()));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(checked > 0);
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [
