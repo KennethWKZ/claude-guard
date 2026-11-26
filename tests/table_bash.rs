@@ -1075,6 +1075,102 @@ fn heredocs_in_quoted_strings_every_rule() {
 }
 
 #[test]
+fn heredoc_piped_into_shell_every_rule() {
+    let p = "pip"; // kept apart so this file's text doesn't trip the live pip hook
+    // (command, words the deny reason must hold)
+    let deny = [
+        ("cat <<EOF | bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        (
+            "cat <<EOF | bash⏎rm -rf /srv/app⏎EOF",
+            "recursive force delete",
+        ),
+        ("cat <<EOF | sh⏎cat .env⏎EOF", ".env"),
+        ("cat <<EOF | bash⏎grep -r token .⏎EOF", "recursive grep"),
+        ("cat <<EOF | bash⏎rg --hidden token⏎EOF", "rg with --hidden"),
+        ("cat <<EOF | bash⏎git push -f⏎EOF", "git push --force"),
+        (
+            "cat <<EOF | bash⏎rust-anything build rust/util⏎EOF",
+            "rust-anything build",
+        ),
+        // Delimiter forms, readers of stdin, paths and wrappers.
+        ("cat <<'X' | sh -s⏎git push -f⏎X", "git push --force"),
+        ("cat <<\"X\" | zsh⏎sudo ls⏎X", "sudo is blocked"),
+        ("cat <<-EOF | bash⏎\tsudo ls⏎\tEOF", "sudo is blocked"),
+        (
+            "cat <<EOF | source /dev/stdin⏎sudo ls⏎EOF",
+            "sudo is blocked",
+        ),
+        ("cat <<EOF | . /dev/stdin⏎sudo ls⏎EOF", "sudo is blocked"),
+        ("cat <<EOF | bash /dev/stdin⏎sudo ls⏎EOF", "sudo is blocked"),
+        ("/bin/cat <<EOF | /bin/bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        ("cat <<EOF | timeout 9 bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        ("cat <<EOF|bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        ("cat - <<EOF | bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        ("tee run.log <<EOF | bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        ("cd x && cat <<EOF | bash⏎sudo ls⏎EOF", "sudo is blocked"),
+        // Inside strings run as commands, and nested.
+        ("bash -c 'cat <<EOF | bash⏎sudo ls⏎EOF'", "sudo is blocked"),
+        ("eval 'cat <<EOF | sh⏎git push -f⏎EOF'", "git push --force"),
+        ("x=\"$(cat <<EOF | bash⏎sudo ls⏎EOF⏎)\"", "sudo is blocked"),
+        ("cat <<EOF | bash⏎bash -c 'sudo ls'⏎EOF", "sudo is blocked"),
+    ];
+    let allow = [
+        // Piped into something that isn't a shell running stdin: data.
+        "cat <<EOF | grep sudo⏎sudo ls⏎EOF",
+        "cat <<EOF | tee notes.md⏎git push -f⏎EOF",
+        "cat <<EOF | bash -c cat⏎sudo ls⏎EOF",
+        "cat <<EOF | bash script.sh⏎sudo ls⏎EOF",
+        "cat <<EOF > run.sh⏎sudo ls⏎EOF",
+        "cat <<EOF | wc -l⏎rm -rf /srv/app⏎EOF",
+        // Piped into a shell, but nothing in it breaks a rule.
+        "cat <<EOF | bash⏎ls -la⏎git status⏎EOF",
+        // Claude's commit messages.
+        "git commit -m \"$(cat <<'EOF'⏎sudo ls | bash is blocked⏎EOF⏎)\"",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in &deny {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        let ok = o.code == 0
+            && o.stdout.contains("\"permissionDecision\": \"deny\"")
+            && o.stdout.contains(want);
+        if !ok {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in [
+        format!("cat <<EOF | bash⏎{p} install y⏎EOF"),
+        format!("bash -c 'cat <<EOF | sh⏎{p} install y⏎EOF'"),
+    ] {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (2, "") {
+            fails.push(format!(
+                "want pip :: {c:?} -> {} {}",
+                o.code,
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in &allow {
+        let c = c.replace('⏎', "\n");
+        let o = run(&["bash"], &bash_input(&c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+#[test]
 fn input_edges() {
     // Bad JSON, wrong shapes and empty commands allow (as the Python guard did).
     for input in [

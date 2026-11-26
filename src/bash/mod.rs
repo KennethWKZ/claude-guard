@@ -25,6 +25,8 @@
 //! In that newline pass a heredoc starts only where bash starts one: outside quotes and comments, or inside `$(...)`
 //! and backticks. A heredoc inside a quoted `bash -c '...'` string stays in the string and is checked with it; the
 //! Python guard's reading cut the "body" out of the string, which then failed to parse and was allowed.
+//! A `cat` or `tee` heredoc piped into a shell that runs its stdin (`cat <<EOF | bash`) has its body checked too;
+//! the Python guard read it as data.
 //!
 //! Same contract as the Python guard: a parse error allows the command (a quoting mistake never locks the
 //! shell); any other failure blocks it (fail closed) and is logged. It only sees what is written in the command.
@@ -366,12 +368,26 @@ fn code_mask(line: &[char], stack: &mut Vec<Ctx>) -> (Vec<bool>, bool) {
     (mask, false)
 }
 
+/// True if the rest of a heredoc's line (from its `<<`) pipes the command's output into a shell that runs its
+/// stdin: `cat <<EOF | bash`, `cat <<'X' | sh -s`, `tee log <<EOF | source /dev/stdin`.
+fn heredoc_piped_to_shell(rest: &[char]) -> bool {
+    let rest: String = rest.iter().collect();
+    let Ok(tokens) = shlex::split_lines(&rest) else {
+        return false;
+    };
+    let segs = segments_with_seps(tokens);
+    segs.first().is_some_and(|(_, sep)| sep == "|")
+        && segs.get(1).is_some_and(|(seg, _)| runs_stdin(seg))
+}
+
 /// Remove heredoc bodies (data for the command that reads them); bodies a shell reads come back to be checked.
 ///
 /// `quoted` false reads `<<WORD` anywhere, as the Python guard's regex did. `quoted` true (the newline pass) reads
 /// it only as code, outside quotes and comments, and starts the bodies after the first line that ends outside
 /// quotes, as bash does: a heredoc written inside a quoted `bash -c '...'` string stays in that string, which is
-/// then checked on its own, and a quoted `<<WORD` no longer hides the lines after it. Heredocs inside `"$(...)"`
+/// then checked on its own, and a quoted `<<WORD` no longer hides the lines after it.
+/// It also counts a `cat` or `tee` heredoc piped straight into a shell that runs its stdin (`cat <<EOF | bash`) as fed
+/// to that shell. Heredocs inside `"$(...)"`
 /// and backticks are code, so `git commit -m "$(cat <<'EOF' ...)"` still drops its message.
 fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
     let lines: Vec<&str> = command.split('\n').collect();
@@ -398,7 +414,10 @@ fn split_heredocs(command: &str, quoted: bool) -> (String, Vec<String>) {
             let before: String = chars[..start].iter().collect();
             let last = before.rsplit([';', '&', '|', '(']).next().unwrap_or("");
             let first_word = last.split(py_isspace).find(|w| !w.is_empty());
-            let to_shell = first_word.is_some_and(|w| contains(SHELLS, pyfs::basename(w)));
+            let to_shell = first_word.is_some_and(|w| contains(SHELLS, pyfs::basename(w)))
+                || (quoted
+                    && first_word.is_some_and(|w| ["cat", "tee"].contains(&pyfs::basename(w)))
+                    && heredoc_piped_to_shell(&chars[start..]));
             pending.push((tabs, delim, to_shell));
         }
         let ready = !quoted

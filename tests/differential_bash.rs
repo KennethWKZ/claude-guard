@@ -401,6 +401,27 @@ fn generate(rng: &mut Rng, dir: &str) -> String {
             out.push(q);
             continue;
         }
+        // A cat or tee heredoc piped into a shell, or into something else.
+        if (verb == "cat" || verb == "tee") && rng.chance(20) {
+            let to = [
+                "bash",
+                "sh -s",
+                "zsh",
+                "source /dev/stdin",
+                ". /dev/stdin",
+                "timeout 9 bash",
+                "bash -c cat",
+                "grep x",
+                "wc -l",
+            ];
+            let body = heredoc_bodies[rng.below(heredoc_bodies.len())].replace("PIP", p);
+            let delim = ["EOF", "'EOF'", "\"EOF\""][rng.below(3)];
+            out.push_str(&format!(
+                " <<{delim} | {}\n{body}\nEOF\n",
+                to[rng.below(to.len())]
+            ));
+            continue;
+        }
         if verb == "echo" && rng.chance(10) {
             let body = heredoc_bodies[rng.below(heredoc_bodies.len())].replace("PIP", p);
             let hide = ["'a <<EOF'", "\"see <<EOF\"", "x # <<EOF"];
@@ -541,6 +562,26 @@ fn nested_kind(input: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// True if a line of the hook input's command has a `<<WORD` followed by a pipe into a shell, `source` or `.`.
+fn heredoc_piped_to_shell(input: &str) -> bool {
+    let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+    let cmd = v["tool_input"]["command"].as_str().unwrap_or("");
+    cmd.split('\n').any(|line| {
+        line.split_once("<<").is_some_and(|(_, after)| {
+            after.split('|').skip(1).any(|piece| {
+                let first = piece
+                    .split(|c: char| c.is_whitespace() || "();&".contains(c))
+                    .find(|x| !x.is_empty())
+                    .unwrap_or("");
+                [
+                    "bash", "sh", "zsh", "dash", "ksh", "source", ".", "timeout", "env",
+                ]
+                .contains(&unquoted_base(first))
+            })
+        })
+    })
 }
 
 /// True if a `<<WORD` in the hook input's command sits inside quotes or a comment on its line (roughly: an odd
@@ -857,6 +898,11 @@ fn known_difference(
     if reference.stdout.is_empty() && rust_blocks {
         // A `<<WORD` inside quotes or a comment is no heredoc in Rust's newline pass (a heredoc in a quoted `-c`
         // string stays in the string, checked on its own); the Python guard cut its "body" out of the string.
+        // A cat or tee heredoc piped into a shell runs its body in Rust's newline pass; the Python guard read the
+        // body as data.
+        if heredoc_piped_to_shell(input) {
+            return Some("heredoc-piped-to-shell");
+        }
         if quoted_heredoc(input) {
             return Some("quoted-heredoc");
         }
