@@ -1832,7 +1832,48 @@ fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut at_cmd = true;
     let mut after_declare = false;
-    for t in tokens {
+    let mut skip = 0;
+    for (k, t) in tokens.iter().enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        // `for NAME in WORDS` (also select): NAME takes the word the body would read, so `for f in .env; do cat
+        // "$f"; done` reads .env. The first word that names a secrets file or holds a glob, else the first word;
+        // a `$VAR` word the command set earlier is expanded first (Rust only).
+        if at_cmd && (t == "for" || t == "select") && tokens.get(k + 2).is_some_and(|w| w == "in") {
+            let name = &tokens[k + 1];
+            let words: Vec<String> = tokens[k + 3..]
+                .iter()
+                .take_while(|w| !(contains(SEPARATORS, w) || *w == "\n" || *w == "do"))
+                .flat_map(|w| {
+                    let var = w
+                        .strip_prefix("${")
+                        .and_then(|r| r.strip_suffix('}'))
+                        .or_else(|| w.strip_prefix('$'));
+                    match var.and_then(|v| vars.iter().find(|(n, _)| n == v)) {
+                        Some((_, val)) => val.split_whitespace().map(str::to_string).collect(),
+                        None => vec![w.clone()],
+                    }
+                })
+                .collect();
+            skip = 2 + tokens[k + 3..]
+                .iter()
+                .take_while(|w| !(contains(SEPARATORS, w) || *w == "\n" || *w == "do"))
+                .count();
+            if is_assignment(&format!("{name}=")) {
+                if let Some(v) = words
+                    .iter()
+                    .find(|w| is_secret_env(w) || w.contains(['*', '?', '[']))
+                    .or(words.first())
+                {
+                    vars.retain(|(n, _)| n != name);
+                    vars.push((name.clone(), v.clone()));
+                }
+            }
+            at_cmd = false;
+            continue;
+        }
         if contains(SEPARATORS, t) || t == "\n" {
             at_cmd = true;
             after_declare = false;
@@ -2304,8 +2345,9 @@ fn check_mode(
         {
             return Ok(Some("rg with --hidden/--no-ignore also reads .env files. Run plain rg, or exclude them with -g '!.env*'.".into()));
         }
-        // `case WORD in PATTERN)`: the word and patterns are matched as text, not read (Rust only).
-        if !contains(ENV_SAFE_VERBS, &verb) && verb != "case" {
+        // `case WORD in PATTERN)`: the word and patterns are matched as text, not read; `for NAME in WORDS` (and
+        // select) only names them, and what the body does with NAME is checked through `expand_vars` (Rust only).
+        if !contains(ENV_SAFE_VERBS, &verb) && !matches!(verb.as_str(), "case" | "for" | "select") {
             let mut written: HashSet<usize> = args
                 .iter()
                 .enumerate()

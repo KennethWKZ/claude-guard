@@ -140,7 +140,9 @@ Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `ba
    `[ -f .env ]`, `test -f .env`, and (Rust only) `[[ -f .env && -s .env ]]`, `[ ! -f .env ]`, `test ! -e .envrc`.
    Also not reads (Rust only): a grep/rg search pattern (`rg 'process\.env' src`, `grep -e .env x`; a `-f`
    pattern file and a pattern holding a glob or brace still count, as the shell expands those into files), a `case`
-   word or pattern (`case $p in /.env)`), and `readlink`, `realpath`, `chown`, `chgrp`. A substitution that only
+   word or pattern (`case $p in /.env)`), a `for`/`select` word list (`for f in .env .env.local`; the loop variable
+   carries the word the body would read, so `for f in .env; do cat "$f"; done` still counts), and `readlink`,
+   `realpath`, `chown`, `chgrp`. A substitution that only
    prints a path reads as that path in the command around it (`cat $(readlink -f .env)`, `cat $(echo .env)`: Rust
    only; the Python guard let those through).
 3. `git push --force` / `-f` (`--force-with-lease` is allowed).
@@ -195,7 +197,7 @@ The rules also hold for what a wrapper runs (Rust only):
   never `node_modules`, `vendor`, `.venv` or `site-packages`, and a file over 256 KiB is skipped): perl `system`,
   `exec`, backticks, `qx`, pipe `open`; python `os.system`, `os.popen`, `subprocess.*` (also imported or aliased),
   `os.exec*`, `os.spawn*`; node/bun/deno `child_process` `exec*`/`spawn*`/`execFile*`, `Bun.spawn`, `` $`…` `` (Bun,
-  zx), `Deno.Command`, `Deno.run`; ruby `system`, `exec`, `spawn`, backticks, `%x()`, `IO.popen`, `Open3.*`; php
+  zx; the `$` must start an expression, so a regex's `$` before a template literal's closing backtick isn't one), `Deno.Command`, `Deno.run`; ruby `system`, `exec`, `spawn`, backticks, `%x()`, `IO.popen`, `Open3.*`; php
   `exec`, `shell_exec`, `system`, `passthru`, `popen`, `proc_open`, backticks; lua `os.execute`, `io.popen`;
   osascript `do shell script`. One string is a command line, a list an argv. Arguments are evaluated: literals,
   variables the code assigns (every value a name gets), concatenation, interpolation, `" ".join([…])`,

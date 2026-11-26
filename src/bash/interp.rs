@@ -361,9 +361,10 @@ fn code_commands_at(lang: Lang, code: &str, depth: usize) -> Vec<String> {
         out.extend(quoted_forms(code, "%x").into_iter().map(fill));
     }
     if lang == Lang::Node {
-        // Bun shell and zx: $`cmd`.
+        // Bun shell and zx: $`cmd`. The `$` starts an expression (after a blank or `(`, `=`, `,`, ...), so a
+        // regex's end anchor before a template literal's closing backtick (`` `^${k}\\s*$` ``) isn't one.
         {
-            let re = super::re(r"\$`((?:[^`\\]|\\.)*)`");
+            let re = super::re(r"(?:^|[\s(=,;:!?&|{\[+])\$`((?:[^`\\]|\\.)*)`");
             out.extend(re.captures_iter(code).map(|c| fill(c[1].to_string())));
         }
     }

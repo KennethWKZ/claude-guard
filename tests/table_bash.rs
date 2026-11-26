@@ -2898,3 +2898,81 @@ fn search_patterns_case_patterns_and_path_verbs_are_not_reads() {
         fails.join("\n")
     );
 }
+
+#[test]
+fn for_word_lists_and_zx_template_literals() {
+    // A for/select word list only names files; what the body does with the loop variable is what counts.
+    let allow = [
+        "for f in .env .env.local; do echo \"$f\"; done",
+        "for f in .env; do ls -l \"$f\"; done",
+        "for f in .env .env.local; do [ -f \"$f\" ] && echo \"$f exists\"; done",
+        "P=\"/x /.env\"; for p in $P; do echo \"$p\"; done",
+        "select f in .env x; do echo $f; break; done",
+        "for f in .env\ndo\n  test -e \"$f\" && echo yes\ndone",
+    ];
+    let deny = [
+        "for f in .env; do cat \"$f\"; done",
+        "for f in x .env.local; do cat $f; done",
+        "for f in .env; do source \"${f}\"; done",
+        "for f in a b; do cat .env; done",
+        "P=\".env x\"; for f in $P; do cat \"$f\"; done",
+        "for f in .env\ndo\n  grep KEY \"$f\"\ndone",
+    ];
+    let mut fails = Vec::new();
+    for c in allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    for c in deny {
+        let o = run(&["bash"], &bash_input(c));
+        if !o.stdout.contains("reading a secrets file") {
+            fails.push(format!("want deny :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+
+    // zx / Bun shell: $`cmd` runs cmd; a regex end anchor before a template literal's closing backtick doesn't.
+    let dir = format!("{}/claude-guard-table-zx-{}", tmpdir(), std::process::id());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let files = [
+        (
+            "regex.js",
+            "const re = new RegExp(`^\\\\s*${key}\\\\s*=\\\\s*(.*)\\\\s*$`);\nconst env = process.env;\nconst t = `${env.HOME}/x`;\n",
+            "",
+        ),
+        ("zx.mjs", "await $`sudo ls`;\n", "sudo is blocked"),
+        (
+            "zx2.mjs",
+            "const out = await $`cat .env`;\n",
+            "reading a secrets file",
+        ),
+        (
+            "bun.js",
+            "import { $ } from 'bun';\n($`rm -rf /srv/x`);\n",
+            "recursive force delete",
+        ),
+    ];
+    for (name, body, want) in files {
+        std::fs::write(format!("{dir}/{name}"), body).unwrap();
+        let input = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": format!("node {name}")}, "cwd": dir})
+            .to_string();
+        let o = run(&["bash"], &input);
+        let ok = if want.is_empty() {
+            (o.code, o.stdout.as_str()) == (0, "")
+        } else {
+            o.stdout.contains(want)
+        };
+        if !ok {
+            fails.push(format!("node {name}: want {want:?} -> {}", o.stdout.trim()));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}

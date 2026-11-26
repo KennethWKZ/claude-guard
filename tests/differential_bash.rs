@@ -170,6 +170,9 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "chown u:g .env",
     "cat $(readlink -f .env)",
     "cat $(echo .env)",
+    "for f in .env .env.local; do echo \"$f\"; done",
+    "for f in .env; do cat \"$f\"; done",
+    "P=\".env x\"; for f in $P; do cat $f; done",
     "x=$(date); @@",
     "echo $(pwd)&& @@",
     "echo \"$(@@)\"",
@@ -1232,6 +1235,7 @@ const KNOWN_KINDS: &[&str] = &[
     "case-pattern",
     "path-only-verb",
     "printed-path",
+    "for-word-list",
 ];
 
 /// A `$(...)` or backticks with more of the same simple command after it: its closing `)` or backtick (glued to
@@ -1281,6 +1285,10 @@ fn known_difference(
         if at_command("readlink|realpath|chown|chgrp").is_match(&cmd) {
             return Some("path-only-verb");
         }
+        // A for/select word list only names files (Rust only); the body's use of the loop variable is checked.
+        if at_command("for|select").is_match(&cmd) {
+            return Some("for-word-list");
+        }
     }
     // A hook input whose cwd isn't text (Claude Code always sends text): the Python guard crashed (blocked) judging
     // a glob in a word Rust no longer reads as a file (after a case arm's end, a chown argument, a search pattern),
@@ -1298,6 +1306,9 @@ fn known_difference(
         }
         if at_command("grep|egrep|fgrep|rg").is_match(&cmd) {
             return Some("search-pattern");
+        }
+        if at_command("for|select").is_match(&cmd) {
+            return Some("for-word-list");
         }
     }
     // The work budget: more pieces than one check reads (deep nesting the Python guard never followed).
@@ -1370,6 +1381,13 @@ fn known_difference(
         // pass, which reads the substitution as one word; the Python guard ended the command at its `)`.
         if words_after_substitution(input) {
             return Some("substitution-word");
+        }
+        // The loop variable of a for/select carries its words into the body in Rust's newline pass (`for f in .env;
+        // do cat "$f"; done`); the Python guard read `$f` as unknown.
+        if rust.stdout.contains("reading a secrets file")
+            && at_command("for|select").is_match(&input_command(input).replace('\\', ""))
+        {
+            return Some("for-word-list");
         }
         // A substitution that only prints a path (`cat $(readlink -f .env)`) reads as that path in Rust's newline
         // pass; the Python guard read it as words and operators.
