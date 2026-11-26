@@ -2909,6 +2909,7 @@ fn for_word_lists_and_zx_template_literals() {
         "P=\"/x /.env\"; for p in $P; do echo \"$p\"; done",
         "select f in .env x; do echo $f; break; done",
         "for f in .env\ndo\n  test -e \"$f\" && echo yes\ndone",
+        "for e in /home/*/*/.env; do [ -f \"$e\" ] && echo \"$e\"; done",
     ];
     let deny = [
         "for f in .env; do cat \"$f\"; done",
@@ -2917,6 +2918,12 @@ fn for_word_lists_and_zx_template_literals() {
         "for f in a b; do cat .env; done",
         "P=\".env x\"; for f in $P; do cat \"$f\"; done",
         "for f in .env\ndo\n  grep KEY \"$f\"\ndone",
+        // Server paths: a glob shaped like a secrets file reads as one, whatever exists on this machine.
+        "for e in /home/forge/*/.env /var/app/current/.env; do [ -f \"$e\" ] || continue; grep -E '^REDIS_HOST=' \"$e\"; done",
+        "for e in /home/*/*/.env /home/*/*/shared/.env; do grep -oE '^AGRANI_[A-Z_]+' \"$e\"; done",
+        // A copy of the loop variable reads as the file too.
+        "ENV=\"\"; for e in \"$D/shared/.env\" \"$D/.env\"; do [ -f \"$e\" ] && { ENV=$e; break; }; done; grep -E '^QUEUE_CONNECTION=' \"$ENV\"",
+        "a=.env; b=$a; cat \"$b\"",
     ];
     let mut fails = Vec::new();
     for c in allow {

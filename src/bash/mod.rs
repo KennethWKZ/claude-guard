@@ -1839,8 +1839,9 @@ fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
             continue;
         }
         // `for NAME in WORDS` (also select): NAME takes the word the body would read, so `for f in .env; do cat
-        // "$f"; done` reads .env. The first word that names a secrets file or holds a glob, else the first word;
-        // a `$VAR` word the command set earlier is expanded first (Rust only).
+        // "$f"; done` reads .env. The first word that names a secrets file, else a glob shaped like one (a server path
+        // such as `/home/*/*/.env`, read as that file whatever exists here), else any glob, else the first word; a
+        // `$VAR` word the command set earlier is expanded first (Rust only).
         if at_cmd && (t == "for" || t == "select") && tokens.get(k + 2).is_some_and(|w| w == "in") {
             let name = &tokens[k + 1];
             let words: Vec<String> = tokens[k + 3..]
@@ -1862,13 +1863,16 @@ fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
                 .take_while(|w| !(contains(SEPARATORS, w) || *w == "\n" || *w == "do"))
                 .count();
             if is_assignment(&format!("{name}=")) {
-                if let Some(v) = words
+                let v = words
                     .iter()
-                    .find(|w| is_secret_env(w) || w.contains(['*', '?', '[']))
-                    .or(words.first())
-                {
+                    .find(|w| is_secret_env(w))
+                    .cloned()
+                    .or_else(|| words.iter().find_map(|w| secret_glob_word(w)))
+                    .or_else(|| words.iter().find(|w| w.contains(['*', '?', '['])).cloned())
+                    .or_else(|| words.first().cloned());
+                if let Some(v) = v {
                     vars.retain(|(n, _)| n != name);
-                    vars.push((name.clone(), v.clone()));
+                    vars.push((name.clone(), v));
                 }
             }
             at_cmd = false;
@@ -1888,8 +1892,22 @@ fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
         }
         if at_cmd && is_assignment(t) {
             if let Some((name, value)) = t.split_once('=') {
+                // With the values of variables set before it (`ENV=$e` after `for e in ...`), so a copy reads as
+                // the file too (Rust only).
+                // A value a substitution builds (`okd=$(mktemp -d)`) isn't known, so it isn't copied in.
+                let known: Vec<(String, String)> = vars
+                    .iter()
+                    .filter(|(_, v)| {
+                        !(v.contains("$(")
+                            || v.contains('`')
+                            || v.contains("__substitution__")
+                            || v == "$")
+                    })
+                    .cloned()
+                    .collect();
+                let value = substitute_vars(value, &known);
                 vars.retain(|(k, _)| k != name);
-                vars.push((name.to_string(), value.to_string()));
+                vars.push((name.to_string(), value));
             }
             continue;
         }
@@ -1898,7 +1916,13 @@ fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
     if vars.is_empty() {
         return None;
     }
-    let chars: Vec<char> = command.chars().collect();
+    let out = substitute_vars(command, &vars);
+    (out != command).then_some(out)
+}
+
+/// `text` with `$NAME` and `${NAME}` replaced by the values in `vars` (others left as written).
+fn substitute_vars(text: &str, vars: &[(String, String)]) -> String {
+    let chars: Vec<char> = text.chars().collect();
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut out = String::new();
     let mut i = 0;
@@ -1925,7 +1949,33 @@ fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
         out.push(chars[i]);
         i += 1;
     }
-    (out != command).then_some(out)
+    out
+}
+
+/// A for-list word as the body would see it, for the secrets check: a glob shaped like a secrets file
+/// (`/home/*/*/.env`, a server path that matches nothing here) reads as that file whatever exists on this machine,
+/// written with `<any>` for each wildcard. None for any other glob.
+fn secret_glob_word(w: &str) -> Option<String> {
+    if !w.contains(['*', '?', '[']) {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = w.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' | '?' => out.push_str("<any>"),
+            '[' => {
+                for d in chars.by_ref() {
+                    if d == ']' {
+                        break;
+                    }
+                }
+                out.push_str("<any>");
+            }
+            _ => out.push(c),
+        }
+    }
+    is_secret_env(&out).then_some(out)
 }
 
 /// The bodies of `$(...)` and backtick substitutions, also inside double quotes, where the lexer reads

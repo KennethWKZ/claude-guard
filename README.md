@@ -141,7 +141,9 @@ Logs go to `~/.local/state/claude-guard/` (owner-only files; `husky.log` and `ba
    Also not reads (Rust only): a grep/rg search pattern (`rg 'process\.env' src`, `grep -e .env x`; a `-f`
    pattern file and a pattern holding a glob or brace still count, as the shell expands those into files), a `case`
    word or pattern (`case $p in /.env)`), a `for`/`select` word list (`for f in .env .env.local`; the loop variable
-   carries the word the body would read, so `for f in .env; do cat "$f"; done` still counts), and `readlink`,
+   carries the word the body would read, so `for f in .env; do cat "$f"; done` still counts; a glob shaped like a
+   secrets file, such as the server path `/home/*/*/.env`, counts as one whatever exists locally, and a copy such as
+   `ENV=$f` carries it too), and `readlink`,
    `realpath`, `chown`, `chgrp`. A substitution that only
    prints a path reads as that path in the command around it (`cat $(readlink -f .env)`, `cat $(echo .env)`: Rust
    only; the Python guard let those through).
