@@ -163,7 +163,9 @@ followed, so `sed 's/^/sudo /' <<EOF | bash` is caught; the same holds for `echo
 wrapper (`timeout 9 bash <<EOF`, `ssh host <<EOF`) or whose output is run (`eval "$(cat <<EOF …)"`, `$(cat <<EOF …)` as
 a command, `bash <(cat <<EOF …)`) count as fed to a shell, and a `case` pattern's `)` doesn't end a `$(…)`. Command
 substitutions are checked inside double quotes and backticks too (`echo "$(cat .env)"`, ``x=`sudo ls` ``; Rust only:
-the Python guard read `"$(…)"` as one word and never looked inside backticks).
+the Python guard read `"$(…)"` as one word and never looked inside backticks). An unquoted substitution is one word of
+the command around it, so the arguments after it are checked as well (`cat $(true) .env`, `rm -rf $(true) /srv/x`;
+Rust only: the Python guard ended the command at the `)` and let them through).
 
 The rules also hold for what a wrapper runs (Rust only):
 

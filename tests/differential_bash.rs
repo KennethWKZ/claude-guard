@@ -156,6 +156,9 @@ const WRAPPED_TEMPLATES: &[&str] = &[
     "rm -rf build 2>/dev/null",
     "rm -rf dist >/dev/null 2>&1",
     "rm -rf /srv/x 2>/dev/null",
+    "cat $(true) .env",
+    "rm -rf $(true) /srv/x",
+    "rm -rf $(mktemp -d)/x",
     "x=$(date); @@",
     "echo $(pwd)&& @@",
     "echo \"$(@@)\"",
@@ -1213,7 +1216,16 @@ const KNOWN_KINDS: &[&str] = &[
     "argv-wrapper",
     "work-budget",
     "rm-redirect-target",
+    "substitution-word",
 ];
+
+/// A `$(...)` or backticks with more of the same simple command after it: its closing `)` or backtick (glued to
+/// more of the word or not) followed by a word or `(`, not an operator or the end.
+fn words_after_substitution(input: &str) -> bool {
+    let cmd = input_command(input);
+    (cmd.contains("$(") || cmd.contains('`'))
+        && rx(r"[)`][^\s;&|]*(?:[ \t]+[^\s;&|#)]|\()").is_match(&cmd)
+}
 
 /// Differences that are intended. Anything else fails the test.
 fn known_difference(
@@ -1302,6 +1314,11 @@ fn known_difference(
         // `"$(...)"` as one word and never looked inside backticks.
         if quoted_substitution(input) {
             return Some("quoted-substitution");
+        }
+        // Words after an unquoted substitution (`cat $(true) .env`) stay in its simple command in Rust's newline
+        // pass, which reads the substitution as one word; the Python guard ended the command at its `)`.
+        if words_after_substitution(input) {
+            return Some("substitution-word");
         }
         // pip run as a simple command after blanks, a keyword or an assignment (`then pip install`): block-pip's
         // pattern only matched at a line start or after ; & |.

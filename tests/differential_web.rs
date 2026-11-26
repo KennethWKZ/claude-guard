@@ -428,8 +428,16 @@ fn differential_web() {
     };
 
     let fast_sh = format!("{d}/fast/web-guard.sh");
+    // A run that fails (exit code or stderr; seen once under heavy load) is retried, so a process glitch can't
+    // read as "the fast path let it through" and show up as an unexpected difference.
     let passes: Vec<bool> = parallel(&inputs, workers, |_, (i, mode, _)| {
-        run(&["/bin/dash", &fast_sh, mode], i).stdout == "PASS"
+        for _ in 0..3 {
+            let o = run(&["/bin/dash", &fast_sh, mode], i);
+            if o.code == 0 && o.stderr.is_empty() {
+                return o.stdout == "PASS";
+            }
+        }
+        panic!("the fast path failed three times on {i}");
     });
     let driver = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference_driver.py");
     let mut child = Command::new("/usr/bin/python3")

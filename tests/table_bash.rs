@@ -2673,3 +2673,60 @@ fn shadow_never_blocks() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn words_after_a_substitution_stay_in_its_command() {
+    // An unquoted `$(...)` or backticks is one word: the arguments after it belong to the same simple command and
+    // are checked (the Python guard ended the command at the `)`).
+    let deny = [
+        ("cat $(true) .env", "reading a secrets file"),
+        ("cat $(true) /srv/app/.env", "reading a secrets file"),
+        ("true; cat $(true) .env", "reading a secrets file"),
+        ("cat $(true)$(true) .env", "reading a secrets file"),
+        ("echo $(echo $(ls)) > tail .env", "reading a secrets file"),
+        (
+            "echo $(echo $(echo $(echo $(ls)))) > tail .env",
+            "reading a secrets file",
+        ),
+        ("cat $(echo $(echo x)) .env.local", "reading a secrets file"),
+        ("rm -rf $(true) /srv/x", "recursive force delete"),
+        ("ls $(true) && rm -rf $(true) ~/x", "recursive force delete"),
+        ("rm -rf `true` /srv/x", "recursive force delete"),
+        ("grep x $(true) -r .", "recursive grep"),
+        ("git push $(true) --force", "git push --force"),
+        ("bash -c 'cat $(true) .env'", "reading a secrets file"),
+    ];
+    let allow = [
+        "rm -rf $(mktemp -d)/x",
+        "rm -rf \"$(mktemp -d)\"",
+        "cat $(ls) README.md",
+        "echo $(date) > out.txt",
+        "n=$(wc -l < .env.example); echo $n",
+        "cp .env.example $(pwd)/.env",
+        "[ -f $(pwd)/.env ] && echo yes",
+        "echo \"$(date)\" .",
+        "x=$(case $1 in a) echo 1;; esac) && echo $x",
+    ];
+    let mut fails = Vec::new();
+    for (c, want) in deny {
+        let o = run(&["bash"], &bash_input(c));
+        if !o.stdout.contains(want) {
+            fails.push(format!(
+                "want deny ({want}) :: {c:?} -> {}",
+                o.stdout.trim()
+            ));
+        }
+    }
+    for c in allow {
+        let o = run(&["bash"], &bash_input(c));
+        if (o.code, o.stdout.as_str()) != (0, "") {
+            fails.push(format!("want allow :: {c:?} -> {}", o.stdout.trim()));
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}

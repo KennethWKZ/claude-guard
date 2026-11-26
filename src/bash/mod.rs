@@ -1300,6 +1300,12 @@ fn pip_in_nested_mode(command: &str, cwd: &Cwd, depth: usize, expand: bool) -> b
     if bodies.iter().any(|b| pip_in_nested(b, cwd, depth + 1)) {
         return true;
     }
+    // Its substitutions as single words (as check_mode does).
+    if let Some(flat) = flatten_substitutions(&command) {
+        if pip_in_nested_mode(&flat, cwd, depth + 1, expand) {
+            return true;
+        }
+    }
     let Ok(raw) = lex_lines(&command) else {
         return false;
     };
@@ -1587,6 +1593,45 @@ fn expand_vars(command: &str, tokens: &[String]) -> Option<String> {
 /// The bodies of `$(...)` and backtick substitutions, also inside double quotes, where the lexer reads
 /// `"$(cat .env)"` as one word (the Python guard never checked them). Single quotes, `$'...'` and comments hold none.
 fn substitutions(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out: Vec<String> = substitution_spans(&chars)
+        .into_iter()
+        .map(|s| chars[s.body.clone()].iter().collect())
+        .collect();
+    out.retain(|b: &String| !b.trim().is_empty());
+    out.dedup();
+    out
+}
+
+/// The command with each outermost substitution (`$(...)`, backticks) replaced by one placeholder word, or None
+/// when it has none. The lexers read an unquoted `$(` ... `)` as words and operators, so the simple command around
+/// it ended at the `)`: `cat $(true) .env` and `rm -rf $(true) /srv/x` left their last arguments unchecked (in the
+/// Python guard too). Its bodies are checked on their own (`substitutions`). Newline pass only.
+fn flatten_substitutions(command: &str) -> Option<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let spans = substitution_spans(&chars);
+    if spans.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut at = 0;
+    for s in spans {
+        out.extend(&chars[at..s.whole.start]);
+        out.push_str("__substitution__");
+        at = s.whole.end;
+    }
+    out.extend(&chars[at..]);
+    Some(out)
+}
+
+/// Where an outermost substitution sits: the whole `$(...)` or `` `...` ``, and its body (char indices).
+struct SubSpan {
+    whole: std::ops::Range<usize>,
+    body: std::ops::Range<usize>,
+}
+
+/// The outermost substitutions in `chars`, in order (see `substitutions`). An unclosed one is left out.
+fn substitution_spans(chars: &[char]) -> Vec<SubSpan> {
     #[derive(Clone, Copy, PartialEq)]
     enum F {
         Code,
@@ -1600,9 +1645,8 @@ fn substitutions(command: &str) -> Vec<String> {
     // Only the outermost substitutions: checking one finds those nested in it, so returning every level would check
     // each nested body once per level around it (work doubling per level).
     let outermost = |stack: &[F]| !stack.iter().any(|f| matches!(f, F::Sub(..) | F::Tick(_)));
-    let chars: Vec<char> = command.chars().collect();
     let mut stack = vec![F::Code];
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<SubSpan> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -1657,7 +1701,10 @@ fn substitutions(command: &str) -> Vec<String> {
                         if let F::Tick(start) = top {
                             stack.pop();
                             if outermost(&stack) {
-                                out.push(chars[start..i].iter().collect());
+                                out.push(SubSpan {
+                                    whole: start - 1..i + 1,
+                                    body: start..i,
+                                });
                             }
                         } else {
                             stack.push(F::Tick(i + 1));
@@ -1676,7 +1723,10 @@ fn substitutions(command: &str) -> Vec<String> {
                             let start = *start;
                             stack.pop();
                             if outermost(&stack) {
-                                out.push(chars[start..i].iter().collect());
+                                out.push(SubSpan {
+                                    whole: start - 2..i + 1,
+                                    body: start..i,
+                                });
                             }
                         }
                         _ => {}
@@ -1705,8 +1755,6 @@ fn substitutions(command: &str) -> Vec<String> {
         }
         i += 1;
     }
-    out.retain(|b| !b.trim().is_empty());
-    out.dedup();
     out
 }
 
@@ -1936,6 +1984,15 @@ fn check_mode(
     if let Some(x) = expanded {
         if let Some(r) = check_mode(&x, cwd, depth + 1, lines, false)? {
             return Ok(Some(r));
+        }
+    }
+    // The command with its substitutions as single words, so the words after one stay in its simple command
+    // (`cat $(true) .env`). Rust only.
+    if lines {
+        if let Some(flat) = flatten_substitutions(&command) {
+            if let Some(r) = check_mode(&flat, cwd, depth + 1, lines, expand)? {
+                return Ok(Some(r));
+            }
         }
     }
     for (file, explicit, chain) in disk {
