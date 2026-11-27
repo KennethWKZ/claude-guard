@@ -12,9 +12,11 @@ it is needed to use claude-guard.
   test suites.
 - **Differential tests** (`tests/differential_*.rs`) generate thousands of inputs from a seed, run the original hook
   and the Rust subcommand on each, and fail on any difference in output, exit code, log lines or (for husky) every
-  file, mode, mtime and link. They need the original hooks (`~/.claude/hooks/` by default, or
-  `CLAUDE_GUARD_REF_BASH`, `CLAUDE_GUARD_REF_PIP`, `CLAUDE_GUARD_REF_READ`, `CLAUDE_GUARD_REF_HUSKY`,
-  `CLAUDE_GUARD_REF_PROMPT`, `CLAUDE_GUARD_REF_WEB`) and skip themselves when they are missing. Size and workers:
+  file, mode, mtime and link. The original hooks are kept in `tests/reference/` as test-only references (nothing installs them any
+  more); `CLAUDE_GUARD_REF_BASH`, `CLAUDE_GUARD_REF_PIP`, `CLAUDE_GUARD_REF_READ`, `CLAUDE_GUARD_REF_HUSKY`,
+  `CLAUDE_GUARD_REF_PROMPT`, `CLAUDE_GUARD_REF_WEB`, `CLAUDE_GUARD_REF_SESSION_NAME` and `CLAUDE_GUARD_REF_DNS` point
+  a test at another copy. A rule change goes into the Rust code and the matching reference together, so the
+  differential tests keep comparing two independent implementations. Size and workers:
   `CLAUDE_GUARD_DIFF_CASES`, `CLAUDE_GUARD_DIFF_WORKERS`. `tests/reference_driver.py` runs the Python bash, read and
   prompt guards in-process so thousands of cases take seconds (spot checked against real `python3 -I` runs).
 - **Shadow mode** ran each subcommand next to the live Python hook for real traffic before any switch (below).

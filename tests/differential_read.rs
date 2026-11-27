@@ -181,7 +181,10 @@ fn rust_matches_python() {
     let h = home();
     let reference = env_or(
         "CLAUDE_GUARD_REF_READ",
-        &format!("{h}/.claude/hooks/guard-read-keys.py"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/reference/guard-read-keys.py"
+        ),
     );
     if !std::path::Path::new(&reference).exists() {
         eprintln!("SKIPPED: reference hook not found ({reference})");

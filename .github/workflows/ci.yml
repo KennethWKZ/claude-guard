@@ -43,6 +43,9 @@ jobs:
         run: cargo clippy --release --locked --all-targets -- -D warnings
 
       - name: Tests
+        # The differential tests compare against tests/reference/; fewer generated cases keep CI quick.
+        env:
+          CLAUDE_GUARD_DIFF_CASES: "500"
         run: cargo test --release --locked
 
   supply-chain:

@@ -228,7 +228,10 @@ fn build(rng: &mut Rng, root: &str, i: usize, pids: &[String]) -> Case {
 fn differential_session_name() {
     let reference = env_or(
         "CLAUDE_GUARD_REF_SESSION_NAME",
-        &format!("{}/.claude/hooks/session-name-from-title.sh", home()),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/reference/session-name-from-title.sh"
+        ),
     );
     if !std::path::Path::new(&reference).exists() {
         eprintln!("differential session-name: skipped, no reference at {reference}");

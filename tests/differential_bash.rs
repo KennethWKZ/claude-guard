@@ -3,7 +3,7 @@
 //! stdout, exit code or stderr fails, except the known ones listed in `known_difference`.
 //!
 //! Needs the reference hooks; skipped (with a message) when they are missing. Test-only settings come from the
-//! environment: CLAUDE_GUARD_REF_BASH, CLAUDE_GUARD_REF_PIP (default ~/.claude/hooks/...),
+//! environment: CLAUDE_GUARD_REF_BASH, CLAUDE_GUARD_REF_PIP (default tests/reference/...),
 //! CLAUDE_GUARD_DIFF_CASES (default 4000), CLAUDE_GUARD_DIFF_SEED, CLAUDE_GUARD_DIFF_WORKERS (default 2;
 //! pass "$(test-workers)").
 
@@ -958,14 +958,13 @@ fn rule(stdout: &str) -> String {
 
 #[test]
 fn rust_matches_python_and_dash() {
-    let home = env_or("HOME", "/");
     let ref_bash = env_or(
         "CLAUDE_GUARD_REF_BASH",
-        &format!("{home}/.claude/hooks/guard-bash.py"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/guard-bash.py"),
     );
     let ref_pip = env_or(
         "CLAUDE_GUARD_REF_PIP",
-        &format!("{home}/.claude/hooks/block-pip.sh"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/block-pip.sh"),
     );
     if !std::path::Path::new(&ref_bash).exists() || !std::path::Path::new(&ref_pip).exists() {
         eprintln!("SKIPPED: reference hooks not found ({ref_bash}, {ref_pip})");

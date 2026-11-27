@@ -1,7 +1,7 @@
 //! Differential test: `claude-guard prompt` against guard-prompt.py on generated prompts and hook inputs.
 //! stdout must match byte for byte, and the allow-name log lines (time left out) must match as a set.
-//! Reference: guard-prompt.py (default ~/.claude/hooks/guard-prompt.py) (the source the live hook and the team
-//! runbook copy are made from). Names come from a made-up terms file; the real blocked-terms file is never read.
+//! Reference: guard-prompt.py (default tests/reference/guard-prompt.py) (the Python original the hook was ported
+//! from; the team runbook no longer ships it). Names come from a made-up terms file; the real blocked-terms file is never read.
 //! Env (test only): CLAUDE_GUARD_REF_PROMPT, CLAUDE_GUARD_DIFF_CASES (default 3000), CLAUDE_GUARD_DIFF_SEED,
 //! CLAUDE_GUARD_DIFF_WORKERS (default 2; pass "$(test-workers)").
 
@@ -484,7 +484,10 @@ fn untimed(line: &str) -> String {
 fn differential_prompt() {
     let reference = env_or(
         "CLAUDE_GUARD_REF_PROMPT",
-        &format!("{}/.claude/hooks/guard-prompt.py", home()),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/reference/guard-prompt.py"
+        ),
     );
     if !std::path::Path::new(&reference).exists() {
         eprintln!("differential prompt: skipped, no reference at {reference}");

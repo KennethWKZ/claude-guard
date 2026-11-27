@@ -303,10 +303,12 @@ fn snapshot(root: &str) -> BTreeMap<String, String> {
 
 #[test]
 fn rust_matches_python() {
-    let h = home();
     let reference = env_or(
         "CLAUDE_GUARD_REF_HUSKY",
-        &format!("{h}/.claude/hooks/husky-worktree-hooks.py"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/reference/husky-worktree-hooks.py"
+        ),
     );
     if !std::path::Path::new(&reference).exists() {
         eprintln!("SKIPPED: reference hook not found ({reference})");

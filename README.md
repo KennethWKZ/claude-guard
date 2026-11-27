@@ -387,8 +387,8 @@ CI runs all of these on every push and pull request (`.github/workflows/ci.yml`)
 `serde_json` and `regex`, 13 crates in all, no proc macros; `Cargo.lock` is committed and builds use `--locked`.
 
 claude-guard started as a port of Python and shell hooks, checked against them with differential tests and a "shadow"
-mode that ran both side by side. The differential tests need those original hooks, which aren't in this repository,
-and skip themselves without them. [docs/porting.md](docs/porting.md) has the details, including where Python's
+mode that ran both side by side. Those original hooks are kept in `tests/reference/` as test-only references, so
+the differential tests run everywhere, CI included (with fewer generated cases there). [docs/porting.md](docs/porting.md) has the details, including where Python's
 `json`, `re`, `shlex` and `urllib` behave differently from their Rust counterparts. Some messages still carry the
 original hooks' names (`guard-bash:`, `Blocked by guard-read-keys.py:`) so tools that matched them keep working.
 

@@ -1,6 +1,6 @@
 //! Differential test: `claude-guard web` against web-guard.sh + web-guard.py on generated hook inputs.
 //! stdout must match byte for byte, and the web.log lines (time left out) must match as a set.
-//! Reference: the web-guard folder (default ~/.claude/hooks) (the source of the live hook and the team runbook copy),
+//! Reference: the web-guard folder (default tests/reference) (the Python original the hook was ported from),
 //! with guard-prompt.py as its `--guard`. web-guard.sh's fast path is applied by running
 //! the real script from a temp folder where web-guard.py is a stub that prints PASS; web-guard.py itself runs
 //! in-process (tests/reference_driver.py), spot-checked against real runs of the script.
@@ -375,11 +375,16 @@ fn untimed(line: &str) -> String {
 
 #[test]
 fn differential_web() {
-    let h = home();
-    let refdir = env_or("CLAUDE_GUARD_REF_WEB", &format!("{h}/.claude/hooks"));
+    let refdir = env_or(
+        "CLAUDE_GUARD_REF_WEB",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference"),
+    );
     let guard = env_or(
         "CLAUDE_GUARD_REF_PROMPT",
-        &format!("{h}/.claude/hooks/guard-prompt.py"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/reference/guard-prompt.py"
+        ),
     );
     let (py_ref, sh_ref) = (
         format!("{refdir}/web-guard.py"),
@@ -601,8 +606,10 @@ fn rule_kind(stdout: &str) -> String {
 /// non-IP METADATA_HOSTS, sorted), so the Rust list and the Python one can't drift apart.
 #[test]
 fn list_hosts_matches_python() {
-    let h = home();
-    let refdir = env_or("CLAUDE_GUARD_REF_WEB", &format!("{h}/.claude/hooks"));
+    let refdir = env_or(
+        "CLAUDE_GUARD_REF_WEB",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference"),
+    );
     let reference = format!("{refdir}/web-guard.py");
     if !std::path::Path::new(&reference).exists() {
         eprintln!("SKIPPED: reference hook not found ({reference})");

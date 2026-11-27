@@ -4,7 +4,7 @@
 //! left out) must match in order, which also covers the once-a-minute log limit and its 5,000-name reset.
 //! The sentinel's own lines are left out of that comparison: each server first logs it at its own start, so once
 //! a run passes 60 s (a loaded Mac) the two log it again at different packets. Both must still have logged it.
-//! Reference: dns-nxdomain.py (default ~/.local/share/claude-guard/dns-nxdomain.py). Names are made up.
+//! Reference: dns-nxdomain.py (default tests/reference/dns-nxdomain.py). Names are made up.
 //! Env (test only): CLAUDE_GUARD_REF_DNS, CLAUDE_GUARD_DIFF_CASES (default 3000), CLAUDE_GUARD_DIFF_SEED.
 
 mod common;
@@ -167,7 +167,10 @@ fn packet(rng: &mut Rng, i: usize) -> Vec<u8> {
 fn differential_dns() {
     let reference = env_or(
         "CLAUDE_GUARD_REF_DNS",
-        &format!("{}/.local/share/claude-guard/dns-nxdomain.py", home()),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/reference/dns-nxdomain.py"
+        ),
     );
     if !std::path::Path::new(&reference).exists() {
         eprintln!("differential dns: skipped, no reference at {reference}");
