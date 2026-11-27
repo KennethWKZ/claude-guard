@@ -18,6 +18,8 @@
 //!                         shadow mode against the repo's Python hook, each side with its own records under DIR
 //!   claude-guard dns-nxdomain [--port N] [--log F]
 //!                         launchd daemon: NXDOMAIN for every DNS query on 127.0.0.1:10053 (was dns-nxdomain.py)
+//!   claude-guard dns list|install|agent|check|status|remove|diagnose|help
+//!                         the DNS blocklist: /etc/resolver files and the responder agent (was dns-blocklist)
 //!   claude-guard <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F]
 //!                         run next to the old hook: never blocks or copies, logs agreement
 //!                         (starts `<hook> --shadow-compare` detached and returns at once)
@@ -28,6 +30,7 @@
 
 mod bash;
 mod dns;
+mod dns_blocklist;
 mod hookio;
 mod husky;
 mod jqlite;
@@ -79,7 +82,7 @@ fn home() -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | repo pre-bash --shadow --reference F [--reference F ...] [--log F] | repo post-read [--crash-log F] | repo post-read --shadow --reference F [--records DIR] [--log F] | dns-nxdomain [--port N] [--log F] | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
+        "usage: claude-guard bash [--crash-log F] | read | husky | prompt [--strict] [--terms F] [--log F] | web pre|post [--policy F] [--log F] [--guard F] [--terms F] | web --list-hosts | session-name | repo pre-bash [--crash-log F] | repo pre-bash --shadow --reference F [--reference F ...] [--log F] | repo post-read [--crash-log F] | repo post-read --shadow --reference F [--records DIR] [--log F] | dns-nxdomain [--port N] [--log F] | dns list|install|agent|check|status|remove|diagnose|help | <hook> --shadow [pre|post] [--reference F] [--pip-reference F] [--terms F] [--policy F] [--log F] | --version"
     );
     std::process::exit(64);
 }
@@ -89,6 +92,9 @@ fn main() {
     let Some(cmd) = args.first().map(String::as_str) else {
         usage()
     };
+    if cmd == "dns" {
+        std::process::exit(dns_blocklist::run(&args[1..]));
+    }
     if cmd == "dns-nxdomain" {
         std::process::exit(dns::serve(&args[1..]));
     }

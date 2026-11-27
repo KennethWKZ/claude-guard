@@ -1,0 +1,241 @@
+#!/bin/bash
+# dns-blocklist: make the web guard's canary and callback hosts resolve nowhere, for every program that looks names
+# up through macOS (Playwright, Chrome, curl, Node's fetch, MCP servers, scripts), not only the tool calls Claude
+# Code's hooks see. Programs that send DNS themselves get past it: dig, nslookup, Node's dns.resolve*, Go with
+# GODEBUG=netdns=go, DNS-over-HTTPS. It stops callbacks tripped by accident, not code written to get out.
+#
+# How: one macOS per-domain resolver file per host, /etc/resolver/<domain>, pointing at a local port where
+# nothing listens. macOS applies such a file to the domain and all its subdomains, so x7q2.canarytokens.com
+# fails to resolve too, at once: the files point at dns-nxdomain, a local responder that answers every query with
+# "no such domain" (a launchd agent for your user, 127.0.0.1:10053; it forwards nothing). If the agent isn't
+# running, those lookups still fail, after about 30 s of retries (fail closed). Nothing leaves the Mac. macOS reads the folder when it rebuilds its DNS
+# settings, which a network change does (VPN reconnect, Wi-Fi off and on), not a change to the folder itself.
+# The list comes from claude-guard (`claude-guard web --list-hosts`, the hook's own built-in list) plus block_hosts
+# in ~/.config/claude-guard/url-policy.json (in the real home folder from the user database, as the web guard reads
+# it, not $HOME), so the
+# hook and the DNS layer can't drift apart: after changing either, run `dns-blocklist install` again.
+#
+# Usage:
+#   dns-blocklist list       the domains it would block
+#   dns-blocklist install    start the responder agent, write /etc/resolver files (sudo; asks for your password),
+#                            remove ones no longer listed
+#   dns-blocklist agent      start (or restart) only the responder agent (no sudo)
+#   dns-blocklist check      prove each domain and a random subdomain fail to resolve (no sudo)
+#   dns-blocklist status     one line: how many domains macOS has loaded, whether the responder answers, and
+#                            whether the self-test name is blocked (BYPASSED: something answers DNS around
+#                            the blocklist, such as iCloud Private Relay), and whether the Private Relay files
+#                            are in place
+#   dns-blocklist remove     delete every file this script wrote (sudo)
+#   dns-blocklist diagnose   write 4 throwaway variants for made-up .invalid domains, report which macOS loads,
+#                            remove them (sudo)
+# Its files are recognised by their exact content (below; port 5 makes it unique), and it never touches other
+# /etc/resolver files. resolver(5) has no comment syntax, and a file with a '#' line isn't loaded at all.
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+DIR=/etc/resolver
+CG="$HOME/.local/bin/claude-guard"
+# The real home folder from the user database (`id -P`, field 9), as the web guard reads the policy; $HOME only when
+# the account has no entry.
+REAL_HOME=$(id -P 2>/dev/null | awk -F: '{print $9}') || true
+POLICY="${REAL_HOME:-$HOME}/.config/claude-guard/url-policy.json"
+# Self-test: one more resolver file, for a subtree of sslip.io, a public wildcard DNS service that answers every
+# name under 192-0-2-1.sslip.io with 192.0.2.1 (a reserved test address). While the blocklist works, a random name
+# under it fails to resolve; when it resolves, something on this Mac answers DNS around /etc/resolver (iCloud
+# Private Relay does). A lookup that gets past tells sslip.io one random name and nothing else.
+SELFTEST=selftest.192-0-2-1.sslip.io
+# Private Relay: two more resolver files, for the names iCloud Private Relay connects through. "No such domain" for
+# both is Apple's documented sign that a network doesn't allow Private Relay: macOS then asks, once per network, to
+# use it without Private Relay. With Private Relay on, DNS goes around /etc/resolver and the blocklist does nothing.
+# Their own list, not the web guard's: they're Apple's relay, not catchers.
+RELAY="mask.icloud.com mask-h2.icloud.com"
+# dns-nxdomain answers on 127.0.0.1:10053. OLD_BODY is the first version (port 5, nothing listening: 30 s hangs).
+BODY="nameserver 127.0.0.1
+port 10053"
+OLD_BODY="nameserver 127.0.0.1
+port 5
+timeout 1"
+# Before v30 the responder was a Python script; start_agent replaces its agent and removes the file.
+OLD_RESPONDER="$HOME/.local/share/claude-guard/dns-nxdomain.py"
+LABEL=local.claude-guard.dns-nxdomain
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+die() { echo "dns-blocklist: $*" >&2; exit 1; }
+
+cg_list() { # claude-guard's built-in block list, when this claude-guard has `web --list-hosts`
+  # Older releases don't: they would read `web --list-hosts` as a hook call (stdin) and could print a warning, so
+  # check the usage text first and give it no stdin.
+  [ -x "$CG" ] && { "$CG" 2>&1 || true; } | grep -q 'web --list-hosts' && "$CG" web --list-hosts </dev/null
+}
+
+domains() {
+  /usr/bin/python3 -I - "$POLICY" "$(cg_list || true)" <<'PY'
+import json, re, sys
+# claude-guard's built-in list (argv[2]): the web guard's blocked hosts and metadata host names.
+names = set(sys.argv[2].split())
+if not names:
+    sys.exit("dns-blocklist: no block list: install claude-guard (Step 16, claude-guard)")
+try:
+    names |= {str(h).lower().strip(".") for h in json.load(open(sys.argv[1])).get("block_hosts", [])}
+except FileNotFoundError:
+    pass
+for n in sorted(names):
+    # a resolver file name is a domain: letters, digits, dots and hyphens only
+    if re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", n):
+        print(n)
+PY
+}
+
+ours() { # files in /etc/resolver this script wrote
+  [ -d "$DIR" ] || return 0
+  for f in "$DIR"/*; do [ -f "$f" ] || continue; c=$(cat "$f"); { [ "$c" = "$BODY" ] || [ "$c" = "$OLD_BODY" ]; } && echo "${f##*/}"; done; return 0
+}
+
+agent_up() { # the responder answers NXDOMAIN on its port
+  dig +time=1 +tries=1 @127.0.0.1 -p 10053 dns-blocklist-check.invalid 2>/dev/null | grep -q 'status: NXDOMAIN'
+}
+
+agent_old() { # the agent still runs the Python responder from before v30
+  grep -q 'dns-nxdomain.py' "$PLIST" 2>/dev/null
+}
+
+start_agent() {
+  [ -x "$CG" ] || die "no $CG (install claude-guard first: Step 16, claude-guard)"
+  mkdir -p "${PLIST%/*}"
+  cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$CG</string><string>dns-nxdomain</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>
+PL
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  for i in 1 2 3 4 5; do agent_up && { rm -f "$OLD_RESPONDER"; echo "dns-blocklist: responder agent answering on 127.0.0.1:10053"; return 0; }; sleep 1; done
+  die "responder agent didn't answer on 127.0.0.1:10053 (launchctl print gui/$(id -u)/$LABEL)"
+}
+
+flush() { sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder 2>/dev/null || true; }
+
+loaded() { # how many of the listed domains macOS's DNS configuration (scutil --dns) has a resolver for
+  local conf; conf=$(scutil --dns); n=0
+  for d in $(domains); do printf '%s\n' "$conf" | grep -qE "^  domain   : $d\$" && n=$((n + 1)); done; echo "$n"
+}
+
+resolves() { # 0 if the name resolves (python's getaddrinfo, the same call curl and Node make)
+  /usr/bin/python3 -I -c 'import socket, sys
+try:
+    socket.getaddrinfo(sys.argv[1], 443); sys.exit(0)
+except OSError:
+    sys.exit(1)' "$1"
+}
+
+extras_missing() { # the self-test and Private Relay files install writes that aren't there
+  for d in $SELFTEST $RELAY; do [ -f "$DIR/$d" ] || echo "$d"; done; return 0
+}
+
+selftest() { # blocked, BYPASSED or missing (no self-test file: dns-blocklist install writes it)
+  [ -f "$DIR/$SELFTEST" ] || { echo missing; return 0; }
+  if resolves "probe-$RANDOM$RANDOM.$SELFTEST"; then echo BYPASSED; else echo blocked; fi
+}
+
+case "${1:-}" in
+  list) domains ;;
+  agent) start_agent ;;
+  status)
+    total=$(domains | wc -l | tr -d ' '); have=$(ours | wc -l | tr -d ' '); got=$(loaded)
+    agent_up && a=answering || a=down
+    if [ "$have" = 0 ]; then echo MISSING
+    elif agent_old; then echo "INCOMPLETE (the responder agent still runs the old Python script: run dns-blocklist agent)"
+    elif [ "$got" = "$total" ] && [ "$a" = answering ] && [ -n "$(extras_missing)" ]; then
+      echo "INCOMPLETE ($got of $total loaded, responder answering, missing self-test or Private Relay file: run dns-blocklist install)"
+    elif [ "$got" = "$total" ] && [ "$a" = answering ]; then
+      case $(selftest) in
+        blocked) echo "ok ($got of $total loaded, responder answering, self-test blocked)" ;;
+        BYPASSED) echo "BYPASSED ($got of $total loaded, responder answering, but the self-test name resolves: something answers DNS around the blocklist, such as iCloud Private Relay)" ;;
+        *) echo "INCOMPLETE ($got of $total loaded, responder answering, missing self-test or Private Relay file: run dns-blocklist install)" ;;
+      esac
+    else echo "INCOMPLETE ($have files, $got of $total loaded, responder $a)"; fi ;;
+  install)
+    want=$(domains); [ -n "$want" ] || die "empty list"
+    want=$(printf '%s\n%s\n' "$want" "$SELFTEST"; printf '%s\n' $RELAY)
+    start_agent
+    echo "dns-blocklist: writing $(printf '%s\n' "$want" | wc -l | tr -d ' ') files in $DIR (sudo)"
+    sudo mkdir -p "$DIR"
+    for d in $want; do
+      c=$(cat "$DIR/$d" 2>/dev/null || true)
+      if [ -e "$DIR/$d" ] && [ "$c" != "$BODY" ] && [ "$c" != "$OLD_BODY" ] && ! head -n 1 "$DIR/$d" | grep -q '^# dns-blocklist'; then
+        echo "  skip $d: $DIR/$d exists and isn't ours"; continue
+      fi
+      # temp file + rename: a rename changes the folder, which is what makes macOS re-read it (rewriting a
+      # file's contents in place doesn't, so a fixed file can sit there unread)
+      printf '%s\n' "$BODY" | sudo tee "$DIR/.dns-blocklist-$d" >/dev/null
+      sudo chmod 644 "$DIR/.dns-blocklist-$d"; sudo mv -f "$DIR/.dns-blocklist-$d" "$DIR/$d"
+    done
+    for d in $(ours); do printf '%s\n' "$want" | grep -qxF "$d" || { sudo rm -f "$DIR/$d"; echo "  removed $d (no longer listed)"; }; done
+    # flush again once macOS has read the files: an answer cached in between (iCloud Private Relay looks up
+    # mask.icloud.com on its own) would otherwise outlive the block
+    flush; sleep 2; flush
+    total=$(domains | wc -l | tr -d ' '); got=$(loaded)
+    echo "dns-blocklist: installed; macOS loaded $got of $total (scutil --dns)."
+    echo "Private Relay is blocked too: if it's on, macOS asks once per network whether to use the network without it. Choose 'Use Without Private Relay'."
+    if [ "$got" = 0 ]; then
+      echo "macOS hasn't read the files yet: it rebuilds its DNS settings (and reads $DIR) when the network changes,"
+      echo "not when the folder does. Reconnect the VPN, or turn Wi-Fi off and on, then run 'dns-blocklist check'."
+    elif [ "$got" != "$total" ]; then echo "Only some loaded: testing which file format macOS accepts..."; "$0" diagnose
+    else
+      case $(selftest) in
+        blocked) echo "Self-test: blocked. Run 'dns-blocklist check'" ;;
+        BYPASSED) echo "Self-test: BYPASSED: the files are loaded, but something answers DNS around them. Turn off iCloud Private Relay (System Settings, your name, iCloud), then run 'dns-blocklist status'" ;;
+        *) echo "Self-test file not loaded yet; run 'dns-blocklist check'" ;;
+      esac
+    fi ;;
+  check)
+    have=$(ours); [ -n "$have" ] || die "not installed (no files in $DIR with this script's content)"
+    echo "macOS has loaded $(loaded) of $(domains | wc -l | tr -d ' ') domains (scutil --dns)"
+    agent_up && echo "responder agent: answering" || { echo "responder agent: NOT answering (lookups hang ~30 s, still fail): dns-blocklist agent"; bad_agent=1; }
+    old=0; for d in $have; do [ "$(cat "$DIR/$d")" = "$OLD_BODY" ] && old=$((old + 1)); done
+    [ "$old" = 0 ] || { echo "$old files still point at the old port 5 (every lookup hangs ~30 s): run dns-blocklist install, then reconnect the network"; exit 1; }
+    bad=0; n=0
+    for d in $(domains); do
+      n=$((n + 1))
+      printf '%s\n' "$have" | grep -qxF "$d" || { echo "MISSING $d"; bad=1; continue; }
+      for name in "$d" "probe-$RANDOM.$d"; do
+        s=$(date +%s); if resolves "$name"; then echo "RESOLVES $name"; bad=1; elif [ $(( $(date +%s) - s )) -gt 3 ]; then echo "SLOW $name (blocked, but took $(( $(date +%s) - s )) s)"; slow=1; fi
+      done
+      [ "${slow:-0}" = 1 ] && [ "${bad_agent:-0}" = 1 ] && { echo "stopping: every lookup takes ~30 s while the agent is down"; exit 1; }
+    done
+    case $(selftest) in
+      blocked) ;;
+      BYPASSED) echo "BYPASSED: a name under $SELFTEST resolves although its resolver file blocks it: something answers DNS around the blocklist (turn off iCloud Private Relay)"; bad=1 ;;
+      *) echo "MISSING self-test file $DIR/$SELFTEST: run dns-blocklist install"; bad=1 ;;
+    esac
+    for d in $RELAY; do
+      printf '%s\n' "$have" | grep -qxF "$d" || { echo "MISSING Private Relay file $DIR/$d: run dns-blocklist install"; bad=1; continue; }
+      if resolves "$d"; then echo "RESOLVES $d (an answer cached from before: run dns-blocklist install again, or sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder)"; bad=1; fi
+    done
+    resolves example.com || { echo "WARNING: example.com doesn't resolve either: no network, or DNS is broken"; bad=1; }
+    [ "$bad" = 0 ] && echo "ok: $n domains and their subdomains resolve nowhere, self-test blocked, Private Relay blocked; example.com still resolves"
+    exit "$bad" ;;
+  diagnose)
+    sudo mkdir -p "$DIR"
+    v1="nameserver 127.0.0.1"; v2="$v1
+port 5"; v3="$v1
+timeout 1"; v4="$BODY"
+    for i in 1 2 3 4; do eval "b=\$v$i"; printf '%s\n' "$b" | sudo tee "$DIR/dnsdiag-$i.invalid" >/dev/null; done
+    sudo killall -HUP mDNSResponder 2>/dev/null || true; sleep 3; conf=$(scutil --dns)
+    for i in 1 2 3 4; do eval "b=\$v$i"
+      printf '%s\n' "$conf" | grep -qE "^  domain   : dnsdiag-$i\.invalid\$" && s=loaded || s="NOT loaded"
+      echo "variant $i ($(printf '%s' "$b" | tr '\n' ';')): $s"; done
+    for i in 1 2 3 4; do sudo rm -f "$DIR/dnsdiag-$i.invalid"; done
+    sudo killall -HUP mDNSResponder 2>/dev/null || true; echo "(test files removed)" ;;
+  remove)
+    for d in $(ours); do sudo rm -f "$DIR/$d"; echo "  removed $d"; done
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true; rm -f "$PLIST" "$OLD_RESPONDER"; echo "  responder agent stopped and removed"
+    flush; echo "dns-blocklist: removed" ;;
+  *) sed -n '2,/remove them (sudo)$/p' "$0" | sed 's/^# \{0,1\}//'; [ -n "${1:-}" ] && exit 2 || exit 0 ;;
+esac

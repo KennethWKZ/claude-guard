@@ -1,6 +1,8 @@
 //! Helpers shared by the read and husky tests.
 #![allow(dead_code)]
 
+pub mod dnsbl;
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;

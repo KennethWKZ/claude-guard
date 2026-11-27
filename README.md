@@ -32,6 +32,7 @@ Claude Code's sandbox and permission rules, not instead of them. See [What it do
 | `claude-guard repo pre-bash` | PreToolUse `Bash`, in one repo | Guards a repo configures in its own `.claude/repo-guard.json`: the Logs Insights cost guard (raw `aws logs start-query`, and Python that starts queries without the repo's guard module) and, for repos where sessions share one working tree, the shared-tree guard (git outside the commit queue, history and branch moves, discards, shell and interpreter writes to locked folders, the write ledger) | allows, logs one line (blocks once the repo opts in) |
 | `claude-guard repo post-read` | PostToolUse `Read\|Bash`, in one repo | Tells a session that a file it read earlier in the repo's tracked folders was changed since by someone else (another session, a script, a person), so it reads it again before relying on it; per-session records shared with the repo's Edit hook | prints nothing, logs one line |
 | `claude-guard dns-nxdomain` | not a hook | A tiny DNS responder that answers "no such domain" for blocked domains (see below) | skips that reply |
+| `claude-guard dns <command>` | not a hook | Sets up and checks the macOS DNS blocklist that sends those domains to the responder (see below) | stops with the failing command's exit code |
 
 Input that isn't hook JSON is let through by every guard: a hook that blocked on bad input could lock up Claude Code.
 
@@ -352,8 +353,23 @@ The guards only see what Claude's tools do. A script Claude runs (Playwright, a 
 those, point the blocked domains at this responder with macOS `/etc/resolver/<domain>` files
 (`nameserver 127.0.0.1`, `port 10053`) and run `claude-guard dns-nxdomain` as a launchd agent. It answers every query
 on 127.0.0.1:10053 with NXDOMAIN at once (so programs fail fast instead of retrying) and logs each name to `web.log`
-at most once a minute. The resolver files and the launchd agent are yours to set up; macOS reads `/etc/resolver` only
-when the network changes.
+at most once a minute. macOS reads `/etc/resolver` only when the network changes.
+
+### `claude-guard dns list|install|agent|check|status|remove|diagnose`
+
+Sets that up and checks it. The list is the web guard's built-in blocked hosts (`claude-guard web --list-hosts`) plus
+`block_hosts` from `~/.config/claude-guard/url-policy.json`, so the hook and the DNS layer can't drift apart.
+
+- `install` starts the responder as a launchd agent (`local.claude-guard.dns-nxdomain`), writes one
+  `/etc/resolver/<domain>` file per name with `sudo` (asks for your password), adds a self-test file and two for
+  iCloud Private Relay's names, removes files it wrote for names no longer listed, and leaves other files alone.
+- `status` prints one line (`ok (43 of 43 loaded, responder answering, self-test blocked)`, `MISSING`, `INCOMPLETE
+  (...)`, `BYPASSED (...)`); `check` proves each name and a random subdomain fail to resolve; `agent` restarts only
+  the responder; `remove` deletes everything it wrote; `diagnose` reports which resolver-file format macOS loads.
+
+It is a port of a bash script (`tests/reference/dns-blocklist`) with the same messages and exit codes, checked against
+it by `tests/table_dns_blocklist.rs` and `tests/differential_dns_blocklist.rs` on fake Macs (a temp folder for
+`/etc/resolver`, stub `sudo`, `launchctl`, `scutil` and `dig`), so the tests never touch the real system.
 
 ## What it doesn't cover
 
