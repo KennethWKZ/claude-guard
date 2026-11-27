@@ -137,6 +137,16 @@ fn flush_out() {
     let _ = std::io::stdout().flush();
 }
 
+/// bash's exit code for a command it couldn't start: 126 when the file was found but couldn't be run (no execute
+/// permission, or the system refused it), 127 when there was nothing to run.
+fn exec_failure_code(e: &std::io::Error) -> i32 {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        126
+    } else {
+        127
+    }
+}
+
 /// Run a command with stdout and stderr passed through; a failure stops the run, as `set -e` did.
 fn must(mut c: Command) -> R<()> {
     flush_out();
@@ -144,9 +154,8 @@ fn must(mut c: Command) -> R<()> {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(Exit(s.code().unwrap_or(1))),
         Err(e) => {
-            // bash: "<prog>: command not found", exit 127.
             eprintln!("dns-blocklist: {}: {e}", c.get_program().to_string_lossy());
-            Err(Exit(127))
+            Err(Exit(exec_failure_code(&e)))
         }
     }
 }
@@ -568,7 +577,7 @@ fn sudo_write(ctx: &Ctx, path: &str, text: &str) -> R<()> {
         Ok(ch) => ch,
         Err(e) => {
             eprintln!("dns-blocklist: sudo: {e}");
-            return Err(Exit(127));
+            return Err(Exit(exec_failure_code(&e)));
         }
     };
     if let Some(mut si) = child.stdin.take() {
@@ -941,6 +950,16 @@ mod tests {
         ] {
             assert_eq!(py_float_repr(f), want, "{f}");
         }
+    }
+
+    #[test]
+    fn exec_failure_codes() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            exec_failure_code(&Error::from(ErrorKind::PermissionDenied)),
+            126
+        );
+        assert_eq!(exec_failure_code(&Error::from(ErrorKind::NotFound)), 127);
     }
 
     #[test]

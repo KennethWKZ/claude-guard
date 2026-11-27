@@ -483,3 +483,52 @@ fn diagnose_remove_agent_help() {
         );
     }
 }
+
+/// A command the port finds but can't run exits 126, as bash does ("Permission denied"); one it can't find exits 127.
+/// Port only: with the system folders on PATH, bash and execvp would skip a stub that can't be run and start the
+/// real /bin/launchctl, so the PATH here holds only the stub folder, and bash isn't run.
+#[test]
+fn refused_exec_exits_126() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for (tag, make_launchctl, want) in [("refused", true, 126), ("missing", false, 127)] {
+        let root = fresh_dir(&format!("dnsbl-t-exec-{tag}"));
+        build(&root, &Scenario::new("agent"));
+        let stubs = format!("{root}/stubs");
+        let lc = format!("{stubs}/launchctl");
+        if make_launchctl {
+            std::fs::set_permissions(&lc, std::fs::Permissions::from_mode(0o644)).unwrap();
+        } else {
+            std::fs::remove_file(&lc).unwrap();
+        }
+        symlink("/bin/mkdir", format!("{stubs}/mkdir")).unwrap();
+        let o = std::process::Command::new(BIN)
+            .args([
+                "dns",
+                "--resolver-dir",
+                &format!("{root}/resolver"),
+                "--real-home",
+                &format!("{root}/realhome"),
+            ])
+            .args([
+                "--path",
+                &stubs,
+                "--resolve-with",
+                &format!("{stubs}/resolve"),
+                "--no-sleep",
+                "agent",
+            ])
+            .env_clear()
+            .env("HOME", format!("{root}/home"))
+            .env("PATH", &stubs)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(want), "[{tag}] {err}");
+        assert!(
+            err.starts_with("dns-blocklist: launchctl: "),
+            "[{tag}] {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
