@@ -5,6 +5,8 @@
 //!    digits. gitleaks runs in `/` (nobody can plant a .gitleaks.toml there) with a clean environment, /dev/null as
 //!    its ignore file and a 1 s timeout; if it is missing, fails or times out, the built-in rules stand.
 //! 2. Malaysian IC numbers: YYMMDD-PB-###G, all dashes or none, real month and day, a place-of-birth code JPN issues.
+//!    Twelve digits inside a run of 32 or more ASCII hex characters (a SHA-256, SHA-1, MD5 or git id) are part of a
+//!    hash, not an IC number.
 //! 3. Names from ~/.config/claude-guard/blocked-terms.txt (`--terms <file>`): case-insensitive, whole words.
 //!
 //! A secret or an IC number blocks ({"decision": "block"}) with the rule name only, never the matched text. A
@@ -438,8 +440,27 @@ fn pb_code_ok(pb: &[char]) -> bool {
     matches!(n, 1..=16 | 21..=68 | 71 | 72 | 74..=79 | 82..=93 | 98 | 99)
 }
 
+/// Hashes (SHA-256, SHA-1, MD5, git ids) are at least this many hex characters.
+const HEX_RUN_MIN: usize = 32;
+
+/// guard-prompt's `in_hex_run`: the match `c[a..b]` is all ASCII hex and sits in a run of at least `HEX_RUN_MIN`
+/// ASCII hex characters. Stops looking once the run is long enough, so a long hex blob stays linear.
+fn in_hex_run(c: &[char], a: usize, b: usize) -> bool {
+    if !c[a..b].iter().all(char::is_ascii_hexdigit) {
+        return false;
+    }
+    let (mut lo, mut hi) = (a, b);
+    while lo > 0 && hi - lo < HEX_RUN_MIN && c[lo - 1].is_ascii_hexdigit() {
+        lo -= 1;
+    }
+    while hi < c.len() && hi - lo < HEX_RUN_MIN && c[hi].is_ascii_hexdigit() {
+        hi += 1;
+    }
+    hi - lo >= HEX_RUN_MIN
+}
+
 /// guard-prompt's IC_RE `(?<![\d-])(\d{2})(\d{2})(\d{2})(-?)(\d{2})\4(\d{4})(?![\d-])` run with finditer, then
-/// the month, day and place-of-birth check on each match.
+/// the month, day and place-of-birth check on each match, skipping a match that is part of a hex hash.
 pub(crate) fn malaysian_ic(prompt: &str) -> bool {
     let c: Vec<char> = prompt.chars().collect();
     let n = c.len();
@@ -483,6 +504,7 @@ pub(crate) fn malaysian_ic(prompt: &str) -> bool {
             && day >= 1
             && day <= DAYS[month as usize - 1]
             && pb_code_ok(&c[pb..pb + 2])
+            && !in_hex_run(&c, s, end)
         {
             return true;
         }

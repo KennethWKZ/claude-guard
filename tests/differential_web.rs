@@ -108,6 +108,13 @@ const QUERIES: &[&str] = &[
     "?q=Zorbenta+Quillfeather",
     "?ic=900115-10-5821",
     "?ic=900115105821",
+    concat!(
+        "?sha=abcdefabcdefabcdefab",
+        "900115",
+        "105821",
+        "abcdefabcdefabcdefabcdefabcdefab"
+    ),
+    concat!("?sha=abcdef", "900115", "105821", "abc"),
     "?password=Xk29pq0zA!",
     "?k={AWS}",
     "?X-Amz-Credential={AWS}%2F2026&X-Amz-Signature=ab12",

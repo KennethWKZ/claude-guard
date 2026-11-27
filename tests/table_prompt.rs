@@ -141,6 +141,9 @@ fn guard_prompt_cases() {
         rep("SflKxwRJ", 3)
     );
     let npm = format!("npm_{}", rep("a1b2c3d4e5f6", 3));
+    // IC-shaped digits built from parts, and hex filler with no digits, so only the IC part can match.
+    let ic12 = format!("{}{}", "900115", "105821");
+    let hx = |n: usize| "abcdef".repeat(n / 6 + 1)[..n].to_string();
     let mut cases: Vec<(&str, &str, String, String)> = vec![
         // must block: secrets
         ("block:aws-access-key-id", "AWS key", format!("my key is {aws} ok"), aws.clone()),
@@ -210,6 +213,20 @@ fn guard_prompt_cases() {
         ("block:gcp-api-key", "Google key ending in - before a letter", format!("AIza{}abcdefg-x", rep("SyD3x8kLm", 3)), String::new()),
         ("warn", "name with a dotless i", "ZORBENTA QUıLLFEATHER".into(), "Zorbenta".into()),
         ("warn", "name with a combining mark after it is still a whole word", "Zorbenta Quillfeather\u{301}".into(), "Zorbenta".into()),
+        // IC-shaped digits inside a hash (32+ ASCII hex characters) are part of the hash
+        ("allow", "IC digits inside a SHA-256", format!("zip sha256 {}{ic12}{}", hx(20), hx(32)), String::new()),
+        ("allow", "IC digits inside a git sha", format!("commit {}{ic12}{} pushed", hx(14), hx(14)), String::new()),
+        ("allow", "IC digits inside uppercase hex", format!("{}{ic12}{}", hx(20).to_uppercase(), hx(20).to_uppercase()), String::new()),
+        ("allow", "IC digits at the start of a 32-char hex run", format!("{ic12}{}", hx(20)), String::new()),
+        ("allow", "IC digits at the end of a 32-char hex run", format!("{}{ic12}", hx(20)), String::new()),
+        ("allow", "hex run of exactly 32", format!("{}{ic12}{}", hx(10), hx(10)), String::new()),
+        ("block:malaysian-ic", "hex run of 31 is not a hash", format!("{}{ic12}{}", hx(10), hx(9)), String::new()),
+        ("block:malaysian-ic", "a non-hex letter ends the run", format!("{}{ic12}g{}", hx(10), hx(20)), String::new()),
+        ("block:malaysian-ic", "a short hex word before the IC", format!("IC{ic12}"), String::new()),
+        ("block:malaysian-ic", "dashed IC inside hex", format!("{}{}-{}-{}{}", hx(20), "900115", "10", "5821", hx(20)), String::new()),
+        ("block:malaysian-ic", "a hash, then an IC", format!("{}{ic12}{} and IC {ic12}", hx(20), hx(32)), String::new()),
+        ("block:malaysian-ic", "an IC, then a hash", format!("IC {ic12} and {}{ic12}{}", hx(20), hx(32)), String::new()),
+        ("block:malaysian-ic", "Arabic-Indic digits are not hex", format!("{}{}{}{}", hx(20), "٩٠٠١١٥", "105821", hx(32)), String::new()),
     ];
     if gitleaks_installed() {
         cases.push((

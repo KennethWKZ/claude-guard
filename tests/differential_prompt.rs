@@ -172,6 +172,19 @@ const DIGITS: &[&str] = &[
     "०१२३४५६७८९",
 ];
 
+fn hex(rng: &mut Rng, n: usize) -> String {
+    let set: &[u8] = if rng.chance(15) {
+        b"0123456789ABCDEFabcdefgz"
+    } else if rng.chance(30) {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    (0..n)
+        .map(|_| char::from(set[rng.below(set.len())]))
+        .collect()
+}
+
 fn ic(rng: &mut Rng) -> String {
     let d = |rng: &mut Rng| char::from(b'0' + rng.below(10) as u8);
     let yy: String = (0..2).map(|_| d(rng)).collect();
@@ -334,7 +347,18 @@ fn fragment(rng: &mut Rng, secrets: &[String]) -> String {
             }
             s
         }
-        4 | 5 => format!("{}{}{}", rng.pick(EDGES), ic(rng), rng.pick(EDGES)),
+        4 => format!("{}{}{}", rng.pick(EDGES), ic(rng), rng.pick(EDGES)),
+        5 => {
+            // An IC inside hex: runs around the 32-character hash cut-off, either case, sometimes a non-hex letter.
+            let (l, r) = (rng.below(26), rng.below(26));
+            format!(
+                "{}{}{}{}",
+                rng.pick(EDGES),
+                hex(rng, l),
+                ic(rng),
+                hex(rng, r)
+            )
+        }
         6 | 7 => name(rng),
         _ => rng.pick(FILLER).to_string(),
     }
