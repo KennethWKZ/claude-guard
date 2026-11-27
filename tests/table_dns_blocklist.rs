@@ -15,11 +15,26 @@ fn roots(tag: &str) -> (String, String) {
 /// Run both sides; check they agree; return the port's normalised outcome.
 fn both(tag: &str, sc: &Scenario) -> Outcome {
     let (a, b) = roots(tag);
-    build(&a, sc);
     build(&b, sc);
     let mut n = Normalised::default();
-    let want = normalise(&run_bash(&a, &sc.command), &a, &mut n);
     let got = normalise(&run_rust(&b, &sc.command), &b, &mut n);
+    // Named noise in the reference: its `loaded` counts with `printf | grep -q` under `set -o pipefail`, and when
+    // grep exits at the first match while printf is still writing, printf's SIGPIPE loses that count (seen on a
+    // busy Mac and on CI). The port counts without that race, so bash gets up to three runs to agree with it.
+    let mut want = Outcome {
+        code: -1,
+        stdout: String::new(),
+        stderr: String::new(),
+        log: String::new(),
+        tree: String::new(),
+    };
+    for _ in 0..3 {
+        build(&a, sc);
+        want = normalise(&run_bash(&a, &sc.command), &a, &mut Normalised::default());
+        if want == got {
+            break;
+        }
+    }
     for (field, g, w) in [
         ("stdout", &got.stdout, &want.stdout),
         ("stderr", &got.stderr, &want.stderr),
